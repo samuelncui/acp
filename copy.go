@@ -42,7 +42,6 @@ type Copyer struct {
 	copyedFiles int64
 	totalFiles  int64
 
-	progressBarLock   sync.Mutex
 	updateProgressBar func(func(bar *progressbar.ProgressBar))
 
 	jobs      []*Job
@@ -69,6 +68,7 @@ func New(ctx context.Context, opts ...Option) (*Copyer, error) {
 
 	c := &Copyer{
 		option:            opt,
+		stage:             StageIndex,
 		writePipe:         make(chan *writeJob, 32),
 		metaPipe:          make(chan *metaJob, 8),
 		updateProgressBar: func(f func(bar *progressbar.ProgressBar)) {},
@@ -118,6 +118,11 @@ func (c *Copyer) index(ctx context.Context) {
 	for _, s := range c.src {
 		c.walk(s.base, s.path)
 	}
+
+	c.updateProgressBar(func(bar *progressbar.ProgressBar) {
+		bar.ChangeMax64(atomic.LoadInt64(&c.totalBytes))
+		bar.Describe(fmt.Sprintf("[0/%d] index finished...", atomic.LoadInt64(&c.totalFiles)))
+	})
 }
 
 func (c *Copyer) copy(ctx context.Context) {
