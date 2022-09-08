@@ -13,7 +13,7 @@ import (
 
 var (
 	notOverwrite = flag.Bool("n", false, "not overwrite exist file")
-	noTarget     = flag.Bool("notarget", false, "do not have target, aka sha256")
+	noTarget     = flag.Bool("notarget", false, "do not have target, use as dir index tool")
 	reportPath   = flag.String("report", "", "json report storage path")
 	targetPaths  []string
 )
