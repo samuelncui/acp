@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -16,8 +15,6 @@ const (
 )
 
 func (c *Copyer) startProgressBar(ctx context.Context) {
-	var lock sync.Mutex
-
 	// progressBar := progressbar.DefaultBytes(1, "[0/0] indexing...")
 	progressBar := progressbar.NewOptions64(
 		1,
@@ -33,37 +30,41 @@ func (c *Copyer) startProgressBar(ctx context.Context) {
 		progressbar.OptionSetRenderBlankState(true),
 	)
 
+	ch := make(chan func(bar *progressbar.ProgressBar), 8)
 	c.updateProgressBar = func(f func(bar *progressbar.ProgressBar)) {
-		lock.Lock()
-		defer lock.Unlock()
-
-		if progressBar == nil {
-			return
-		}
-		f(progressBar)
+		ch <- f
 	}
 
 	go func() {
+		for f := range ch {
+			if progressBar == nil {
+				continue
+			}
+			f(progressBar)
+		}
+	}()
+
+	go func() {
+		defer close(ch)
+
 		ticker := time.NewTicker(barUpdateInterval) // around 255ms, avoid conflict with progress bar fresh by second
 		defer ticker.Stop()
 
 		var lastCopyedBytes int64
-		for range ticker.C {
-			switch atomic.LoadInt64(&c.stage) {
-			case StageIndex:
-				go c.updateProgressBar(func(bar *progressbar.ProgressBar) {
-					bar.ChangeMax64(atomic.LoadInt64(&c.totalBytes))
-					bar.Describe(fmt.Sprintf("[0/%d] indexing...", atomic.LoadInt64(&c.totalFiles)))
-				})
-			case StageCopy:
-				currentCopyedBytes := atomic.LoadInt64(&c.copyedBytes)
-				diff := currentCopyedBytes - lastCopyedBytes
-				lastCopyedBytes = currentCopyedBytes
+		for {
+			select {
+			case <-ticker.C:
+				switch atomic.LoadInt64(&c.stage) {
+				case StageCopy:
+					currentCopyedBytes := atomic.LoadInt64(&c.copyedBytes)
+					diff := currentCopyedBytes - lastCopyedBytes
+					lastCopyedBytes = currentCopyedBytes
 
-				go c.updateProgressBar(func(bar *progressbar.ProgressBar) {
-					bar.Add64(diff)
-				})
-			case StageFinished:
+					c.updateProgressBar(func(bar *progressbar.ProgressBar) {
+						bar.Add64(diff)
+					})
+				}
+			case <-ctx.Done():
 				currentCopyedBytes := atomic.LoadInt64(&c.copyedBytes)
 				diff := int(currentCopyedBytes - lastCopyedBytes)
 				lastCopyedBytes = currentCopyedBytes
@@ -73,17 +74,7 @@ func (c *Copyer) startProgressBar(ctx context.Context) {
 					bar.Add(diff)
 					bar.Describe(fmt.Sprintf("[%d/%d] finished!", copyedFiles, totalFiles))
 				})
-			}
-
-			select {
-			case <-ctx.Done():
-				time.Sleep(barUpdateInterval)
-				c.updateProgressBar(func(bar *progressbar.ProgressBar) {
-					bar.Close()
-					progressBar = nil
-				})
 				return
-			default:
 			}
 		}
 	}()

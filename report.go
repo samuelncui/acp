@@ -8,12 +8,16 @@ import (
 )
 
 func (c *Copyer) Report() *Report {
-	c.reportLock.Lock()
-	defer c.reportLock.Unlock()
+	jobs, errs := c.getJobs(), c.getErrors()
+
+	files := make([]*File, 0, len(jobs))
+	for _, job := range jobs {
+		files = append(files, job.report())
+	}
 
 	return &Report{
-		Files:  c.files,
-		Errors: c.errors,
+		Files:  files,
+		Errors: errs,
 	}
 }
 
@@ -47,18 +51,21 @@ func (e *Error) UnmarshalJSON(buf []byte) error {
 }
 
 type File struct {
-	Source        string            `json:"source"`
-	SuccessTarget []string          `json:"success_target"`
-	FailTarget    map[string]string `json:"fail_target"`
-	RelativePath  string            `json:"relative_path"`
-	Size          int64             `json:"size"`
-	Mode          os.FileMode       `json:"mode"`
-	ModTime       time.Time         `json:"mod_time"`
-	WriteTime     time.Time         `json:"write_time"`
-	SHA256        string            `json:"sha256"`
+	Source       string `json:"source"`
+	RelativePath string `json:"relative_path"`
+
+	Status         string            `json:"status"`
+	SuccessTargets []string          `json:"success_target"`
+	FailTargets    map[string]string `json:"fail_target"`
+
+	Size      int64       `json:"size"`
+	Mode      os.FileMode `json:"mode"`
+	ModTime   time.Time   `json:"mod_time"`
+	WriteTime time.Time   `json:"write_time"`
+	SHA256    string      `json:"sha256"`
 }
 
 type Report struct {
-	Files  []*File
-	Errors []*Error
+	Files  []*File  `json:"files,omitempty"`
+	Errors []*Error `json:"errors,omitempty"`
 }

@@ -2,137 +2,39 @@ package acp
 
 import (
 	"context"
-	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"os"
 	"sync"
 	"sync/atomic"
-	"time"
+	"syscall"
 
 	"github.com/abc950309/acp/mmap"
 	"github.com/hashicorp/go-multierror"
 	"github.com/minio/sha256-simd"
 	"github.com/schollz/progressbar/v3"
-	"github.com/sirupsen/logrus"
 )
 
 const (
-	unexpectFileMode = os.ModeType &^ os.ModeDir
-	batchSize        = 1024 * 1024
+	batchSize = 1024 * 1024
 )
 
 var (
 	sha256Pool = &sync.Pool{New: func() interface{} { return sha256.New() }}
 )
 
-const (
-	StageIndex = iota
-	StageCopy
-	StageFinished
-)
-
-type Copyer struct {
-	*option
-
-	createFlag  int
-	stage       int64
-	copyedBytes int64
-	totalBytes  int64
-	copyedFiles int64
-	totalFiles  int64
-
-	updateProgressBar func(func(bar *progressbar.ProgressBar))
-
-	jobs      []*Job
-	writePipe chan *writeJob
-	metaPipe  chan *metaJob
-
-	wg         sync.WaitGroup
-	reportLock sync.Mutex
-	errors     []*Error
-	files      []*File
-}
-
-func New(ctx context.Context, opts ...Option) (*Copyer, error) {
-	opt := newOption()
-	for _, o := range opts {
-		if o == nil {
-			continue
-		}
-		opt = o(opt)
-	}
-	if err := opt.check(); err != nil {
-		return nil, err
-	}
-
-	c := &Copyer{
-		option:            opt,
-		stage:             StageIndex,
-		writePipe:         make(chan *writeJob, 32),
-		metaPipe:          make(chan *metaJob, 8),
-		updateProgressBar: func(f func(bar *progressbar.ProgressBar)) {},
-	}
-
-	c.createFlag = os.O_WRONLY | os.O_CREATE
-	if c.overwrite {
-		c.createFlag |= os.O_TRUNC
-	} else {
-		c.createFlag |= os.O_EXCL
-	}
-
-	c.wg.Add(1)
-	go c.run(ctx)
-	return c, nil
-}
-
-func (c *Copyer) Wait() *Report {
-	c.wg.Wait()
-	return c.Report()
-}
-
-func (c *Copyer) reportError(file string, err error) {
-	e := &Error{Path: file, Err: err}
-	logrus.Errorf(e.Error())
-
-	c.reportLock.Lock()
-	defer c.reportLock.Unlock()
-	c.errors = append(c.errors, e)
-}
-
-func (c *Copyer) run(ctx context.Context) {
-	defer c.wg.Done()
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	if c.withProgressBar {
-		c.startProgressBar(ctx)
-	}
-
-	c.index(ctx)
-	c.copy(ctx)
-}
-
-func (c *Copyer) index(ctx context.Context) {
-	for _, s := range c.src {
-		c.walk(s.base, s.path)
-	}
-
-	c.updateProgressBar(func(bar *progressbar.ProgressBar) {
-		bar.ChangeMax64(atomic.LoadInt64(&c.totalBytes))
-		bar.Describe(fmt.Sprintf("[0/%d] index finished...", atomic.LoadInt64(&c.totalFiles)))
-	})
-}
-
 func (c *Copyer) copy(ctx context.Context) {
 	atomic.StoreInt64(&c.stage, StageCopy)
 	defer atomic.StoreInt64(&c.stage, StageFinished)
+	wg := new(sync.WaitGroup)
 
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		defer close(c.writePipe)
 
-		for _, job := range c.jobs {
+		for _, job := range c.getJobs() {
 			c.prepare(ctx, job)
 
 			select {
@@ -143,111 +45,96 @@ func (c *Copyer) copy(ctx context.Context) {
 		}
 	}()
 
+	for i := 0; i < c.threads; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			for {
+				select {
+				case job, ok := <-c.writePipe:
+					if !ok {
+						return
+					}
+
+					wg.Add(1)
+					c.write(ctx, job)
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
 	go func() {
-		defer close(c.metaPipe)
-
-		for job := range c.writePipe {
-			c.write(ctx, job)
-
+		for {
 			select {
+			case job, ok := <-c.postPipe:
+				if !ok {
+					return
+				}
+				c.post(wg, job)
 			case <-ctx.Done():
 				return
-			default:
 			}
 		}
 	}()
 
-	for file := range c.metaPipe {
-		c.meta(file)
-	}
+	wg.Wait()
 }
 
-func (c *Copyer) walk(base, path string) {
-	stat, err := os.Stat(path)
-	if err != nil {
-		c.reportError(path, fmt.Errorf("walk get stat, %w", err))
-		return
-	}
+func (c *Copyer) prepare(ctx context.Context, job *baseJob) {
+	job.setStatus(jobStatusPreparing)
 
-	job, err := newJobFromFileInfo(base, path, stat)
-	if err != nil {
-		c.reportError(path, fmt.Errorf("make job fail, %w", err))
-		return
-	}
-	if job.Mode&unexpectFileMode != 0 {
-		return
-	}
-	if !job.Mode.IsDir() {
-		atomic.AddInt64(&c.totalFiles, 1)
-		atomic.AddInt64(&c.totalBytes, job.Size)
-		c.jobs = append(c.jobs, job)
-		return
-	}
-
-	enterJob := new(Job)
-	*enterJob = *job
-	enterJob.Type = JobTypeEnterDir
-	c.jobs = append(c.jobs, enterJob)
-
-	files, err := os.ReadDir(path)
-	if err != nil {
-		c.reportError(path, fmt.Errorf("walk read dir, %w", err))
-		return
-	}
-
-	for _, file := range files {
-		c.walk(base, path+"/"+file.Name())
-	}
-
-	exitJob := new(Job)
-	*exitJob = *job
-	exitJob.Type = JobTypeExitDir
-	c.jobs = append(c.jobs, exitJob)
-}
-
-func (c *Copyer) prepare(ctx context.Context, job *Job) {
-	switch job.Type {
-	case JobTypeEnterDir:
+	switch job.typ {
+	case jobTypeDir:
 		for _, d := range c.dst {
-			name := d + job.RelativePath
-			err := os.Mkdir(name, job.Mode&os.ModePerm)
-			if err != nil && !os.IsExist(err) {
-				c.reportError(name, fmt.Errorf("mkdir fail, %w", err))
+			target := d + job.source.target(d)
+			if err := os.MkdirAll(target, job.mode&os.ModePerm); err != nil && !os.IsExist(err) {
+				c.reportError(target, fmt.Errorf("mkdir fail, %w", err))
+				job.fail(target, fmt.Errorf("mkdir fail, %w", err))
+				continue
 			}
+			job.succes(target)
 		}
-		return
-	case JobTypeExitDir:
-		c.writePipe <- &writeJob{Job: job}
+
+		c.writePipe <- &writeJob{baseJob: job}
 		return
 	}
 
-	name := job.Source
-	file, err := mmap.Open(name)
+	file, err := mmap.Open(job.source.path())
 	if err != nil {
-		c.reportError(name, fmt.Errorf("open src file fail, %w", err))
+		c.reportError(job.source.path(), fmt.Errorf("open src file fail, %w", err))
 		return
 	}
 
-	c.writePipe <- &writeJob{Job: job, src: file}
+	c.writePipe <- &writeJob{baseJob: job, src: file}
 }
 
 func (c *Copyer) write(ctx context.Context, job *writeJob) {
-	if job.src == nil {
-		c.metaPipe <- &metaJob{Job: job.Job}
+	job.setStatus(jobStatusCopying)
+	if job.typ != jobTypeNormal {
 		return
 	}
-	defer job.src.Close()
-
-	num := atomic.AddInt64(&c.copyedFiles, 1)
-	go c.updateProgressBar(func(bar *progressbar.ProgressBar) {
-		bar.Describe(fmt.Sprintf("[%d/%d] %s", num, c.totalFiles, job.RelativePath))
-	})
 
 	var wg sync.WaitGroup
-	var lock sync.Mutex
-	var readErr error
+	defer func() {
+		wg.Wait()
+		job.src.Close()
+		c.postPipe <- job.baseJob
+	}()
+
+	num := atomic.AddInt64(&c.copyedFiles, 1)
+	c.updateProgressBar(func(bar *progressbar.ProgressBar) {
+		bar.Describe(fmt.Sprintf("[%d/%d] %s", num, c.totalFiles, job.source.relativePath))
+	})
+
 	chans := make([]chan []byte, 0, len(c.dst)+1)
-	next := &metaJob{Job: job.Job, failTarget: make(map[string]string)}
+	defer func() {
+		for _, ch := range chans {
+			close(ch)
+		}
+	}()
 
 	if c.withHash {
 		sha := sha256Pool.Get().(hash.Hash)
@@ -265,21 +152,24 @@ func (c *Copyer) write(ctx context.Context, job *writeJob) {
 				sha.Write(buf)
 			}
 
-			lock.Lock()
-			defer lock.Unlock()
-			next.hash = sha.Sum(nil)
+			job.setHash(sha.Sum(nil))
 		}()
 	}
 
+	var readErr error
+	badDsts := c.getBadDsts()
 	for _, d := range c.dst {
-		name := d + job.RelativePath
-		file, err := os.OpenFile(name, c.createFlag, job.Mode)
+		dst := d
+
+		name := job.source.target(dst)
+		if e, has := badDsts[dst]; has && e != nil {
+			job.fail(name, fmt.Errorf("bad target path, %w", e))
+		}
+
+		file, err := os.OpenFile(name, c.createFlag, job.mode)
 		if err != nil {
 			c.reportError(name, fmt.Errorf("open dst file fail, %w", err))
-
-			lock.Lock()
-			defer lock.Unlock()
-			next.failTarget[name] = fmt.Errorf("open dst file fail, %w", err).Error()
+			job.fail(name, fmt.Errorf("open dst file fail, %w", err))
 			continue
 		}
 
@@ -293,9 +183,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob) {
 			var rerr error
 			defer func() {
 				if rerr == nil {
-					lock.Lock()
-					defer lock.Unlock()
-					next.successTarget = append(next.successTarget, name)
+					job.succes(name)
 					return
 				}
 
@@ -307,29 +195,24 @@ func (c *Copyer) write(ctx context.Context, job *writeJob) {
 					rerr = multierror.Append(rerr, re)
 				}
 
-				c.reportError(name, rerr)
+				// if no space
+				if errors.Is(err, syscall.ENOSPC) {
+					c.addBadDsts(dst, err)
+				}
 
-				lock.Lock()
-				defer lock.Unlock()
-				next.failTarget[name] = rerr.Error()
+				c.reportError(name, rerr)
+				job.fail(name, rerr)
 			}()
 
 			defer file.Close()
 			for buf := range ch {
-				nr := len(buf)
-
 				n, err := file.Write(buf)
-				if n < 0 || nr < n {
-					if err == nil {
-						rerr = fmt.Errorf("write fail, unexpected return, byte_num= %d", n)
-						return
-					}
-
+				if err != nil {
 					rerr = fmt.Errorf("write fail, %w", err)
 					return
 				}
-				if nr != n {
-					rerr = fmt.Errorf("write fail, write and read bytes not equal, read= %d write= %d", nr, n)
+				if len(buf) != n {
+					rerr = fmt.Errorf("write fail, unexpected writen bytes return, read= %d write= %d", len(buf), n)
 					return
 				}
 			}
@@ -340,15 +223,9 @@ func (c *Copyer) write(ctx context.Context, job *writeJob) {
 		}()
 	}
 
-	defer func() {
-		for _, ch := range chans {
-			close(ch)
-		}
-
-		wg.Wait()
-		c.metaPipe <- next
-	}()
-
+	if len(chans) == 0 {
+		return
+	}
 	readErr = c.streamCopy(ctx, chans, job.src)
 }
 
@@ -381,31 +258,23 @@ func (c *Copyer) streamCopy(ctx context.Context, dsts []chan []byte, src *mmap.R
 	}
 }
 
-func (c *Copyer) meta(job *metaJob) {
-	if job.Mode.IsDir() {
-		for _, d := range c.dst {
-			if err := os.Chtimes(d+job.RelativePath, job.ModTime, job.ModTime); err != nil {
-				c.reportError(d+job.RelativePath, fmt.Errorf("change info, chtimes fail, %w", err))
-			}
+func (c *Copyer) post(wg *sync.WaitGroup, job *baseJob) {
+	defer wg.Done()
+
+	job.setStatus(jobStatusFinishing)
+	for _, name := range job.successTargets {
+		if err := os.Chtimes(name, job.modTime, job.modTime); err != nil {
+			c.reportError(name, fmt.Errorf("change info, chtimes fail, %w", err))
 		}
+	}
+
+	job.setStatus(jobStatusFinished)
+	if job.parent == nil {
 		return
 	}
 
-	c.files = append(c.files, &File{
-		Source:        job.Source,
-		SuccessTarget: job.successTarget,
-		FailTarget:    job.failTarget,
-		RelativePath:  job.RelativePath,
-		Size:          job.Size,
-		Mode:          job.Mode,
-		ModTime:       job.ModTime,
-		WriteTime:     time.Now(),
-		SHA256:        hex.EncodeToString(job.hash),
-	})
-
-	for _, name := range job.successTarget {
-		if err := os.Chtimes(name, job.ModTime, job.ModTime); err != nil {
-			c.reportError(name, fmt.Errorf("change info, chtimes fail, %w", err))
-		}
+	left := job.parent.done(job)
+	if left == 0 {
+		c.postPipe <- job.parent
 	}
 }

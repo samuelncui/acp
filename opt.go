@@ -4,18 +4,24 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"sort"
 	"strings"
 )
 
 type source struct {
-	path string
-	base string
-	name string
+	base         string
+	relativePath string
+}
+
+func (s *source) path() string {
+	return s.base + s.relativePath
+}
+
+func (s *source) target(dst string) string {
+	return dst + s.relativePath
 }
 
 type option struct {
-	src []source
+	src []*source
 	dst []string
 
 	fromDevice *deviceOption
@@ -23,8 +29,8 @@ type option struct {
 
 	overwrite       bool
 	withProgressBar bool
-	// threads         int
-	withHash bool
+	threads         int
+	withHash        bool
 }
 
 func newOption() *option {
@@ -61,20 +67,17 @@ func (o *option) check() error {
 		return fmt.Errorf("source path not found")
 	}
 	for _, s := range o.src {
-		if _, err := os.Stat(s.path); err != nil {
-			return fmt.Errorf("check src path '%s', %w", s.path, err)
+		if _, err := os.Stat(s.path()); err != nil {
+			return fmt.Errorf("check src path '%s', %w", s.path(), err)
 		}
 	}
 
-	sort.Slice(o.src, func(i, j int) bool {
-		return o.src[i].name < o.src[j].name
-	})
-	for idx := 1; idx < len(o.src); idx++ {
-		if o.src[idx].name == o.src[idx-1].name {
-			return fmt.Errorf("have same name source path, '%s' and '%s'", o.src[idx-1].path, o.src[idx].path)
-		}
+	if o.threads < 1 {
+		o.threads = 4
 	}
-
+	if o.fromDevice.linear || o.toDevice.linear {
+		o.threads = 1
+	}
 	return nil
 }
 
@@ -87,13 +90,32 @@ func Source(paths ...string) Option {
 			if p == "" {
 				continue
 			}
+			p = path.Clean(p)
 
 			if p[len(p)-1] == '/' {
 				p = p[:len(p)-1]
 			}
 
 			base, name := path.Split(p)
-			o.src = append(o.src, source{path: p, base: base, name: name})
+			o.src = append(o.src, &source{base: base, relativePath: name})
+		}
+		return o
+	}
+}
+
+func AccurateSource(base string, relativePaths ...string) Option {
+	return func(o *option) *option {
+		for _, p := range relativePaths {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+
+			if p[len(p)-1] == '/' {
+				p = p[:len(p)-1]
+			}
+
+			o.src = append(o.src, &source{base: base, relativePath: p})
 		}
 		return o
 	}
