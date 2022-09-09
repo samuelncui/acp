@@ -16,8 +16,9 @@ var (
 	notOverwrite    = flag.Bool("n", false, "not overwrite exist file")
 	noTarget        = flag.Bool("notarget", false, "do not have target, use as dir index tool")
 	reportPath      = flag.String("report", "", "json report storage path")
-	fromLinear      = flag.Bool("from-linear", false, "json report storage path")
-	toLinear        = flag.Bool("to-linear", false, "json report storage path")
+	reportIndent    = flag.Bool("report-indent", false, "json report with indent")
+	fromLinear      = flag.Bool("from-linear", false, "copy from linear device, such like tape drive")
+	toLinear        = flag.Bool("to-linear", false, "copy to linear device, such like tape drive")
 
 	targetPaths []string
 )
@@ -89,7 +90,12 @@ func main() {
 	}
 	defer r.Close()
 
-	if err := json.NewEncoder(r).Encode(report); err != nil {
-		logrus.Fatalf("export report fail, err= %s", err)
+	var buf []byte
+	if *reportIndent {
+		buf, _ = json.MarshalIndent(report, "", "\t")
+	} else {
+		buf, _ = json.Marshal(report)
 	}
+
+	r.Write(buf)
 }
