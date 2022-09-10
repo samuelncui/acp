@@ -26,6 +26,8 @@ type Copyer struct {
 	totalFiles  int64
 
 	updateProgressBar func(func(bar *progressbar.ProgressBar))
+	updateCopying     func(func(set map[int64]struct{}))
+	logf              func(l logrus.Level, format string, args ...any)
 
 	jobsLock sync.Mutex
 	jobs     []*baseJob
@@ -36,8 +38,9 @@ type Copyer struct {
 	badDstsLock sync.Mutex
 	badDsts     map[string]error
 
-	writePipe chan *writeJob
-	postPipe  chan *baseJob
+	readingFiles chan struct{}
+	writePipe    chan *writeJob
+	postPipe     chan *baseJob
 
 	running sync.WaitGroup
 }
@@ -55,12 +58,18 @@ func New(ctx context.Context, opts ...Option) (*Copyer, error) {
 	}
 
 	c := &Copyer{
-		option:            opt,
-		stage:             StageIndex,
+		option: opt,
+		stage:  StageIndex,
+
 		updateProgressBar: func(f func(bar *progressbar.ProgressBar)) {},
-		badDsts:           make(map[string]error),
-		writePipe:         make(chan *writeJob, 32),
-		postPipe:          make(chan *baseJob, 8),
+		updateCopying:     func(f func(set map[int64]struct{})) {},
+		logf: func(l logrus.Level, format string, args ...any) {
+			logrus.StandardLogger().Logf(l, format, args...)
+		},
+
+		badDsts:   make(map[string]error),
+		writePipe: make(chan *writeJob, 32),
+		postPipe:  make(chan *baseJob, 8),
 	}
 
 	c.createFlag = os.O_WRONLY | os.O_CREATE
@@ -68,6 +77,10 @@ func New(ctx context.Context, opts ...Option) (*Copyer, error) {
 		c.createFlag |= os.O_TRUNC
 	} else {
 		c.createFlag |= os.O_EXCL
+	}
+
+	if c.fromDevice.linear {
+		c.readingFiles = make(chan struct{}, 1)
 	}
 
 	c.running.Add(1)
@@ -100,7 +113,7 @@ func (c *Copyer) run(ctx context.Context) {
 
 func (c *Copyer) reportError(file string, err error) {
 	e := &Error{Path: file, Err: err}
-	logrus.Errorf(e.Error())
+	c.logf(logrus.ErrorLevel, e.Error())
 
 	c.errsLock.Lock()
 	defer c.errsLock.Unlock()

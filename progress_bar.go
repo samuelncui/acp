@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/schollz/progressbar/v3"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -30,17 +33,49 @@ func (c *Copyer) startProgressBar(ctx context.Context) {
 		progressbar.OptionSetRenderBlankState(true),
 	)
 
-	ch := make(chan func(bar *progressbar.ProgressBar), 8)
+	ch := make(chan interface{}, 8)
 	c.updateProgressBar = func(f func(bar *progressbar.ProgressBar)) {
 		ch <- f
 	}
+	c.updateCopying = func(f func(set map[int64]struct{})) {
+		ch <- f
+	}
+	c.logf = func(l logrus.Level, format string, args ...any) {
+		ch <- func() { logrus.StandardLogger().Logf(l, format, args...) }
+	}
 
 	go func() {
+		copying := make(map[int64]struct{}, c.threads)
+
 		for f := range ch {
 			if progressBar == nil {
 				continue
 			}
-			f(progressBar)
+
+			switch v := f.(type) {
+			case func(bar *progressbar.ProgressBar):
+				v(progressBar)
+			case func(set map[int64]struct{}):
+				v(copying)
+
+				idxs := make([]int64, 0, len(copying))
+				for idx := range copying {
+					idxs = append(idxs, idx)
+				}
+				sort.Slice(idxs, func(i, j int) bool {
+					return idxs[i] < idxs[j]
+				})
+
+				strs := make([]string, 0, len(idxs))
+				for _, idx := range idxs {
+					strs = append(strs, fmt.Sprintf("file %d", idx))
+				}
+
+				copyedFiles, totalFiles := atomic.LoadInt64(&c.copyedFiles), atomic.LoadInt64(&c.totalFiles)
+				progressBar.Describe(fmt.Sprintf("[%d/%d] copying... %s", copyedFiles, totalFiles, strings.Join(strs, ", ")))
+			case func():
+				v()
+			}
 		}
 	}()
 

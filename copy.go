@@ -13,7 +13,7 @@ import (
 	"github.com/abc950309/acp/mmap"
 	"github.com/hashicorp/go-multierror"
 	"github.com/minio/sha256-simd"
-	"github.com/schollz/progressbar/v3"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -67,20 +67,21 @@ func (c *Copyer) copy(ctx context.Context) {
 	}
 
 	go func() {
-		for {
-			select {
-			case job, ok := <-c.postPipe:
-				if !ok {
-					return
-				}
-				c.post(wg, job)
-			case <-ctx.Done():
-				return
-			}
+		for job := range c.postPipe {
+			c.post(wg, job)
 		}
 	}()
 
-	wg.Wait()
+	finished := make(chan struct{}, 1)
+	go func() {
+		wg.Wait()
+		finished <- struct{}{}
+	}()
+
+	select {
+	case <-finished:
+	case <-ctx.Done():
+	}
 }
 
 func (c *Copyer) prepare(ctx context.Context, job *baseJob) {
@@ -89,7 +90,7 @@ func (c *Copyer) prepare(ctx context.Context, job *baseJob) {
 	switch job.typ {
 	case jobTypeDir:
 		for _, d := range c.dst {
-			target := d + job.source.target(d)
+			target := job.source.target(d)
 			if err := os.MkdirAll(target, job.mode&os.ModePerm); err != nil && !os.IsExist(err) {
 				c.reportError(target, fmt.Errorf("mkdir fail, %w", err))
 				job.fail(target, fmt.Errorf("mkdir fail, %w", err))
@@ -100,6 +101,10 @@ func (c *Copyer) prepare(ctx context.Context, job *baseJob) {
 
 		c.writePipe <- &writeJob{baseJob: job}
 		return
+	}
+
+	if c.readingFiles != nil {
+		c.readingFiles <- struct{}{}
 	}
 
 	file, err := mmap.Open(job.source.path())
@@ -120,14 +125,19 @@ func (c *Copyer) write(ctx context.Context, job *writeJob) {
 	var wg sync.WaitGroup
 	defer func() {
 		wg.Wait()
+
 		job.src.Close()
+		if c.readingFiles != nil {
+			<-c.readingFiles
+		}
+
 		c.postPipe <- job.baseJob
 	}()
 
 	num := atomic.AddInt64(&c.copyedFiles, 1)
-	c.updateProgressBar(func(bar *progressbar.ProgressBar) {
-		bar.Describe(fmt.Sprintf("[%d/%d] %s", num, c.totalFiles, job.source.relativePath))
-	})
+	c.logf(logrus.InfoLevel, "[%d/%d] copying: %s", num, c.totalFiles, job.source.relativePath)
+	c.updateCopying(func(set map[int64]struct{}) { set[num] = struct{}{} })
+	defer c.updateCopying(func(set map[int64]struct{}) { delete(set, num) })
 
 	chans := make([]chan []byte, 0, len(c.dst)+1)
 	defer func() {

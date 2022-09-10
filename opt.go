@@ -166,12 +166,12 @@ func WithProgressBar(b bool) Option {
 	}
 }
 
-// func WithThreads(threads int) Option {
-// 	return func(o *option) *option {
-// 		o.threads = threads
-// 		return o
-// 	}
-// }
+func WithThreads(threads int) Option {
+	return func(o *option) *option {
+		o.threads = threads
+		return o
+	}
+}
 
 func WithHash(b bool) Option {
 	return func(o *option) *option {
