@@ -29,8 +29,9 @@ type Copyer struct {
 	updateCopying     func(func(set map[int64]struct{}))
 	logf              func(l logrus.Level, format string, args ...any)
 
-	jobsLock sync.Mutex
-	jobs     []*baseJob
+	jobsLock      sync.Mutex
+	jobs          []*baseJob
+	noSpaceSource []*source
 
 	errsLock sync.Mutex
 	errors   []*Error
@@ -105,6 +106,11 @@ func (c *Copyer) run(ctx context.Context) {
 
 	c.index(ctx)
 	if !c.checkJobs() {
+		return
+	}
+
+	if err := c.applyAutoFillLimit(); err != nil {
+		c.reportError("_autofill", err)
 		return
 	}
 

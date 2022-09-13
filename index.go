@@ -74,18 +74,6 @@ func (c *Copyer) walk(parent *baseJob, src *source) *baseJob {
 	return job
 }
 
-func (c *Copyer) appendJobs(jobs ...*baseJob) {
-	c.jobsLock.Lock()
-	defer c.jobsLock.Unlock()
-	c.jobs = append(c.jobs, jobs...)
-}
-
-func (c *Copyer) getJobs() []*baseJob {
-	c.jobsLock.Lock()
-	defer c.jobsLock.Unlock()
-	return c.jobs
-}
-
 func (c *Copyer) checkJobs() bool {
 	c.jobsLock.Lock()
 	defer c.jobsLock.Unlock()
@@ -135,4 +123,22 @@ func (c *Copyer) checkJobs() bool {
 
 	c.jobs = filtered
 	return true
+}
+
+func (c *Copyer) appendJobs(jobs ...*baseJob) {
+	c.jobsLock.Lock()
+	defer c.jobsLock.Unlock()
+	c.jobs = append(c.jobs, jobs...)
+}
+
+func (c *Copyer) getJobs() []*baseJob {
+	c.jobsLock.Lock()
+	defer c.jobsLock.Unlock()
+	return c.jobs
+}
+
+func (c *Copyer) getJobsAndNoSpaceSource() ([]*baseJob, []*source) {
+	c.jobsLock.Lock()
+	defer c.jobsLock.Unlock()
+	return c.jobs, c.noSpaceSource
 }

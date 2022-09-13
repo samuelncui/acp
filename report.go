@@ -8,16 +8,23 @@ import (
 )
 
 func (c *Copyer) Report() *Report {
-	jobs, errs := c.getJobs(), c.getErrors()
+	jobs, nss := c.getJobsAndNoSpaceSource()
+	errs := c.getErrors()
 
 	files := make([]*File, 0, len(jobs))
 	for _, job := range jobs {
 		files = append(files, job.report())
 	}
 
+	noSpaceSources := make([]*FilePath, 0, len(nss))
+	for _, s := range nss {
+		noSpaceSources = append(noSpaceSources, &FilePath{Base: s.base, RelativePath: s.relativePath})
+	}
+
 	return &Report{
-		Files:  files,
-		Errors: errs,
+		Files:          files,
+		NoSpaceSources: noSpaceSources,
+		Errors:         errs,
 	}
 }
 
@@ -55,8 +62,8 @@ type File struct {
 	RelativePath string `json:"relative_path"`
 
 	Status         string            `json:"status"`
-	SuccessTargets []string          `json:"success_target"`
-	FailTargets    map[string]string `json:"fail_target"`
+	SuccessTargets []string          `json:"success_target,omitempty"`
+	FailTargets    map[string]string `json:"fail_target,omitempty"`
 
 	Size      int64       `json:"size"`
 	Mode      os.FileMode `json:"mode"`
@@ -65,7 +72,13 @@ type File struct {
 	SHA256    string      `json:"sha256"`
 }
 
+type FilePath struct {
+	Base         string `json:"base,omitempty"`
+	RelativePath string `json:"relative_path,omitempty"`
+}
+
 type Report struct {
-	Files  []*File  `json:"files,omitempty"`
-	Errors []*Error `json:"errors,omitempty"`
+	Files          []*File     `json:"files,omitempty"`
+	NoSpaceSources []*FilePath `json:"no_space_sources,omitempty"`
+	Errors         []*Error    `json:"errors,omitempty"`
 }

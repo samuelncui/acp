@@ -14,11 +14,13 @@ import (
 var (
 	withProgressBar = flag.Bool("p", true, "display progress bar")
 	notOverwrite    = flag.Bool("n", false, "not overwrite exist file")
+	continueReport  = flag.String("c", "", "continue with previous report, for auto fill circumstances")
 	noTarget        = flag.Bool("notarget", false, "do not have target, use as dir index tool")
 	reportPath      = flag.String("report", "", "json report storage path")
 	reportIndent    = flag.Bool("report-indent", false, "json report with indent")
 	fromLinear      = flag.Bool("from-linear", false, "copy from linear device, such like tape drive")
 	toLinear        = flag.Bool("to-linear", false, "copy to linear device, such like tape drive")
+	autoFillDepth   = flag.Int("auto-fill-depth", 0, "auto fill the whole filesystem, split by specify filepath depth, and report will output left filepaths")
 
 	targetPaths []string
 )
@@ -59,7 +61,25 @@ func main() {
 	}()
 
 	opts := make([]acp.Option, 0, 8)
-	opts = append(opts, acp.Source(sources...))
+	if *continueReport != "" {
+		f, err := os.Open(*continueReport)
+		if err != nil {
+			logrus.Fatalf("cannot open continue report file, %s", err)
+		}
+
+		r := new(acp.Report)
+		if err := json.NewDecoder(f).Decode(r); err != nil {
+			logrus.Fatalf("decode continue report file, %s", err)
+		}
+
+		for _, s := range r.NoSpaceSources {
+			logrus.Infof("restore unfinished: base= '%s' relative_path= '%s'", s.Base, s.RelativePath)
+			opts = append(opts, acp.AccurateSource(s.Base, s.RelativePath))
+		}
+	} else {
+		opts = append(opts, acp.Source(sources...))
+	}
+
 	opts = append(opts, acp.Target(targetPaths...))
 	opts = append(opts, acp.WithHash(*reportPath != ""))
 	opts = append(opts, acp.Overwrite(!*notOverwrite))
@@ -71,31 +91,37 @@ func main() {
 	if *toLinear {
 		opts = append(opts, acp.SetToDevice(acp.LinearDevice(true)))
 	}
+	if *autoFillDepth != 0 {
+		opts = append(opts, acp.WithAutoFill(true, *autoFillDepth))
+	}
 
 	c, err := acp.New(ctx, opts...)
 	if err != nil {
-		panic(err)
+		logrus.Fatalf("unexpected exit: %s", err)
 	}
 
-	report := c.Wait()
-	if *reportPath == "" {
-		return
-	}
+	defer func() {
+		if *reportPath == "" {
+			return
+		}
 
-	r, err := os.Create(*reportPath)
-	if err != nil {
-		logrus.Warnf("open report fail, path= '%s', err= %w", *reportPath, err)
-		logrus.Infof("report: %s", report)
-		return
-	}
-	defer r.Close()
+		report := c.Report()
+		r, err := os.Create(*reportPath)
+		if err != nil {
+			logrus.Warnf("open report fail, path= '%s', err= %w", *reportPath, err)
+			logrus.Infof("report: %s", report)
+			return
+		}
+		defer r.Close()
 
-	var buf []byte
-	if *reportIndent {
-		buf, _ = json.MarshalIndent(report, "", "\t")
-	} else {
-		buf, _ = json.Marshal(report)
-	}
+		var buf []byte
+		if *reportIndent {
+			buf, _ = json.MarshalIndent(report, "", "\t")
+		} else {
+			buf, _ = json.Marshal(report)
+		}
 
-	r.Write(buf)
+		r.Write(buf)
+	}()
+	c.Wait()
 }

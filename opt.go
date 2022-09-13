@@ -31,6 +31,9 @@ type option struct {
 	withProgressBar bool
 	threads         int
 	withHash        bool
+
+	autoFill           bool
+	autoFillSplitDepth int
 }
 
 func newOption() *option {
@@ -176,6 +179,14 @@ func WithThreads(threads int) Option {
 func WithHash(b bool) Option {
 	return func(o *option) *option {
 		o.withHash = b
+		return o
+	}
+}
+
+func WithAutoFill(on bool, depth int) Option {
+	return func(o *option) *option {
+		o.autoFill = on
+		o.autoFillSplitDepth = depth
 		return o
 	}
 }
