@@ -44,7 +44,7 @@ func (c *Copyer) startProgressBar(ctx context.Context) {
 		ch <- func() { logrus.StandardLogger().Logf(l, format, args...) }
 	}
 
-	go func() {
+	go wrap(ctx, func() {
 		copying := make(map[int64]struct{}, c.threads)
 
 		for f := range ch {
@@ -77,9 +77,9 @@ func (c *Copyer) startProgressBar(ctx context.Context) {
 				v()
 			}
 		}
-	}()
+	})
 
-	go func() {
+	go wrap(ctx, func() {
 		defer close(ch)
 
 		ticker := time.NewTicker(barUpdateInterval) // around 255ms, avoid conflict with progress bar fresh by second
@@ -112,5 +112,5 @@ func (c *Copyer) startProgressBar(ctx context.Context) {
 				return
 			}
 		}
-	}()
+	})
 }

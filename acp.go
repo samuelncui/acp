@@ -85,7 +85,7 @@ func New(ctx context.Context, opts ...Option) (*Copyer, error) {
 	}
 
 	c.running.Add(1)
-	go c.run(ctx)
+	go wrap(ctx, func() { c.run(ctx) })
 	return c, nil
 }
 

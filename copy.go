@@ -30,7 +30,7 @@ func (c *Copyer) copy(ctx context.Context) {
 	wg := new(sync.WaitGroup)
 
 	wg.Add(1)
-	go func() {
+	go wrap(ctx, func() {
 		defer wg.Done()
 		defer close(c.writePipe)
 
@@ -43,11 +43,11 @@ func (c *Copyer) copy(ctx context.Context) {
 			default:
 			}
 		}
-	}()
+	})
 
 	for i := 0; i < c.threads; i++ {
 		wg.Add(1)
-		go func() {
+		go wrap(ctx, func() {
 			defer wg.Done()
 
 			for {
@@ -63,20 +63,20 @@ func (c *Copyer) copy(ctx context.Context) {
 					return
 				}
 			}
-		}()
+		})
 	}
 
-	go func() {
+	go wrap(ctx, func() {
 		for job := range c.postPipe {
 			c.post(wg, job)
 		}
-	}()
+	})
 
 	finished := make(chan struct{}, 1)
-	go func() {
+	go wrap(ctx, func() {
 		wg.Wait()
 		finished <- struct{}{}
-	}()
+	})
 
 	select {
 	case <-finished:
@@ -154,7 +154,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob) {
 		chans = append(chans, ch)
 
 		wg.Add(1)
-		go func() {
+		go wrap(ctx, func() {
 			defer wg.Done()
 			defer sha256Pool.Put(sha)
 
@@ -163,7 +163,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob) {
 			}
 
 			job.setHash(sha.Sum(nil))
-		}()
+		})
 	}
 
 	var readErr error
@@ -187,7 +187,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob) {
 		chans = append(chans, ch)
 
 		wg.Add(1)
-		go func() {
+		go wrap(ctx, func() {
 			defer wg.Done()
 
 			var rerr error
@@ -230,7 +230,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob) {
 			if readErr != nil {
 				rerr = readErr
 			}
-		}()
+		})
 	}
 
 	if len(chans) == 0 {
