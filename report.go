@@ -18,7 +18,17 @@ func (c *Copyer) Report() *Report {
 
 	noSpaceSources := make([]*FilePath, 0, len(nss))
 	for _, s := range nss {
-		noSpaceSources = append(noSpaceSources, &FilePath{Base: s.base, RelativePath: s.relativePath})
+		if len(noSpaceSources) == 0 {
+			noSpaceSources = append(noSpaceSources, &FilePath{Base: s.base, RelativePaths: []string{s.relativePath}})
+			continue
+		}
+
+		if last := noSpaceSources[len(noSpaceSources)-1]; last.Base == s.base {
+			last.RelativePaths = append(last.RelativePaths, s.relativePath)
+			continue
+		}
+
+		noSpaceSources = append(noSpaceSources, &FilePath{Base: s.base, RelativePaths: []string{s.relativePath}})
 	}
 
 	return &Report{
@@ -73,8 +83,8 @@ type File struct {
 }
 
 type FilePath struct {
-	Base         string `json:"base,omitempty"`
-	RelativePath string `json:"relative_path,omitempty"`
+	Base          string   `json:"base,omitempty"`
+	RelativePaths []string `json:"relative_paths,omitempty"`
 }
 
 type Report struct {

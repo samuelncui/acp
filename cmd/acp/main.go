@@ -73,8 +73,8 @@ func main() {
 		}
 
 		for _, s := range r.NoSpaceSources {
-			logrus.Infof("restore unfinished: base= '%s' relative_path= '%s'", s.Base, s.RelativePath)
-			opts = append(opts, acp.AccurateSource(s.Base, s.RelativePath))
+			logrus.Infof("restore unfinished: base= '%s' relative_path= '%v'", s.Base, s.RelativePaths)
+			opts = append(opts, acp.AccurateSource(s.Base, s.RelativePaths...))
 		}
 	} else {
 		opts = append(opts, acp.Source(sources...))

@@ -89,12 +89,7 @@ type Option func(*option) *option
 func Source(paths ...string) Option {
 	return func(o *option) *option {
 		for _, p := range paths {
-			p = strings.TrimSpace(p)
-			if p == "" {
-				continue
-			}
 			p = path.Clean(p)
-
 			if p[len(p)-1] == '/' {
 				p = p[:len(p)-1]
 			}
@@ -108,12 +103,10 @@ func Source(paths ...string) Option {
 
 func AccurateSource(base string, relativePaths ...string) Option {
 	return func(o *option) *option {
-		for _, p := range relativePaths {
-			p = strings.TrimSpace(p)
-			if p == "" {
-				continue
-			}
+		base = path.Clean(base)
 
+		for _, p := range relativePaths {
+			p = path.Clean(p)
 			if p[len(p)-1] == '/' {
 				p = p[:len(p)-1]
 			}
