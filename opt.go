@@ -5,6 +5,8 @@ import (
 	"os"
 	"path"
 	"strings"
+
+	"github.com/sirupsen/logrus"
 )
 
 type source struct {
@@ -34,6 +36,8 @@ type option struct {
 
 	autoFill           bool
 	autoFillSplitDepth int
+
+	logger *logrus.Logger
 }
 
 func newOption() *option {
@@ -180,6 +184,13 @@ func WithAutoFill(on bool, depth int) Option {
 	return func(o *option) *option {
 		o.autoFill = on
 		o.autoFillSplitDepth = depth
+		return o
+	}
+}
+
+func WithLogger(logger *logrus.Logger) Option {
+	return func(o *option) *option {
+		o.logger = logger
 		return o
 	}
 }

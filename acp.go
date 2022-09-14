@@ -64,9 +64,6 @@ func New(ctx context.Context, opts ...Option) (*Copyer, error) {
 
 		updateProgressBar: func(f func(bar *progressbar.ProgressBar)) {},
 		updateCopying:     func(f func(set map[int64]struct{})) {},
-		logf: func(l logrus.Level, format string, args ...any) {
-			logrus.StandardLogger().Logf(l, format, args...)
-		},
 
 		badDsts:   make(map[string]error),
 		writePipe: make(chan *writeJob, 32),
@@ -82,6 +79,12 @@ func New(ctx context.Context, opts ...Option) (*Copyer, error) {
 
 	if c.fromDevice.linear {
 		c.readingFiles = make(chan struct{}, 1)
+	}
+
+	if opt.logger != nil {
+		c.logf = func(l logrus.Level, format string, args ...any) { opt.logger.Logf(l, format, args...) }
+	} else {
+		c.logf = func(l logrus.Level, format string, args ...any) { logrus.StandardLogger().Logf(l, format, args...) }
 	}
 
 	c.running.Add(1)
