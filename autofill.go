@@ -19,8 +19,8 @@ func (c *Copyer) applyAutoFillLimit() error {
 			return fmt.Errorf("get file system fail, %s, %w", d, err)
 		}
 
-		infos[fsInfo.MountPoint] = fsInfo
-		counts[fsInfo.MountPoint] = counts[fsInfo.MountPoint] + 1
+		infos[d] = fsInfo
+		counts[d] = counts[d] + 1
 	}
 
 	min := int64(math.MaxInt64)
@@ -46,19 +46,15 @@ func (c *Copyer) applyAutoFillLimit() error {
 	c.jobs = c.jobs[:idx]
 	last := ""
 	for _, job := range cutoff {
-		job.parent.done(job)
-
+		if job.parent != nil {
+			job.parent.done(job)
+		}
 		if strings.HasPrefix(job.source.relativePath, last) {
-			if len(job.source.relativePath) == len(last) {
-				continue
-			}
-			if job.source.relativePath[len(last)] == '/' {
-				continue
-			}
+			continue
 		}
 
 		c.noSpaceSource = append(c.noSpaceSource, job.source)
-		last = job.source.relativePath
+		last = job.source.relativePath + "/"
 	}
 	return nil
 }

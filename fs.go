@@ -2,26 +2,26 @@ package acp
 
 import (
 	"fmt"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 type fileSystem struct {
-	TypeName      string
-	MountPoint    string
+	// TypeName      string
+	// MountPoint    string
 	TotalSize     int64
 	AvailableSize int64
 }
 
 func getFileSystem(path string) (*fileSystem, error) {
-	stat := new(syscall.Statfs_t)
-
-	if err := syscall.Statfs(path, stat); err != nil {
+	stat := new(unix.Statfs_t)
+	if err := unix.Statfs(path, stat); err != nil {
 		return nil, fmt.Errorf("read statfs fail, err= %w", err)
 	}
 
 	return &fileSystem{
-		TypeName:      unpaddingInt8s(stat.Fstypename[:]),
-		MountPoint:    unpaddingInt8s(stat.Mntonname[:]),
+		// TypeName:      unpaddingInt8s(stat.Fstypename[:]),
+		// MountPoint:    unpaddingInt8s(stat.Mntonname[:]),
 		TotalSize:     int64(stat.Blocks) * int64(stat.Bsize),
 		AvailableSize: int64(stat.Bavail) * int64(stat.Bsize),
 	}, nil
