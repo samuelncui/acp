@@ -2,19 +2,12 @@ package acp
 
 import (
 	"encoding/hex"
+	"fmt"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/abc950309/acp/mmap"
-)
-
-type jobType uint8
-
-const (
-	jobTypeNormal = jobType(iota)
-	jobTypeDir
 )
 
 type jobStatus uint8
@@ -38,9 +31,8 @@ var (
 )
 
 type baseJob struct {
-	parent *baseJob
+	copyer *Copyer
 	source *source
-	typ    jobType
 
 	name    string      // base name of the file
 	size    int64       // length in bytes for regular files; system-dependent for others
@@ -50,32 +42,27 @@ type baseJob struct {
 	lock      sync.Mutex
 	writeTime time.Time
 	status    jobStatus
-	children  map[*baseJob]struct{}
 
 	successTargets []string
 	failedTargets  map[string]error
 	hash           []byte
-
-	// utils
-	comparableRelativePath string
 }
 
-func newJobFromFileInfo(parent *baseJob, source *source, info os.FileInfo) (*baseJob, error) {
+func (c *Copyer) newJobFromFileInfo(source *source, info os.FileInfo) (*baseJob, error) {
 	job := &baseJob{
-		parent: parent,
+		copyer: c,
 		source: source,
 
 		name:    info.Name(),
 		size:    info.Size(),
 		mode:    info.Mode(),
 		modTime: info.ModTime(),
-
-		comparableRelativePath: strings.ReplaceAll(source.relativePath, "/", "\x00"),
 	}
-	if job.mode.IsDir() {
-		job.typ = jobTypeDir
+	if job.mode.IsDir() || job.mode&unexpectFileMode != 0 {
+		return nil, fmt.Errorf("unexpected file, path= %s", source.src())
 	}
 
+	c.submit(&EventUpdateJob{job.report()})
 	return job, nil
 }
 
@@ -87,30 +74,24 @@ func (j *baseJob) setStatus(s jobStatus) {
 	if s == jobStatusCopying {
 		j.writeTime = time.Now()
 	}
+
+	j.copyer.submit(&EventUpdateJob{j.report()})
 }
 
 func (j *baseJob) setHash(h []byte) {
 	j.lock.Lock()
 	defer j.lock.Unlock()
+
 	j.hash = h
-}
-
-func (j *baseJob) done(child *baseJob) int {
-	if j.typ == jobTypeNormal {
-		return 0
-	}
-
-	j.lock.Lock()
-	defer j.lock.Unlock()
-
-	delete(j.children, child)
-	return len(j.children)
+	j.copyer.submit(&EventUpdateJob{j.report()})
 }
 
 func (j *baseJob) succes(path string) {
 	j.lock.Lock()
 	defer j.lock.Unlock()
+
 	j.successTargets = append(j.successTargets, path)
+	j.copyer.submit(&EventUpdateJob{j.report()})
 }
 
 func (j *baseJob) fail(path string, err error) {
@@ -121,24 +102,17 @@ func (j *baseJob) fail(path string, err error) {
 		j.failedTargets = make(map[string]error, 1)
 	}
 	j.failedTargets[path] = err
+	j.copyer.submit(&EventUpdateJob{j.report()})
 }
 
-func (j *baseJob) report() *File {
-	j.lock.Lock()
-	defer j.lock.Unlock()
-
-	fails := make(map[string]string, len(j.failedTargets))
-	for n, e := range j.failedTargets {
-		fails[n] = e.Error()
-	}
-
-	return &File{
-		Source:       j.source.path(),
-		RelativePath: j.source.relativePath,
+func (j *baseJob) report() *Job {
+	return &Job{
+		Base: j.source.base,
+		Path: j.source.path,
 
 		Status:         statusMapping[j.status],
 		SuccessTargets: j.successTargets,
-		FailTargets:    fails,
+		FailTargets:    j.failedTargets,
 
 		Size:      j.size,
 		Mode:      j.mode,
@@ -151,4 +125,25 @@ func (j *baseJob) report() *File {
 type writeJob struct {
 	*baseJob
 	src *mmap.ReaderAt
+	ch  chan struct{}
+}
+
+func (wj *writeJob) done() {
+	wj.src.Close()
+	close(wj.ch)
+}
+
+type Job struct {
+	Base string   `json:"base"`
+	Path []string `json:"path"`
+
+	Status         string           `json:"status"`
+	SuccessTargets []string         `json:"success_target,omitempty"`
+	FailTargets    map[string]error `json:"fail_target,omitempty"`
+
+	Size      int64       `json:"size"`
+	Mode      os.FileMode `json:"mode"`
+	ModTime   time.Time   `json:"mod_time"`
+	WriteTime time.Time   `json:"write_time"`
+	SHA256    string      `json:"sha256"`
 }

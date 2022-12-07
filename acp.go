@@ -2,48 +2,15 @@ package acp
 
 import (
 	"context"
-	"os"
 	"sync"
 
-	"github.com/schollz/progressbar/v3"
 	"github.com/sirupsen/logrus"
-)
-
-const (
-	StageIndex = iota
-	StageCopy
-	StageFinished
 )
 
 type Copyer struct {
 	*option
-
-	createFlag  int
-	stage       int64
-	copyedBytes int64
-	totalBytes  int64
-	copyedFiles int64
-	totalFiles  int64
-
-	updateProgressBar func(func(bar *progressbar.ProgressBar))
-	updateCopying     func(func(set map[int64]struct{}))
-	logf              func(l logrus.Level, format string, args ...any)
-
-	jobsLock      sync.Mutex
-	jobs          []*baseJob
-	noSpaceSource []*source
-
-	errsLock sync.Mutex
-	errors   []*Error
-
-	badDstsLock sync.Mutex
-	badDsts     map[string]error
-
-	readingFiles chan struct{}
-	writePipe    chan *writeJob
-	postPipe     chan *baseJob
-
 	running sync.WaitGroup
+	eventCh chan Event
 }
 
 func New(ctx context.Context, opts ...Option) (*Copyer, error) {
@@ -59,90 +26,92 @@ func New(ctx context.Context, opts ...Option) (*Copyer, error) {
 	}
 
 	c := &Copyer{
-		option: opt,
-		stage:  StageIndex,
-
-		updateProgressBar: func(f func(bar *progressbar.ProgressBar)) {},
-		updateCopying:     func(f func(set map[int64]struct{})) {},
-
-		badDsts:   make(map[string]error),
-		writePipe: make(chan *writeJob, 32),
-		postPipe:  make(chan *baseJob, 8),
-	}
-
-	c.createFlag = os.O_WRONLY | os.O_CREATE
-	if c.overwrite {
-		c.createFlag |= os.O_TRUNC
-	} else {
-		c.createFlag |= os.O_EXCL
-	}
-
-	if c.fromDevice.linear {
-		c.readingFiles = make(chan struct{}, 1)
-	}
-
-	if opt.logger != nil {
-		c.logf = func(l logrus.Level, format string, args ...any) { opt.logger.Logf(l, format, args...) }
-	} else {
-		c.logf = func(l logrus.Level, format string, args ...any) { logrus.StandardLogger().Logf(l, format, args...) }
+		option:  opt,
+		eventCh: make(chan Event, 128),
 	}
 
 	c.running.Add(1)
 	go wrap(ctx, func() { c.run(ctx) })
+
 	return c, nil
 }
 
-func (c *Copyer) Wait() *Report {
+func (c *Copyer) Wait() {
 	c.running.Wait()
-	return c.Report()
 }
 
-func (c *Copyer) run(ctx context.Context) {
+func (c *Copyer) run(ctx context.Context) error {
 	defer c.running.Done()
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	if c.withProgressBar {
-		c.startProgressBar(ctx)
+	go wrap(ctx, func() { c.eventLoop(ctx) })
+
+	indexed, err := c.index(ctx)
+	if err != nil {
+		return err
 	}
 
-	c.index(ctx)
-	if !c.checkJobs() {
-		return
-	}
+	prepared := c.prepare(ctx, indexed)
+	copyed := c.copy(ctx, prepared)
+	c.cleanupJob(ctx, copyed)
 
-	if err := c.applyAutoFillLimit(); err != nil {
-		c.reportError("_autofill", err)
-		return
-	}
-
-	c.copy(ctx)
+	return nil
 }
 
-func (c *Copyer) reportError(file string, err error) {
-	e := &Error{Path: file, Err: err}
+func (c *Copyer) eventLoop(ctx context.Context) {
+	chans := make([]chan Event, len(c.eventHanders))
+	for idx := range chans {
+		chans[idx] = make(chan Event, 128)
+	}
+
+	for idx, ch := range chans {
+		handler := c.eventHanders[idx]
+		events := ch
+
+		go wrap(ctx, func() {
+			for {
+				e, ok := <-events
+				if !ok {
+					handler(&EventFinished{})
+					return
+				}
+				handler(e)
+			}
+		})
+	}
+
+	defer func() {
+		for _, ch := range chans {
+			close(ch)
+		}
+	}()
+	for {
+		select {
+		case e, ok := <-c.eventCh:
+			if !ok {
+				return
+			}
+			for _, ch := range chans {
+				ch <- e
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (c *Copyer) logf(l logrus.Level, format string, args ...any) {
+	c.logger.Logf(l, format, args...)
+}
+
+func (c *Copyer) submit(e Event) {
+	c.eventCh <- e
+}
+
+func (c *Copyer) reportError(src, dst string, err error) {
+	e := &Error{Src: src, Dst: dst, Err: err}
 	c.logf(logrus.ErrorLevel, e.Error())
-
-	c.errsLock.Lock()
-	defer c.errsLock.Unlock()
-	c.errors = append(c.errors, e)
-}
-
-func (c *Copyer) getErrors() []*Error {
-	c.errsLock.Lock()
-	defer c.errsLock.Unlock()
-	return c.errors
-}
-
-func (c *Copyer) addBadDsts(dst string, err error) {
-	c.badDstsLock.Lock()
-	defer c.badDstsLock.Unlock()
-	c.badDsts[dst] = err
-}
-
-func (c *Copyer) getBadDsts() map[string]error {
-	c.errsLock.Lock()
-	defer c.errsLock.Unlock()
-	return c.badDsts
+	c.submit(&EventReportError{Error: e})
 }

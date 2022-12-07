@@ -6,139 +6,123 @@ import (
 	"os"
 	"sort"
 	"sync/atomic"
-
-	"github.com/schollz/progressbar/v3"
+	"time"
 )
 
 const (
 	unexpectFileMode = os.ModeType &^ os.ModeDir
 )
 
-func (c *Copyer) index(ctx context.Context) {
-	for _, s := range c.src {
-		c.walk(nil, s)
-	}
-
-	c.updateProgressBar(func(bar *progressbar.ProgressBar) {
-		bar.ChangeMax64(atomic.LoadInt64(&c.totalBytes))
-		bar.Describe(fmt.Sprintf("[0/%d] index finished...", atomic.LoadInt64(&c.totalFiles)))
-	})
+type counter struct {
+	bytes, files int64
 }
 
-func (c *Copyer) walk(parent *baseJob, src *source) *baseJob {
-	path := src.path()
-
-	stat, err := os.Stat(path)
+func (c *Copyer) index(ctx context.Context) (<-chan *baseJob, error) {
+	jobs := c.walk(ctx)
+	filtered, err := c.joinJobs(jobs)
 	if err != nil {
-		c.reportError(path, fmt.Errorf("walk get stat, %w", err))
-		return nil
-	}
-	if stat.Mode()&unexpectFileMode != 0 {
-		return nil
+		return nil, err
 	}
 
-	job, err := newJobFromFileInfo(parent, src, stat)
-	if err != nil {
-		c.reportError(path, fmt.Errorf("make job fail, %w", err))
-		return nil
-	}
+	ch := make(chan *baseJob, 128)
+	go wrap(ctx, func() {
+		defer close(ch)
 
-	c.appendJobs(job)
-	if job.typ == jobTypeNormal {
-		totalBytes := atomic.AddInt64(&c.totalBytes, job.size)
-		totalFiles := atomic.AddInt64(&c.totalFiles, 1)
-
-		c.updateProgressBar(func(bar *progressbar.ProgressBar) {
-			bar.ChangeMax64(totalBytes)
-			bar.Describe(fmt.Sprintf("[0/%d] indexing...", totalFiles))
-		})
-
-		return job
-	}
-
-	files, err := os.ReadDir(path)
-	if err != nil {
-		c.reportError(path, fmt.Errorf("walk read dir, %w", err))
-		return nil
-	}
-
-	job.children = make(map[*baseJob]struct{}, len(files))
-	for _, file := range files {
-		id := c.walk(job, &source{base: src.base, relativePath: src.relativePath + "/" + file.Name()})
-		if id == nil {
-			continue
+		for _, job := range filtered {
+			select {
+			case <-ctx.Done():
+				return
+			case ch <- job:
+			}
 		}
-		job.children[id] = struct{}{}
-	}
+	})
 
-	return job
+	return ch, nil
 }
 
-func (c *Copyer) checkJobs() bool {
-	c.jobsLock.Lock()
-	defer c.jobsLock.Unlock()
+func (c *Copyer) walk(ctx context.Context) []*baseJob {
+	done := make(chan struct{})
+	defer close(done)
 
-	if len(c.jobs) == 0 {
-		c.reportError("", fmt.Errorf("cannot found available jobs"))
-		return false
+	cntr := new(counter)
+	go wrap(ctx, func() {
+		ticker := time.NewTicker(time.Second)
+		for {
+			select {
+			case <-ticker.C:
+				c.submit(&EventUpdateCount{Bytes: atomic.LoadInt64(&cntr.bytes), Files: atomic.LoadInt64(&cntr.files)})
+			case <-done:
+				c.submit(&EventUpdateCount{Bytes: atomic.LoadInt64(&cntr.bytes), Files: atomic.LoadInt64(&cntr.files), Finished: true})
+				return
+			}
+		}
+	})
+
+	jobs := make([]*baseJob, 0, 64)
+	appendJob := func(job *baseJob) {
+		jobs = append(jobs, job)
+		atomic.AddInt64(&cntr.files, 1)
+		atomic.AddInt64(&cntr.bytes, job.size)
 	}
 
-	sort.Slice(c.jobs, func(i int, j int) bool {
-		return c.jobs[i].comparableRelativePath < c.jobs[j].comparableRelativePath
+	var walk func(src *source)
+	walk = func(src *source) {
+		path := src.src()
+
+		stat, err := os.Stat(path)
+		if err != nil {
+			c.reportError(path, "", fmt.Errorf("walk get stat, %w", err))
+			return
+		}
+
+		mode := stat.Mode()
+		if mode&unexpectFileMode != 0 {
+			return
+		}
+		if !mode.IsDir() {
+			job, err := c.newJobFromFileInfo(src, stat)
+			if err != nil {
+				c.reportError(path, "", fmt.Errorf("make job fail, %w", err))
+				return
+			}
+
+			appendJob(job)
+			return
+		}
+
+		files, err := os.ReadDir(path)
+		if err != nil {
+			c.reportError(path, "", fmt.Errorf("walk read dir, %w", err))
+			return
+		}
+		for _, file := range files {
+			walk(src.append(file.Name()))
+		}
+
+		return
+	}
+	for _, s := range c.src {
+		walk(s)
+	}
+	return jobs
+}
+
+func (c *Copyer) joinJobs(jobs []*baseJob) ([]*baseJob, error) {
+	sort.Slice(jobs, func(i int, j int) bool {
+		return comparePath(jobs[i].source.path, jobs[j].source.path) < 0
 	})
 
 	var last *baseJob
-	filtered := make([]*baseJob, 0, len(c.jobs))
-	for _, job := range c.jobs {
-		if last == nil {
-			filtered = append(filtered, job)
-			last = job
-			continue
-		}
-		if last.source.relativePath != job.source.relativePath {
-			filtered = append(filtered, job)
-			last = job
+	filtered := make([]*baseJob, 0, len(jobs))
+	for _, job := range jobs {
+		if last != nil && comparePath(last.source.path, job.source.path) == 0 {
+			c.reportError(last.source.src(), "", fmt.Errorf("same relative path, ignored, '%s'", job.source.src()))
 			continue
 		}
 
-		if last.typ != job.typ {
-			c.reportError(job.source.path(), fmt.Errorf("same relative path with different type, '%s' and '%s'", job.source.path(), last.source.path()))
-			return false
-		}
-		if last.typ == jobTypeNormal {
-			c.reportError(job.source.path(), fmt.Errorf("same relative path as normal file, ignored, '%s'", job.source.path()))
-			continue
-		}
-
-		func() {
-			last.lock.Lock()
-			defer last.lock.Unlock()
-
-			for n := range job.children {
-				last.children[n] = struct{}{}
-				n.parent = last
-			}
-		}()
+		filtered = append(filtered, job)
+		last = job
 	}
 
-	c.jobs = filtered
-	return true
-}
-
-func (c *Copyer) appendJobs(jobs ...*baseJob) {
-	c.jobsLock.Lock()
-	defer c.jobsLock.Unlock()
-	c.jobs = append(c.jobs, jobs...)
-}
-
-func (c *Copyer) getJobs() []*baseJob {
-	c.jobsLock.Lock()
-	defer c.jobsLock.Unlock()
-	return c.jobs
-}
-
-func (c *Copyer) getJobsAndNoSpaceSource() ([]*baseJob, []*source) {
-	c.jobsLock.Lock()
-	defer c.jobsLock.Unlock()
-	return c.jobs, c.noSpaceSource
+	return filtered, nil
 }

@@ -4,22 +4,31 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"sort"
 	"strings"
 
 	"github.com/sirupsen/logrus"
 )
 
 type source struct {
-	base         string
-	relativePath string
+	base string
+	path []string
 }
 
-func (s *source) path() string {
-	return s.base + s.relativePath
+func (s *source) src() string {
+	return s.base + path.Join(s.path...)
 }
 
-func (s *source) target(dst string) string {
-	return dst + s.relativePath
+func (s *source) dst(dst string) string {
+	return dst + path.Join(s.path...)
+}
+
+func (s *source) append(next ...string) *source {
+	copyed := make([]string, len(s.path)+len(next))
+	copy(copyed, s.path)
+	copy(copyed[len(s.path):], next)
+
+	return &source{base: s.base, path: copyed}
 }
 
 type option struct {
@@ -29,21 +38,18 @@ type option struct {
 	fromDevice *deviceOption
 	toDevice   *deviceOption
 
-	overwrite       bool
-	withProgressBar bool
-	threads         int
-	withHash        bool
+	createFlag int
+	withHash   bool
 
-	autoFill           bool
-	autoFillSplitDepth int
-
-	logger *logrus.Logger
+	logger       *logrus.Logger
+	eventHanders []EventHandler
 }
 
 func newOption() *option {
 	return &option{
 		fromDevice: new(deviceOption),
 		toDevice:   new(deviceOption),
+		createFlag: os.O_WRONLY | os.O_CREATE | os.O_EXCL,
 	}
 }
 
@@ -73,17 +79,20 @@ func (o *option) check() error {
 	if len(o.src) == 0 {
 		return fmt.Errorf("source path not found")
 	}
+	sort.Slice(o.src, func(i, j int) bool {
+		return comparePath(o.src[i].path, o.src[j].path) < 0
+	})
 	for _, s := range o.src {
-		if _, err := os.Stat(s.path()); err != nil {
-			return fmt.Errorf("check src path '%s', %w", s.path(), err)
+		src := s.src()
+		if _, err := os.Stat(src); err != nil {
+			return fmt.Errorf("check src path '%s', %w", src, err)
 		}
 	}
 
-	if o.threads < 1 {
-		o.threads = 4
-	}
-	if o.fromDevice.linear || o.toDevice.linear {
-		o.threads = 1
+	o.fromDevice.check()
+	o.toDevice.check()
+	if o.logger == nil {
+		o.logger = logrus.StandardLogger()
 	}
 	return nil
 }
@@ -99,23 +108,17 @@ func Source(paths ...string) Option {
 			}
 
 			base, name := path.Split(p)
-			o.src = append(o.src, &source{base: base, relativePath: name})
+			o.src = append(o.src, &source{base: base, path: []string{name}})
 		}
 		return o
 	}
 }
 
-func AccurateSource(base string, relativePaths ...string) Option {
+func AccurateSource(base string, paths ...[]string) Option {
 	return func(o *option) *option {
 		base = path.Clean(base)
-
-		for _, p := range relativePaths {
-			p = path.Clean(p)
-			if p[len(p)-1] == '/' {
-				p = p[:len(p)-1]
-			}
-
-			o.src = append(o.src, &source{base: base, relativePath: p})
+		for _, path := range paths {
+			o.src = append(o.src, &source{base: base, path: path})
 		}
 		return o
 	}
@@ -154,23 +157,18 @@ func SetToDevice(opts ...DeviceOption) Option {
 
 func Overwrite(b bool) Option {
 	return func(o *option) *option {
-		o.overwrite = b
+		if b {
+			o.createFlag = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+			return o
+		}
+
+		o.createFlag = os.O_WRONLY | os.O_CREATE | os.O_EXCL
 		return o
 	}
 }
 
-func WithProgressBar(b bool) Option {
-	return func(o *option) *option {
-		o.withProgressBar = b
-		return o
-	}
-}
-
-func WithThreads(threads int) Option {
-	return func(o *option) *option {
-		o.threads = threads
-		return o
-	}
+func WithProgressBar() Option {
+	return WithEventHandler(NewProgressBar())
 }
 
 func WithHash(b bool) Option {
@@ -180,17 +178,61 @@ func WithHash(b bool) Option {
 	}
 }
 
-func WithAutoFill(on bool, depth int) Option {
-	return func(o *option) *option {
-		o.autoFill = on
-		o.autoFillSplitDepth = depth
-		return o
-	}
-}
-
 func WithLogger(logger *logrus.Logger) Option {
 	return func(o *option) *option {
 		o.logger = logger
 		return o
 	}
+}
+
+func WithEventHandler(h EventHandler) Option {
+	return func(o *option) *option {
+		o.eventHanders = append(o.eventHanders, h)
+		return o
+	}
+}
+
+func comparePath(a, b []string) int {
+	al, bl := len(a), len(b)
+
+	l := al
+	if bl < al {
+		l = bl
+	}
+
+	for idx := 0; idx < l; idx++ {
+		if a[idx] < b[idx] {
+			return -1
+		}
+		if a[idx] > b[idx] {
+			return 1
+		}
+	}
+
+	if al < bl {
+		return -1
+	}
+	if al > bl {
+		return 1
+	}
+	return 0
+}
+
+// isChild return -1(not) 0(equal) 1(child)
+func isChild(parent, child []string) int {
+	pl, cl := len(parent), len(child)
+	if pl > cl {
+		return -1
+	}
+
+	for idx := 0; idx < pl; idx++ {
+		if parent[idx] != child[idx] {
+			return -1
+		}
+	}
+
+	if pl == cl {
+		return 0
+	}
+	return 1
 }

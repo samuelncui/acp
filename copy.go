@@ -6,14 +6,16 @@ import (
 	"fmt"
 	"hash"
 	"os"
+	"path"
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/abc950309/acp/mmap"
+	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/hashicorp/go-multierror"
 	"github.com/minio/sha256-simd"
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -24,121 +26,70 @@ var (
 	sha256Pool = &sync.Pool{New: func() interface{} { return sha256.New() }}
 )
 
-func (c *Copyer) copy(ctx context.Context) {
-	atomic.StoreInt64(&c.stage, StageCopy)
-	defer atomic.StoreInt64(&c.stage, StageFinished)
-	wg := new(sync.WaitGroup)
+func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *baseJob {
+	ch := make(chan *baseJob, 128)
 
-	wg.Add(1)
+	var copying sync.WaitGroup
+	done := make(chan struct{})
+	defer func() {
+		go wrap(ctx, func() {
+			defer close(done)
+			defer close(ch)
+
+			copying.Wait()
+		})
+	}()
+
+	cntr := new(counter)
 	go wrap(ctx, func() {
-		defer wg.Done()
-		defer close(c.writePipe)
-
-		for _, job := range c.getJobs() {
-			c.prepare(ctx, job)
-
+		ticker := time.NewTicker(time.Second)
+		for {
 			select {
-			case <-ctx.Done():
+			case <-ticker.C:
+				c.submit(&EventUpdateProgress{Bytes: atomic.LoadInt64(&cntr.bytes), Files: atomic.LoadInt64(&cntr.files)})
+			case <-done:
+				c.submit(&EventUpdateProgress{Bytes: atomic.LoadInt64(&cntr.bytes), Files: atomic.LoadInt64(&cntr.files), Finished: true})
 				return
-			default:
 			}
 		}
 	})
 
-	for i := 0; i < c.threads; i++ {
-		wg.Add(1)
+	badDsts := mapset.NewSet[string]()
+	for idx := 0; idx < c.toDevice.threads; idx++ {
+		copying.Add(1)
 		go wrap(ctx, func() {
-			defer wg.Done()
+			defer copying.Done()
 
 			for {
 				select {
-				case job, ok := <-c.writePipe:
+				case <-ctx.Done():
+					return
+				case job, ok := <-prepared:
 					if !ok {
 						return
 					}
 
-					wg.Add(1)
-					c.write(ctx, job)
-				case <-ctx.Done():
-					return
+					wrap(ctx, func() { c.write(ctx, job, ch, cntr, badDsts) })
 				}
 			}
 		})
 	}
 
-	go wrap(ctx, func() {
-		for job := range c.postPipe {
-			c.post(wg, job)
-		}
-	})
-
-	finished := make(chan struct{}, 1)
-	go wrap(ctx, func() {
-		wg.Wait()
-		finished <- struct{}{}
-	})
-
-	select {
-	case <-finished:
-	case <-ctx.Done():
-	}
+	return ch
 }
 
-func (c *Copyer) prepare(ctx context.Context, job *baseJob) {
-	job.setStatus(jobStatusPreparing)
-
-	switch job.typ {
-	case jobTypeDir:
-		for _, d := range c.dst {
-			target := job.source.target(d)
-			if err := os.MkdirAll(target, job.mode&os.ModePerm); err != nil && !os.IsExist(err) {
-				c.reportError(target, fmt.Errorf("mkdir fail, %w", err))
-				job.fail(target, fmt.Errorf("mkdir fail, %w", err))
-				continue
-			}
-			job.succes(target)
-		}
-
-		c.writePipe <- &writeJob{baseJob: job}
-		return
-	}
-
-	if c.readingFiles != nil {
-		c.readingFiles <- struct{}{}
-	}
-
-	file, err := mmap.Open(job.source.path())
-	if err != nil {
-		c.reportError(job.source.path(), fmt.Errorf("open src file fail, %w", err))
-		return
-	}
-
-	c.writePipe <- &writeJob{baseJob: job, src: file}
-}
-
-func (c *Copyer) write(ctx context.Context, job *writeJob) {
+func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, cntr *counter, badDsts mapset.Set[string]) {
 	job.setStatus(jobStatusCopying)
-	if job.typ != jobTypeNormal {
-		return
-	}
+	defer job.setStatus(jobStatusFinishing)
 
 	var wg sync.WaitGroup
 	defer func() {
 		wg.Wait()
-
-		job.src.Close()
-		if c.readingFiles != nil {
-			<-c.readingFiles
-		}
-
-		c.postPipe <- job.baseJob
+		job.done()
+		ch <- job.baseJob
 	}()
 
-	num := atomic.AddInt64(&c.copyedFiles, 1)
-	c.logf(logrus.InfoLevel, "[%d/%d] copying: %s", num, c.totalFiles, job.source.relativePath)
-	c.updateCopying(func(set map[int64]struct{}) { set[num] = struct{}{} })
-	defer c.updateCopying(func(set map[int64]struct{}) { delete(set, num) })
-
+	atomic.AddInt64(&cntr.files, 1)
 	chans := make([]chan []byte, 0, len(c.dst)+1)
 	defer func() {
 		for _, ch := range chans {
@@ -167,18 +118,21 @@ func (c *Copyer) write(ctx context.Context, job *writeJob) {
 	}
 
 	var readErr error
-	badDsts := c.getBadDsts()
 	for _, d := range c.dst {
 		dst := d
+		name := job.source.dst(dst)
 
-		name := job.source.target(dst)
-		if e, has := badDsts[dst]; has && e != nil {
-			job.fail(name, fmt.Errorf("bad target path, %w", e))
+		if badDsts.Contains(dst) {
+			job.fail(name, fmt.Errorf("bad target path"))
+			continue
+		}
+		if err := os.MkdirAll(path.Dir(name), os.ModePerm); err != nil {
+			job.fail(name, fmt.Errorf("mkdir dst dir fail, %w", err))
+			continue
 		}
 
 		file, err := os.OpenFile(name, c.createFlag, job.mode)
 		if err != nil {
-			c.reportError(name, fmt.Errorf("open dst file fail, %w", err))
 			job.fail(name, fmt.Errorf("open dst file fail, %w", err))
 			continue
 		}
@@ -206,11 +160,11 @@ func (c *Copyer) write(ctx context.Context, job *writeJob) {
 				}
 
 				// if no space
-				if errors.Is(err, syscall.ENOSPC) {
-					c.addBadDsts(dst, err)
+				if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EROFS) {
+					badDsts.Add(dst)
 				}
 
-				c.reportError(name, rerr)
+				c.reportError(job.source.src(), name, rerr)
 				job.fail(name, rerr)
 			}()
 
@@ -236,10 +190,10 @@ func (c *Copyer) write(ctx context.Context, job *writeJob) {
 	if len(chans) == 0 {
 		return
 	}
-	readErr = c.streamCopy(ctx, chans, job.src)
+	readErr = c.streamCopy(ctx, chans, job.src, &cntr.bytes)
 }
 
-func (c *Copyer) streamCopy(ctx context.Context, dsts []chan []byte, src *mmap.ReaderAt) error {
+func (c *Copyer) streamCopy(ctx context.Context, dsts []chan []byte, src *mmap.ReaderAt, bytes *int64) error {
 	if src.Len() == 0 {
 		return nil
 	}
@@ -255,7 +209,7 @@ func (c *Copyer) streamCopy(ctx context.Context, dsts []chan []byte, src *mmap.R
 		}
 
 		nr := len(buf)
-		atomic.AddInt64(&c.copyedBytes, int64(nr))
+		atomic.AddInt64(bytes, int64(nr))
 		if nr < batchSize {
 			return nil
 		}
@@ -265,26 +219,5 @@ func (c *Copyer) streamCopy(ctx context.Context, dsts []chan []byte, src *mmap.R
 			return ctx.Err()
 		default:
 		}
-	}
-}
-
-func (c *Copyer) post(wg *sync.WaitGroup, job *baseJob) {
-	defer wg.Done()
-
-	job.setStatus(jobStatusFinishing)
-	for _, name := range job.successTargets {
-		if err := os.Chtimes(name, job.modTime, job.modTime); err != nil {
-			c.reportError(name, fmt.Errorf("change info, chtimes fail, %w", err))
-		}
-	}
-
-	job.setStatus(jobStatusFinished)
-	if job.parent == nil {
-		return
-	}
-
-	left := job.parent.done(job)
-	if left == 0 {
-		c.postPipe <- job.parent
 	}
 }
