@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	unexpectFileMode = os.ModeType &^ os.ModeDir
+	UnexpectFileMode = os.ModeType &^ os.ModeDir
 )
 
 type counter struct {
@@ -76,10 +76,7 @@ func (c *Copyer) walk(ctx context.Context) []*baseJob {
 		}
 
 		mode := stat.Mode()
-		if mode&unexpectFileMode != 0 {
-			return
-		}
-		if !mode.IsDir() {
+		if mode.IsRegular() {
 			job, err := c.newJobFromFileInfo(src, stat)
 			if err != nil {
 				c.reportError(path, "", fmt.Errorf("make job fail, %w", err))
@@ -87,6 +84,9 @@ func (c *Copyer) walk(ctx context.Context) []*baseJob {
 			}
 
 			appendJob(job)
+			return
+		}
+		if mode&UnexpectFileMode != 0 {
 			return
 		}
 
@@ -98,8 +98,6 @@ func (c *Copyer) walk(ctx context.Context) []*baseJob {
 		for _, file := range files {
 			walk(src.append(file.Name()))
 		}
-
-		return
 	}
 	for _, s := range c.src {
 		walk(s)

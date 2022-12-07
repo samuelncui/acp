@@ -34,7 +34,6 @@ type baseJob struct {
 	copyer *Copyer
 	source *source
 
-	name    string      // base name of the file
 	size    int64       // length in bytes for regular files; system-dependent for others
 	mode    os.FileMode // file mode bits
 	modTime time.Time   // modification time
@@ -53,12 +52,11 @@ func (c *Copyer) newJobFromFileInfo(source *source, info os.FileInfo) (*baseJob,
 		copyer: c,
 		source: source,
 
-		name:    info.Name(),
 		size:    info.Size(),
 		mode:    info.Mode(),
 		modTime: info.ModTime(),
 	}
-	if job.mode.IsDir() || job.mode&unexpectFileMode != 0 {
+	if !job.mode.IsRegular() {
 		return nil, fmt.Errorf("unexpected file, path= %s", source.src())
 	}
 
