@@ -45,9 +45,9 @@ func (c *Copyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-chan *w
 						return
 					}
 
-					wj := &writeJob{baseJob: job, src: file, ch: make(chan struct{})}
+					wj := newWriteJob(job, file, c.fromDevice.linear)
 					ch <- wj
-					<-wj.ch
+					wj.wait()
 				}
 			}
 		})

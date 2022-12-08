@@ -126,9 +126,30 @@ type writeJob struct {
 	ch  chan struct{}
 }
 
+func newWriteJob(job *baseJob, src *mmap.ReaderAt, needWait bool) *writeJob {
+	j := &writeJob{
+		baseJob: job,
+		src:     src,
+	}
+	if needWait {
+		j.ch = make(chan struct{})
+	}
+	return j
+}
+
 func (wj *writeJob) done() {
 	wj.src.Close()
-	close(wj.ch)
+
+	if wj.ch != nil {
+		close(wj.ch)
+	}
+}
+
+func (wj *writeJob) wait() {
+	if wj.ch == nil {
+		return
+	}
+	<-wj.ch
 }
 
 type Job struct {

@@ -91,6 +91,10 @@ func (o *option) check() error {
 
 	o.fromDevice.check()
 	o.toDevice.check()
+	if o.fromDevice.linear || o.toDevice.linear {
+		o.fromDevice.threads = 1
+		o.toDevice.threads = 1
+	}
 	if o.logger == nil {
 		o.logger = logrus.StandardLogger()
 	}
