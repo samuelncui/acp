@@ -116,7 +116,6 @@ func Source(paths ...string) Option {
 
 func AccurateSource(base string, paths ...[]string) Option {
 	return func(o *option) *option {
-		base = path.Clean(base)
 		for _, path := range paths {
 			o.src = append(o.src, &source{base: base, path: path})
 		}
