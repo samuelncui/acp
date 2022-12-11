@@ -3,14 +3,10 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"os"
 	"os/signal"
-	"unsafe"
 
 	"github.com/abc950309/acp"
-	jsoniter "github.com/json-iterator/go"
-	"github.com/modern-go/reflect2"
 	"github.com/sirupsen/logrus"
 )
 
@@ -113,14 +109,7 @@ func main() {
 			}
 			defer r.Close()
 
-			var buf []byte
-			if *reportIndent {
-				buf, _ = reportJSON.MarshalIndent(report, "", "\t")
-			} else {
-				buf, _ = reportJSON.Marshal(report)
-			}
-
-			r.Write(buf)
+			r.Write([]byte(report.ToJSONString(*reportIndent)))
 		}()
 	}
 
@@ -130,41 +119,4 @@ func main() {
 	}
 
 	c.Wait()
-}
-
-var (
-	reportJSON jsoniter.API
-)
-
-type errValCoder struct{}
-
-func (*errValCoder) IsEmpty(ptr unsafe.Pointer) bool {
-	val := (*error)(ptr)
-	return *val == nil
-}
-
-func (*errValCoder) Encode(ptr unsafe.Pointer, stream *jsoniter.Stream) {
-	val := (*error)(ptr)
-	stream.WriteString((*val).Error())
-}
-
-func (*errValCoder) Decode(ptr unsafe.Pointer, iter *jsoniter.Iterator) {
-	val := (*error)(ptr)
-	*val = fmt.Errorf(iter.ReadString())
-}
-
-func init() {
-	reportJSON = jsoniter.Config{
-		EscapeHTML:             true,
-		SortMapKeys:            true,
-		ValidateJsonRawMessage: true,
-	}.Froze()
-
-	var emptyErr error
-	reportJSON.RegisterExtension(jsoniter.EncoderExtension{
-		reflect2.TypeOf(emptyErr): &errValCoder{},
-	})
-	reportJSON.RegisterExtension(jsoniter.DecoderExtension{
-		reflect2.TypeOf(emptyErr): &errValCoder{},
-	})
 }

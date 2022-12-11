@@ -1,8 +1,13 @@
 package acp
 
 import (
+	"fmt"
 	"path"
 	"sync"
+	"unsafe"
+
+	jsoniter "github.com/json-iterator/go"
+	"github.com/modern-go/reflect2"
 )
 
 type ReportGetter func() *Report
@@ -35,10 +40,9 @@ func NewReportGetter() (EventHandler, ReportGetter) {
 		for _, j := range jobs {
 			jobsCopyed = append(jobsCopyed, j)
 		}
+
 		errorsCopyed := make([]*Error, 0, len(jobs))
-		for _, e := range errors {
-			errorsCopyed = append(errorsCopyed, e)
-		}
+		errorsCopyed = append(errorsCopyed, errors...)
 
 		return &Report{
 			Jobs:   jobsCopyed,
@@ -51,4 +55,51 @@ func NewReportGetter() (EventHandler, ReportGetter) {
 type Report struct {
 	Jobs   []*Job   `json:"files,omitempty"`
 	Errors []*Error `json:"errors,omitempty"`
+}
+
+func (r *Report) ToJSONString(indent bool) string {
+	if indent {
+		buf, _ := reportJSON.MarshalIndent(r, "", "\t")
+		return string(buf)
+	}
+
+	buf, _ := reportJSON.Marshal(r)
+	return string(buf)
+}
+
+var (
+	reportJSON jsoniter.API
+)
+
+type errValCoder struct{}
+
+func (*errValCoder) IsEmpty(ptr unsafe.Pointer) bool {
+	val := (*error)(ptr)
+	return *val == nil
+}
+
+func (*errValCoder) Encode(ptr unsafe.Pointer, stream *jsoniter.Stream) {
+	val := (*error)(ptr)
+	stream.WriteString((*val).Error())
+}
+
+func (*errValCoder) Decode(ptr unsafe.Pointer, iter *jsoniter.Iterator) {
+	val := (*error)(ptr)
+	*val = fmt.Errorf(iter.ReadString())
+}
+
+func init() {
+	reportJSON = jsoniter.Config{
+		EscapeHTML:             true,
+		SortMapKeys:            true,
+		ValidateJsonRawMessage: true,
+	}.Froze()
+
+	var emptyErr error
+	reportJSON.RegisterExtension(jsoniter.EncoderExtension{
+		reflect2.TypeOf(emptyErr): &errValCoder{},
+	})
+	reportJSON.RegisterExtension(jsoniter.DecoderExtension{
+		reflect2.TypeOf(emptyErr): &errValCoder{},
+	})
 }
