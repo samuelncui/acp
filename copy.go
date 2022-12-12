@@ -15,7 +15,7 @@ import (
 	"github.com/abc950309/acp/mmap"
 	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/hashicorp/go-multierror"
-	"github.com/minio/sha256-simd"
+	sha256 "github.com/minio/sha256-simd"
 )
 
 const (
@@ -66,6 +66,9 @@ func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *ba
 					return
 				case job, ok := <-prepared:
 					if !ok {
+						return
+					}
+					if badDsts.Cardinality() >= len(c.dst) {
 						return
 					}
 

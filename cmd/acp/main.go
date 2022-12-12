@@ -7,6 +7,7 @@ import (
 	"os/signal"
 
 	"github.com/abc950309/acp"
+	"github.com/klauspost/cpuid/v2"
 	"github.com/sirupsen/logrus"
 )
 
@@ -33,7 +34,10 @@ func init() {
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 
+	cpuid.Flags()
 	flag.Parse()
+	cpuid.Detect()
+
 	sources := flag.Args()
 	if len(sources) == 0 {
 		logrus.Fatalf("cannot found source path")
