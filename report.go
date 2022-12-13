@@ -80,7 +80,7 @@ func (*errValCoder) IsEmpty(ptr unsafe.Pointer) bool {
 
 func (*errValCoder) Encode(ptr unsafe.Pointer, stream *jsoniter.Stream) {
 	val := (*error)(ptr)
-	if val == nil || *val == nil {
+	if val == nil || *val == nil || reflect2.IsNil(*val) {
 		stream.WriteNil()
 		return
 	}
