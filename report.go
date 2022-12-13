@@ -6,8 +6,10 @@ import (
 	"sync"
 	"unsafe"
 
+	"github.com/davecgh/go-spew/spew"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/modern-go/reflect2"
+	"github.com/sirupsen/logrus"
 )
 
 type ReportGetter func() *Report
@@ -74,18 +76,43 @@ var (
 type errValCoder struct{}
 
 func (*errValCoder) IsEmpty(ptr unsafe.Pointer) bool {
+	logrus.Infof("IsEmpty %s", spew.Sdump(ptr))
 	val := (*error)(ptr)
 	return *val == nil
 }
 
 func (*errValCoder) Encode(ptr unsafe.Pointer, stream *jsoniter.Stream) {
+	logrus.Infof("Encode %s", spew.Sdump(ptr))
 	val := (*error)(ptr)
 	stream.WriteString((*val).Error())
 }
 
 func (*errValCoder) Decode(ptr unsafe.Pointer, iter *jsoniter.Iterator) {
+	logrus.Infof("Decode %s", spew.Sdump(ptr))
 	val := (*error)(ptr)
 	*val = fmt.Errorf(iter.ReadString())
+}
+
+var (
+	errorType2 reflect2.Type
+)
+
+type reportJSONExtension struct {
+	jsoniter.DummyExtension
+}
+
+func (*reportJSONExtension) CreateDecoder(typ reflect2.Type) jsoniter.ValDecoder {
+	if typ.Implements(errorType2) {
+		return &errValCoder{}
+	}
+	return nil
+}
+
+func (*reportJSONExtension) CreateEncoder(typ reflect2.Type) jsoniter.ValEncoder {
+	if typ.Implements(errorType2) {
+		return &errValCoder{}
+	}
+	return nil
 }
 
 func init() {
@@ -96,10 +123,6 @@ func init() {
 	}.Froze()
 
 	var emptyErr error
-	reportJSON.RegisterExtension(jsoniter.EncoderExtension{
-		reflect2.TypeOf(emptyErr): &errValCoder{},
-	})
-	reportJSON.RegisterExtension(jsoniter.DecoderExtension{
-		reflect2.TypeOf(emptyErr): &errValCoder{},
-	})
+	errorType2 = reflect2.TypeOfPtr(&emptyErr).Elem()
+	reportJSON.RegisterExtension(&reportJSONExtension{})
 }
