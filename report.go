@@ -6,10 +6,8 @@ import (
 	"sync"
 	"unsafe"
 
-	"github.com/davecgh/go-spew/spew"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/modern-go/reflect2"
-	"github.com/sirupsen/logrus"
 )
 
 type ReportGetter func() *Report
@@ -76,19 +74,21 @@ var (
 type errValCoder struct{}
 
 func (*errValCoder) IsEmpty(ptr unsafe.Pointer) bool {
-	logrus.Infof("IsEmpty %s", spew.Sdump(ptr))
 	val := (*error)(ptr)
-	return *val == nil
+	return val == nil || *val == nil || reflect2.IsNil(*val)
 }
 
 func (*errValCoder) Encode(ptr unsafe.Pointer, stream *jsoniter.Stream) {
-	logrus.Infof("Encode %s", spew.Sdump(ptr))
 	val := (*error)(ptr)
+	if val == nil || *val == nil {
+		stream.WriteNil()
+		return
+	}
+
 	stream.WriteString((*val).Error())
 }
 
 func (*errValCoder) Decode(ptr unsafe.Pointer, iter *jsoniter.Iterator) {
-	logrus.Infof("Decode %s", spew.Sdump(ptr))
 	val := (*error)(ptr)
 	*val = fmt.Errorf(iter.ReadString())
 }

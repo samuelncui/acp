@@ -57,6 +57,14 @@ func (c *Copyer) run(ctx context.Context) error {
 	copyed := c.copy(ctx, prepared)
 	c.cleanupJob(ctx, copyed)
 
+	// empty pipes
+	for range indexed {
+	}
+	for range prepared {
+	}
+	for range copyed {
+	}
+
 	return nil
 }
 

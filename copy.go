@@ -130,12 +130,22 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			continue
 		}
 		if err := os.MkdirAll(path.Dir(name), os.ModePerm); err != nil {
+			// if no space
+			if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EROFS) {
+				badDsts.Add(dst)
+			}
+
 			job.fail(name, fmt.Errorf("mkdir dst dir fail, %w", err))
 			continue
 		}
 
 		file, err := os.OpenFile(name, c.createFlag, job.mode)
 		if err != nil {
+			// if no space
+			if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EROFS) {
+				badDsts.Add(dst)
+			}
+
 			job.fail(name, fmt.Errorf("open dst file fail, %w", err))
 			continue
 		}
@@ -158,13 +168,13 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 				for range ch {
 				}
 
-				if re := os.Remove(name); re != nil {
-					rerr = multierror.Append(rerr, re)
-				}
-
 				// if no space
 				if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EROFS) {
 					badDsts.Add(dst)
+				}
+
+				if re := os.Remove(name); re != nil {
+					rerr = multierror.Append(rerr, re)
 				}
 
 				c.reportError(job.source.src(), name, rerr)
