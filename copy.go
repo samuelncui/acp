@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	batchSize = 1024 * 1024
+	batchSize = 1 * 1024 * 1024
 )
 
 var (
@@ -207,8 +207,10 @@ func (c *Copyer) streamCopy(ctx context.Context, dsts []chan []byte, src *mmap.R
 			return fmt.Errorf("slice mmap fail, %w", err)
 		}
 
+		copyed := make([]byte, len(buf))
+		copy(copyed, buf)
 		for _, ch := range dsts {
-			ch <- buf
+			ch <- copyed
 		}
 
 		nr := len(buf)
