@@ -2,8 +2,7 @@ package acp
 
 import (
 	"encoding/hex"
-	"fmt"
-	"os"
+	"io/fs"
 	"sync"
 	"time"
 
@@ -32,36 +31,21 @@ var (
 
 type baseJob struct {
 	copyer *Copyer
-	source *source
+	src    *source
+	path   string
 
 	size    int64       // length in bytes for regular files; system-dependent for others
-	mode    os.FileMode // file mode bits
+	mode    fs.FileMode // file mode bits
 	modTime time.Time   // modification time
 
 	lock      sync.Mutex
 	writeTime time.Time
 	status    jobStatus
 
+	targets        []string
 	successTargets []string
 	failedTargets  map[string]error
 	hash           []byte
-}
-
-func (c *Copyer) newJobFromFileInfo(source *source, info os.FileInfo) (*baseJob, error) {
-	job := &baseJob{
-		copyer: c,
-		source: source,
-
-		size:    info.Size(),
-		mode:    info.Mode(),
-		modTime: info.ModTime(),
-	}
-	if !job.mode.IsRegular() {
-		return nil, fmt.Errorf("unexpected file, path= %s", source.src())
-	}
-
-	c.submit(&EventUpdateJob{job.report()})
-	return job, nil
 }
 
 func (j *baseJob) setStatus(s jobStatus) {
@@ -105,8 +89,8 @@ func (j *baseJob) fail(path string, err error) {
 
 func (j *baseJob) report() *Job {
 	return &Job{
-		Base: j.source.base,
-		Path: j.source.path,
+		Base: j.src.base,
+		Path: j.src.path,
 
 		Status:         statusMapping[j.status],
 		SuccessTargets: j.successTargets,
@@ -161,7 +145,7 @@ type Job struct {
 	FailTargets    map[string]error `json:"fail_target,omitempty"`
 
 	Size      int64       `json:"size"`
-	Mode      os.FileMode `json:"mode"`
+	Mode      fs.FileMode `json:"mode"`
 	ModTime   time.Time   `json:"mod_time"`
 	WriteTime time.Time   `json:"write_time"`
 	SHA256    string      `json:"sha256"`

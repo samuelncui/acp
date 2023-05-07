@@ -39,9 +39,9 @@ func (c *Copyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-chan *w
 
 					job.setStatus(jobStatusPreparing)
 
-					file, err := mmap.Open(job.source.src())
+					file, err := mmap.Open(job.path)
 					if err != nil {
-						c.reportError(job.source.src(), "", fmt.Errorf("open src file fail, %w", err))
+						c.reportError(job.path, "", fmt.Errorf("open src file fail, %w", err))
 						return
 					}
 

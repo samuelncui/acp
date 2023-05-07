@@ -15,7 +15,7 @@ func (c *Copyer) cleanupJob(ctx context.Context, copyed <-chan *baseJob) {
 			}
 			for _, name := range job.successTargets {
 				if err := os.Chtimes(name, job.modTime, job.modTime); err != nil {
-					c.reportError(job.source.src(), name, fmt.Errorf("change info, chtimes fail, %w", err))
+					c.reportError(job.path, name, fmt.Errorf("change info, chtimes fail, %w", err))
 				}
 			}
 

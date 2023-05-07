@@ -9,8 +9,9 @@ import (
 
 type Copyer struct {
 	*option
-	running sync.WaitGroup
-	eventCh chan Event
+	running   sync.WaitGroup
+	eventCh   chan Event
+	getDevice func(in string) string
 }
 
 func New(ctx context.Context, opts ...Option) (*Copyer, error) {
@@ -25,9 +26,15 @@ func New(ctx context.Context, opts ...Option) (*Copyer, error) {
 		return nil, err
 	}
 
+	getDevice, err := getMountpointCache()
+	if err != nil {
+		return nil, err
+	}
+
 	c := &Copyer{
-		option:  opt,
-		eventCh: make(chan Event, 128),
+		option:    opt,
+		eventCh:   make(chan Event, 128),
+		getDevice: getDevice,
 	}
 
 	c.running.Add(1)

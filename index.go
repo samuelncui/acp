@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/samber/lo"
 )
 
 const (
@@ -18,8 +21,7 @@ type counter struct {
 }
 
 func (c *Copyer) index(ctx context.Context) (<-chan *baseJob, error) {
-	jobs := c.walk(ctx)
-	filtered, err := c.joinJobs(jobs)
+	jobs, err := c.walk(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -28,7 +30,7 @@ func (c *Copyer) index(ctx context.Context) (<-chan *baseJob, error) {
 	go wrap(ctx, func() {
 		defer close(ch)
 
-		for _, job := range filtered {
+		for _, job := range jobs {
 			select {
 			case <-ctx.Done():
 				return
@@ -40,7 +42,7 @@ func (c *Copyer) index(ctx context.Context) (<-chan *baseJob, error) {
 	return ch, nil
 }
 
-func (c *Copyer) walk(ctx context.Context) []*baseJob {
+func (c *Copyer) walk(ctx context.Context) ([]*baseJob, error) {
 	done := make(chan struct{})
 	defer close(done)
 
@@ -60,13 +62,19 @@ func (c *Copyer) walk(ctx context.Context) []*baseJob {
 
 	jobs := make([]*baseJob, 0, 64)
 	appendJob := func(job *baseJob) {
+		if !job.mode.IsRegular() {
+			c.reportError(job.path, "", fmt.Errorf("unexpected file mode, not regular file, mode= %s", job.mode))
+			return
+		}
+
+		c.submit(&EventUpdateJob{job.report()})
 		jobs = append(jobs, job)
 		atomic.AddInt64(&cntr.files, 1)
 		atomic.AddInt64(&cntr.bytes, job.size)
 	}
 
-	var walk func(src *source)
-	walk = func(src *source) {
+	var walk func(src *source, dsts []string)
+	walk = func(src *source, dsts []string) {
 		path := src.src()
 
 		stat, err := os.Stat(path)
@@ -77,13 +85,21 @@ func (c *Copyer) walk(ctx context.Context) []*baseJob {
 
 		mode := stat.Mode()
 		if mode.IsRegular() {
-			job, err := c.newJobFromFileInfo(src, stat)
-			if err != nil {
-				c.reportError(path, "", fmt.Errorf("make job fail, %w", err))
-				return
+			targets := make([]string, 0, len(dsts))
+			for _, d := range dsts {
+				targets = append(targets, src.dst(d))
 			}
 
-			appendJob(job)
+			appendJob(&baseJob{
+				copyer: c,
+				path:   path,
+
+				size:    stat.Size(),
+				mode:    stat.Mode(),
+				modTime: stat.ModTime(),
+
+				targets: targets,
+			})
 			return
 		}
 		if mode&UnexpectFileMode != 0 {
@@ -96,25 +112,65 @@ func (c *Copyer) walk(ctx context.Context) []*baseJob {
 			return
 		}
 		for _, file := range files {
-			walk(src.append(file.Name()))
+			walk(src.append(file.Name()), dsts)
 		}
 	}
-	for _, s := range c.src {
-		walk(s)
+
+	results := make([]*baseJob, 0, 64)
+	for _, j := range c.wildcardJobs {
+		for _, s := range j.src {
+			walk(s, j.dst)
+		}
+
+		if len(jobs) == 0 {
+			continue
+		}
+
+		joined, err := c.joinJobs(jobs)
+		if err != nil {
+			return nil, err
+		}
+
+		results = append(results, joined...)
+		jobs = jobs[:0]
 	}
-	return jobs
+
+	for _, j := range c.accurateJobs {
+		stat, err := os.Stat(j.src)
+		if err != nil {
+			c.reportError(j.src, "", fmt.Errorf("accurate job get stat, %w", err))
+			continue
+		}
+		if !stat.Mode().IsRegular() {
+			continue
+		}
+
+		appendJob(&baseJob{
+			copyer: c,
+			src:    &source{base: "/", path: lo.Filter(strings.Split(j.src, "/"), func(s string, _ int) bool { return s != "" })},
+			path:   j.src,
+
+			size:    stat.Size(),
+			mode:    stat.Mode(),
+			modTime: stat.ModTime(),
+
+			targets: j.dsts,
+		})
+	}
+
+	return results, nil
 }
 
 func (c *Copyer) joinJobs(jobs []*baseJob) ([]*baseJob, error) {
 	sort.Slice(jobs, func(i int, j int) bool {
-		return comparePath(jobs[i].source.path, jobs[j].source.path) < 0
+		return comparePath(jobs[i].src.path, jobs[j].src.path) < 0
 	})
 
 	var last *baseJob
 	filtered := make([]*baseJob, 0, len(jobs))
 	for _, job := range jobs {
-		if last != nil && comparePath(last.source.path, job.source.path) == 0 {
-			c.reportError(last.source.src(), "", fmt.Errorf("same relative path, ignored, '%s'", job.source.src()))
+		if last != nil && comparePath(last.src.path, job.src.path) == 0 {
+			c.reportError(last.path, "", fmt.Errorf("same relative path, ignored, '%s'", job.path))
 			continue
 		}
 

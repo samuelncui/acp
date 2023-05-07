@@ -63,7 +63,7 @@ func main() {
 	}()
 
 	opts := make([]acp.Option, 0, 8)
-	opts = append(opts, acp.Source(sources...))
+	opts = append(opts, acp.WildcardJob(acp.Source(sources...), acp.Target(targetPaths...)))
 	// if *continueReport != "" {
 	// 	f, err := os.Open(*continueReport)
 	// 	if err != nil {
@@ -81,7 +81,6 @@ func main() {
 	// 	}
 	// }
 
-	opts = append(opts, acp.Target(targetPaths...))
 	opts = append(opts, acp.WithHash(*reportPath != ""))
 	opts = append(opts, acp.Overwrite(!*notOverwrite))
 

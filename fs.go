@@ -2,40 +2,42 @@ package acp
 
 import (
 	"fmt"
+	"strings"
 
-	"golang.org/x/sys/unix"
+	mapset "github.com/deckarep/golang-set/v2"
+	"github.com/moby/sys/mountinfo"
 )
 
-type fileSystem struct {
-	// TypeName      string
-	// MountPoint    string
-	TotalSize     int64
-	AvailableSize int64
-}
-
-func getFileSystem(path string) (*fileSystem, error) {
-	stat := new(unix.Statfs_t)
-	if err := unix.Statfs(path, stat); err != nil {
-		return nil, fmt.Errorf("read statfs fail, err= %w", err)
+func getMountpointCache() (func(string) string, error) {
+	mounts, err := mountinfo.GetMounts(nil)
+	if err != nil {
+		return nil, fmt.Errorf("get mounts fail, %w", err)
 	}
 
-	return &fileSystem{
-		// TypeName:      unpaddingInt8s(stat.Fstypename[:]),
-		// MountPoint:    unpaddingInt8s(stat.Mntonname[:]),
-		TotalSize:     int64(stat.Blocks) * int64(stat.Bsize),
-		AvailableSize: int64(stat.Bavail) * int64(stat.Bsize),
-	}, nil
-}
-
-func unpaddingInt8s(buf []int8) string {
-	result := make([]byte, 0, len(buf))
-	for _, c := range buf {
-		if c == 0x00 {
-			break
+	mountPoints := mapset.NewThreadUnsafeSet[string]()
+	for _, mount := range mounts {
+		if mount == nil {
+			continue
+		}
+		if mount.Mountpoint == "" {
+			continue
 		}
 
-		result = append(result, byte(c))
+		mp := mount.Mountpoint
+		if !strings.HasSuffix(mp, "/") {
+			mp = mp + "/"
+		}
+
+		mountPoints.Add(mp)
 	}
 
-	return string(result)
+	mps := mountPoints.ToSlice()
+	return Cache(func(path string) string {
+		for _, mp := range mps {
+			if strings.HasPrefix(path, mp) {
+				return mp
+			}
+		}
+		return ""
+	}), nil
 }

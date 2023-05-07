@@ -68,9 +68,6 @@ func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *ba
 					if !ok {
 						return
 					}
-					if badDsts.Cardinality() >= len(c.dst) {
-						return
-					}
 
 					wrap(ctx, func() { c.write(ctx, job, ch, cntr, badDsts) })
 				}
@@ -93,7 +90,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 	}()
 
 	atomic.AddInt64(&cntr.files, 1)
-	chans := make([]chan []byte, 0, len(c.dst)+1)
+	chans := make([]chan []byte, 0, len(job.targets)+1)
 	defer func() {
 		for _, ch := range chans {
 			close(ch)
@@ -121,32 +118,31 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 	}
 
 	var readErr error
-	for _, d := range c.dst {
-		dst := d
-		name := job.source.dst(dst)
-
-		if badDsts.Contains(dst) {
-			job.fail(name, fmt.Errorf("bad target path"))
+	for _, target := range job.targets {
+		dev := c.getDevice(target)
+		if badDsts.Contains(dev) {
+			job.fail(target, fmt.Errorf("bad target path"))
 			continue
 		}
-		if err := os.MkdirAll(path.Dir(name), os.ModePerm); err != nil {
+
+		if err := os.MkdirAll(path.Dir(target), os.ModePerm); err != nil {
 			// if no space
 			if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EROFS) {
-				badDsts.Add(dst)
+				badDsts.Add(dev)
 			}
 
-			job.fail(name, fmt.Errorf("mkdir dst dir fail, %w", err))
+			job.fail(target, fmt.Errorf("mkdir dst dir fail, %w", err))
 			continue
 		}
 
-		file, err := os.OpenFile(name, c.createFlag, job.mode)
+		file, err := os.OpenFile(target, c.createFlag, job.mode)
 		if err != nil {
 			// if no space
 			if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EROFS) {
-				badDsts.Add(dst)
+				badDsts.Add(dev)
 			}
 
-			job.fail(name, fmt.Errorf("open dst file fail, %w", err))
+			job.fail(target, fmt.Errorf("open dst file fail, %w", err))
 			continue
 		}
 
@@ -160,7 +156,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			var rerr error
 			defer func() {
 				if rerr == nil {
-					job.succes(name)
+					job.succes(target)
 					return
 				}
 
@@ -170,15 +166,15 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 
 				// if no space
 				if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EROFS) {
-					badDsts.Add(dst)
+					badDsts.Add(dev)
 				}
 
-				if re := os.Remove(name); re != nil {
+				if re := os.Remove(target); re != nil {
 					rerr = multierror.Append(rerr, re)
 				}
 
-				c.reportError(job.source.src(), name, rerr)
-				job.fail(name, rerr)
+				c.reportError(job.path, target, rerr)
+				job.fail(target, rerr)
 			}()
 
 			defer file.Close()

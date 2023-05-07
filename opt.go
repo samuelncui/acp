@@ -1,11 +1,8 @@
 package acp
 
 import (
-	"fmt"
 	"os"
 	"path"
-	"sort"
-	"strings"
 
 	"github.com/sirupsen/logrus"
 )
@@ -32,8 +29,8 @@ func (s *source) append(next ...string) *source {
 }
 
 type option struct {
-	src []*source
-	dst []string
+	accurateJobs []*accurateJob
+	wildcardJobs []*wildcardJob
 
 	fromDevice *deviceOption
 	toDevice   *deviceOption
@@ -54,38 +51,9 @@ func newOption() *option {
 }
 
 func (o *option) check() error {
-	filteredDst := make([]string, 0, len(o.dst))
-	for _, p := range o.dst {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		if p[len(p)-1] != '/' {
-			p = p + "/"
-		}
-
-		dstStat, err := os.Stat(p)
-		if err != nil {
-			return fmt.Errorf("check dst path '%s', %w", p, err)
-		}
-		if !dstStat.IsDir() {
-			return fmt.Errorf("dst path is not a dir")
-		}
-
-		filteredDst = append(filteredDst, p)
-	}
-	o.dst = filteredDst
-
-	if len(o.src) == 0 {
-		return fmt.Errorf("source path not found")
-	}
-	sort.Slice(o.src, func(i, j int) bool {
-		return comparePath(o.src[i].path, o.src[j].path) < 0
-	})
-	for _, s := range o.src {
-		src := s.src()
-		if _, err := os.Stat(src); err != nil {
-			return fmt.Errorf("check src path '%s', %w", src, err)
+	for _, job := range o.wildcardJobs {
+		if err := job.check(); err != nil {
+			return err
 		}
 	}
 
@@ -98,38 +66,20 @@ func (o *option) check() error {
 	if o.logger == nil {
 		o.logger = logrus.StandardLogger()
 	}
+
 	return nil
 }
 
 type Option func(*option) *option
 
-func Source(paths ...string) Option {
-	return func(o *option) *option {
-		for _, p := range paths {
-			p = path.Clean(p)
-			if p[len(p)-1] == '/' {
-				p = p[:len(p)-1]
-			}
-
-			base, name := path.Split(p)
-			o.src = append(o.src, &source{base: base, path: []string{name}})
-		}
-		return o
-	}
+type accurateJob struct {
+	src  string
+	dsts []string
 }
 
-func AccurateSource(base string, paths ...[]string) Option {
+func AccurateJob(src string, dsts []string) Option {
 	return func(o *option) *option {
-		for _, path := range paths {
-			o.src = append(o.src, &source{base: base, path: path})
-		}
-		return o
-	}
-}
-
-func Target(paths ...string) Option {
-	return func(o *option) *option {
-		o.dst = append(o.dst, paths...)
+		o.accurateJobs = append(o.accurateJobs, &accurateJob{src: src, dsts: dsts})
 		return o
 	}
 }
