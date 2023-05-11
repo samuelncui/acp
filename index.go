@@ -157,6 +157,7 @@ func (c *Copyer) walk(ctx context.Context) ([]*baseJob, error) {
 			targets: j.dsts,
 		})
 	}
+	results = append(results, jobs...)
 
 	return results, nil
 }
