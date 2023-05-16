@@ -92,6 +92,7 @@ func (c *Copyer) walk(ctx context.Context) ([]*baseJob, error) {
 
 			appendJob(&baseJob{
 				copyer: c,
+				src:    src,
 				path:   path,
 
 				size:    stat.Size(),
