@@ -97,26 +97,6 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 		}
 	}()
 
-	if c.withHash {
-		sha := sha256Pool.Get().(hash.Hash)
-		sha.Reset()
-
-		ch := make(chan []byte, 4)
-		chans = append(chans, ch)
-
-		wg.Add(1)
-		go wrap(ctx, func() {
-			defer wg.Done()
-			defer sha256Pool.Put(sha)
-
-			for buf := range ch {
-				sha.Write(buf)
-			}
-
-			job.setHash(sha.Sum(nil))
-		})
-	}
-
 	var readErr error
 	for _, target := range job.targets {
 		dev := c.getDevice(target)
@@ -195,9 +175,28 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			}
 		})
 	}
-
 	if len(chans) == 0 {
 		return
+	}
+
+	if c.withHash {
+		sha := sha256Pool.Get().(hash.Hash)
+		sha.Reset()
+
+		ch := make(chan []byte, 4)
+		chans = append(chans, ch)
+
+		wg.Add(1)
+		go wrap(ctx, func() {
+			defer wg.Done()
+			defer sha256Pool.Put(sha)
+
+			for buf := range ch {
+				sha.Write(buf)
+			}
+
+			job.setHash(sha.Sum(nil))
+		})
 	}
 	readErr = c.streamCopy(ctx, chans, job.src, &cntr.bytes)
 }
