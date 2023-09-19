@@ -99,6 +99,8 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 
 	var readErr error
 	for _, target := range job.targets {
+		target := target
+
 		dev := c.getDevice(target)
 		if badDsts.Contains(dev) {
 			job.fail(target, fmt.Errorf("bad target path"))
