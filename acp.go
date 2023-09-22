@@ -76,6 +76,9 @@ func (c *Copyer) run(ctx context.Context) error {
 }
 
 func (c *Copyer) eventLoop(ctx context.Context) {
+	c.running.Add(1)
+	defer c.running.Done()
+
 	chans := make([]chan Event, len(c.eventHanders))
 	for idx := range chans {
 		chans[idx] = make(chan Event, 128)
@@ -85,7 +88,10 @@ func (c *Copyer) eventLoop(ctx context.Context) {
 		handler := c.eventHanders[idx]
 		events := ch
 
+		c.running.Add(1)
 		go wrap(ctx, func() {
+			defer c.running.Done()
+
 			for {
 				e, ok := <-events
 				if !ok {
