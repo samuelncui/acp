@@ -7,7 +7,7 @@ import (
 	"os"
 	"sync"
 
-	"github.com/abc950309/acp/mmap"
+	"github.com/samuelncui/acp/mmap"
 )
 
 func (c *Copyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-chan *writeJob {

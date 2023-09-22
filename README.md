@@ -10,7 +10,7 @@ An Advanced Copy Tools, with following extra features:
 # Install
 ```
 # Install acp
-go install github.com/abc950309/acp/cmd/acp
+go install github.com/samuelncui/acp/cmd/acp
 ```
 
 # Usage

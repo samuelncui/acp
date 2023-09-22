@@ -6,8 +6,8 @@ import (
 	"os"
 	"os/signal"
 
-	"github.com/abc950309/acp"
 	"github.com/klauspost/cpuid/v2"
+	"github.com/samuelncui/acp"
 	"github.com/sirupsen/logrus"
 )
 
