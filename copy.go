@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"io"
 	"os"
 	"path"
 	"sync"
@@ -12,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/abc950309/acp/mmap"
 	mapset "github.com/deckarep/golang-set/v2"
 	"github.com/hashicorp/go-multierror"
 	sha256 "github.com/minio/sha256-simd"
@@ -203,21 +203,18 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 	readErr = c.streamCopy(ctx, chans, job.src, &cntr.bytes)
 }
 
-func (c *Copyer) streamCopy(ctx context.Context, dsts []chan []byte, src *mmap.ReaderAt, bytes *int64) error {
-	if src.Len() == 0 {
-		return nil
-	}
-
+func (c *Copyer) streamCopy(ctx context.Context, dsts []chan []byte, src io.ReadCloser, bytes *int64) error {
 	for idx := int64(0); ; idx += batchSize {
-		buf, err := src.Slice(idx, batchSize)
+		buf := make([]byte, batchSize)
+
+		n, err := io.ReadFull(src, buf)
 		if err != nil {
 			return fmt.Errorf("slice mmap fail, %w", err)
 		}
 
-		copyed := make([]byte, len(buf))
-		copy(copyed, buf)
+		buf = buf[:n]
 		for _, ch := range dsts {
-			ch <- copyed
+			ch <- buf
 		}
 
 		nr := len(buf)

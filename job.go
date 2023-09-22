@@ -2,11 +2,10 @@ package acp
 
 import (
 	"encoding/hex"
+	"io"
 	"io/fs"
 	"sync"
 	"time"
-
-	"github.com/abc950309/acp/mmap"
 )
 
 type jobStatus uint8
@@ -106,11 +105,11 @@ func (j *baseJob) report() *Job {
 
 type writeJob struct {
 	*baseJob
-	src *mmap.ReaderAt
+	src io.ReadCloser
 	ch  chan struct{}
 }
 
-func newWriteJob(job *baseJob, src *mmap.ReaderAt, needWait bool) *writeJob {
+func newWriteJob(job *baseJob, src io.ReadCloser, needWait bool) *writeJob {
 	j := &writeJob{
 		baseJob: job,
 		src:     src,
