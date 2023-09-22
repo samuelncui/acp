@@ -209,7 +209,9 @@ func (c *Copyer) streamCopy(ctx context.Context, dsts []chan []byte, src io.Read
 
 		n, err := io.ReadFull(src, buf)
 		if err != nil {
-			return fmt.Errorf("slice mmap fail, %w", err)
+			if !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+				return fmt.Errorf("slice mmap fail, %w", err)
+			}
 		}
 
 		buf = buf[:n]
