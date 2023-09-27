@@ -16,7 +16,6 @@ import (
 	mapset "github.com/deckarep/golang-set/v2"
 	sha256 "github.com/minio/sha256-simd"
 	"github.com/samber/lo"
-	"github.com/samuelncui/godf"
 )
 
 const (
@@ -117,14 +116,12 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			continue
 		}
 
-		diskUsage, err := godf.NewDiskUsage(dev)
-		if err != nil {
-			job.fail(target, fmt.Errorf("read disk usage fail, dev= '%s', %w", dev, err))
-			continue
-		}
-		if int64(diskUsage.Free()) < job.size {
-			noSpaceDevices.Add(dev)
-			job.fail(target, fmt.Errorf("%w, want= %d have= %d", ErrTargetNoSpace, job.size, diskUsage.Free()))
+		if err := c.getDiskUsageCache(dev).check(job.size); err != nil {
+			if errors.Is(err, ErrTargetNoSpace) {
+				noSpaceDevices.Add(dev)
+			}
+
+			job.fail(target, fmt.Errorf("check disk usage have error, %w", err))
 			continue
 		}
 

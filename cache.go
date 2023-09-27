@@ -1,8 +1,8 @@
 package acp
 
-func Cache[i comparable, o any](f func(in i) o) func(in i) o {
-	cache := make(map[i]o, 0)
-	return func(in i) o {
+func Cache[K comparable, V any](f func(in K) V) func(in K) V {
+	cache := make(map[K]V, 0)
+	return func(in K) V {
 		cached, has := cache[in]
 		if has {
 			return cached

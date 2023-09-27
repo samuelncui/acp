@@ -9,9 +9,10 @@ import (
 
 type Copyer struct {
 	*option
-	running   sync.WaitGroup
-	eventCh   chan Event
-	getDevice func(in string) string
+	running           sync.WaitGroup
+	eventCh           chan Event
+	getDevice         func(in string) string
+	getDiskUsageCache func(mountPoint string) *diskUsageCache
 }
 
 func New(ctx context.Context, opts ...Option) (*Copyer, error) {
@@ -35,6 +36,9 @@ func New(ctx context.Context, opts ...Option) (*Copyer, error) {
 		option:    opt,
 		eventCh:   make(chan Event, 128),
 		getDevice: getDevice,
+		getDiskUsageCache: Cache(func(mountPoint string) *diskUsageCache {
+			return newDiskUsageCache(mountPoint, defaultDiskUsageFreshInterval)
+		}),
 	}
 
 	c.running.Add(1)
