@@ -38,7 +38,7 @@ func (m *diskUsageCache) check(need int64) error {
 
 	usage, err := godf.NewDiskUsage(m.mountPoint)
 	if err != nil {
-		return fmt.Errorf("get disk usage fail, mount_point= %s", m.mountPoint)
+		return fmt.Errorf("get disk usage fail, mount_point= %s, %w", m.mountPoint, err)
 	}
 
 	m.freeSpace = int64(usage.Available())
