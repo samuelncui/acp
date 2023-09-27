@@ -16,15 +16,21 @@ const (
 	jobStatusCopying
 	jobStatusFinishing
 	jobStatusFinished
+
+	JobStatusPending   = "pending"
+	JobStatusPreparing = "preparing"
+	JobStatusCopying   = "copying"
+	JobStatusFinishing = "finishing"
+	JobStatusFinished  = "finished"
 )
 
 var (
 	statusMapping = map[jobStatus]string{
-		jobStatusPending:   "pending",
-		jobStatusPreparing: "preparing",
-		jobStatusCopying:   "copying",
-		jobStatusFinishing: "finishing",
-		jobStatusFinished:  "finished",
+		jobStatusPending:   JobStatusPending,
+		jobStatusPreparing: JobStatusPreparing,
+		jobStatusCopying:   JobStatusCopying,
+		jobStatusFinishing: JobStatusFinishing,
+		jobStatusFinished:  JobStatusFinished,
 	}
 )
 
