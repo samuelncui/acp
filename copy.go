@@ -73,11 +73,6 @@ func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *ba
 						return
 					}
 
-					if noSpaceDevices.Contains(lo.Map(job.targets, func(target string, _ int) string { return c.getDevice(target) })...) {
-						job.fail("", ErrTargetNoSpace)
-						continue
-					}
-
 					wrap(ctx, func() { c.write(ctx, job, ch, cntr, noSpaceDevices) })
 				}
 			}
@@ -97,6 +92,12 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 		job.done()
 		ch <- job.baseJob
 	}()
+
+	// shortcut
+	if noSpaceDevices.Contains(lo.Map(job.targets, func(target string, _ int) string { return c.getDevice(target) })...) {
+		job.fail("", ErrTargetNoSpace)
+		return
+	}
 
 	atomic.AddInt64(&cntr.files, 1)
 	chans := make([]chan []byte, 0, len(job.targets)+1)
