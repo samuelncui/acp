@@ -41,39 +41,39 @@ func (c *Copyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-chan *w
 
 					job.setStatus(jobStatusPreparing)
 
-					file, err := func(path string) (io.ReadCloser, error) {
+					file, size, err := func(path string) (io.ReadCloser, int64, error) {
 						if c.fromDevice.linear {
 							file, err := os.Open(path)
 							if err != nil {
-								return nil, fmt.Errorf("open src file fail, %w", err)
+								return nil, 0, fmt.Errorf("open src file fail, %w", err)
 							}
 
 							fileInfo, err := file.Stat()
 							if err != nil {
-								return nil, fmt.Errorf("get src file stat fail, %w", err)
+								return nil, 0, fmt.Errorf("get src file stat fail, %w", err)
 							}
 							if fileInfo.Size() == 0 {
-								return nil, fmt.Errorf("get src file, size is zero")
+								return nil, 0, fmt.Errorf("get src file, size is zero")
 							}
 
-							return file, nil
+							return file, fileInfo.Size(), nil
 						}
 
 						readerAt, err := mmap.Open(path)
 						if err != nil {
-							return nil, fmt.Errorf("open src file by mmap fail, %w", err)
+							return nil, 0, fmt.Errorf("open src file by mmap fail, %w", err)
 						}
 						if readerAt.Len() == 0 {
-							return nil, fmt.Errorf("get src file by mmap, size is zero")
+							return nil, 0, fmt.Errorf("get src file by mmap, size is zero")
 						}
 
-						return mmap.NewReader(readerAt), nil
+						return mmap.NewReader(readerAt), int64(readerAt.Len()), nil
 					}(job.path)
 					if err != nil {
 						c.reportError(job.path, "", err)
 					}
 
-					wj := newWriteJob(job, file, c.fromDevice.linear)
+					wj := newWriteJob(job, file, size, c.fromDevice.linear)
 					ch <- wj
 					wj.wait()
 				}

@@ -82,6 +82,7 @@ func (j *baseJob) fail(path string, err error) {
 	if j.failedTargets == nil {
 		j.failedTargets = make(map[string]error, 1)
 	}
+
 	j.failedTargets[path] = err
 	j.copyer.submit(&EventUpdateJob{j.report()})
 }
@@ -105,14 +106,16 @@ func (j *baseJob) report() *Job {
 
 type writeJob struct {
 	*baseJob
-	src io.ReadCloser
-	ch  chan struct{}
+	reader io.ReadCloser
+	size   int64
+	ch     chan struct{}
 }
 
-func newWriteJob(job *baseJob, src io.ReadCloser, needWait bool) *writeJob {
+func newWriteJob(job *baseJob, src io.ReadCloser, size int64, needWait bool) *writeJob {
 	j := &writeJob{
 		baseJob: job,
-		src:     src,
+		reader:  src,
+		size:    size,
 	}
 	if needWait {
 		j.ch = make(chan struct{})
@@ -121,7 +124,7 @@ func newWriteJob(job *baseJob, src io.ReadCloser, needWait bool) *writeJob {
 }
 
 func (wj *writeJob) done() {
-	wj.src.Close()
+	wj.reader.Close()
 
 	if wj.ch != nil {
 		close(wj.ch)

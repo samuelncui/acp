@@ -14,8 +14,9 @@ import (
 	"time"
 
 	mapset "github.com/deckarep/golang-set/v2"
-	"github.com/hashicorp/go-multierror"
 	sha256 "github.com/minio/sha256-simd"
+	"github.com/samber/lo"
+	"github.com/samuelncui/godf"
 )
 
 const (
@@ -24,6 +25,9 @@ const (
 
 var (
 	sha256Pool = &sync.Pool{New: func() interface{} { return sha256.New() }}
+
+	ErrTargetNoSpace        = fmt.Errorf("acp: target have no space")
+	ErrTargetDropToReadonly = fmt.Errorf("acp: target droped into readonly")
 )
 
 func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *baseJob {
@@ -54,7 +58,7 @@ func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *ba
 		}
 	})
 
-	badDsts := mapset.NewSet[string]()
+	noSpaceDevices := mapset.NewSet[string]()
 	for idx := 0; idx < c.toDevice.threads; idx++ {
 		copying.Add(1)
 		go wrap(ctx, func() {
@@ -69,7 +73,12 @@ func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *ba
 						return
 					}
 
-					wrap(ctx, func() { c.write(ctx, job, ch, cntr, badDsts) })
+					if noSpaceDevices.Contains(lo.Map(job.targets, func(target string, _ int) string { return c.getDevice(target) })...) {
+						job.fail("", ErrTargetNoSpace)
+						continue
+					}
+
+					wrap(ctx, func() { c.write(ctx, job, ch, cntr, noSpaceDevices) })
 				}
 			}
 		})
@@ -78,7 +87,7 @@ func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *ba
 	return ch
 }
 
-func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, cntr *counter, badDsts mapset.Set[string]) {
+func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, cntr *counter, noSpaceDevices mapset.Set[string]) {
 	job.setStatus(jobStatusCopying)
 	defer job.setStatus(jobStatusFinishing)
 
@@ -102,15 +111,33 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 		target := target
 
 		dev := c.getDevice(target)
-		if badDsts.Contains(dev) {
-			job.fail(target, fmt.Errorf("bad target path"))
+		if noSpaceDevices.Contains(dev) {
+			job.fail(target, ErrTargetNoSpace)
+			continue
+		}
+
+		diskUsage, err := godf.NewDiskUsage(dev)
+		if err != nil {
+			job.fail(target, fmt.Errorf("read disk usage fail, dev= '%s', %w", dev, err))
+			continue
+		}
+		if int64(diskUsage.Free()) < job.size {
+			noSpaceDevices.Add(dev)
+			job.fail(target, fmt.Errorf("%w, want= %d have= %d", ErrTargetNoSpace, job.size, diskUsage.Free()))
 			continue
 		}
 
 		if err := os.MkdirAll(path.Dir(target), os.ModePerm); err != nil {
 			// if no space
-			if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EROFS) {
-				badDsts.Add(dev)
+			if errors.Is(err, syscall.ENOSPC) {
+				noSpaceDevices.Add(dev)
+				job.fail(target, fmt.Errorf("%w, mkdir dst dir fail", ErrTargetNoSpace))
+				continue
+			}
+			if errors.Is(err, syscall.EROFS) {
+				noSpaceDevices.Add(dev)
+				job.fail(target, fmt.Errorf("%w, mkdir dst dir fail", ErrTargetDropToReadonly))
+				continue
 			}
 
 			job.fail(target, fmt.Errorf("mkdir dst dir fail, %w", err))
@@ -120,8 +147,15 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 		file, err := os.OpenFile(target, c.createFlag, job.mode)
 		if err != nil {
 			// if no space
-			if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EROFS) {
-				badDsts.Add(dev)
+			if errors.Is(err, syscall.ENOSPC) {
+				noSpaceDevices.Add(dev)
+				job.fail(target, fmt.Errorf("%w, open dst file fail", ErrTargetNoSpace))
+				continue
+			}
+			if errors.Is(err, syscall.EROFS) {
+				noSpaceDevices.Add(dev)
+				job.fail(target, fmt.Errorf("%w, open dst file fail", ErrTargetDropToReadonly))
+				continue
 			}
 
 			job.fail(target, fmt.Errorf("open dst file fail, %w", err))
@@ -146,17 +180,23 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 				for range ch {
 				}
 
+				if err := os.Remove(target); err != nil {
+					c.reportError(job.path, target, fmt.Errorf("delete failed file has error, %w", err))
+				}
+
 				// if no space
-				if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EROFS) {
-					badDsts.Add(dev)
+				if errors.Is(rerr, syscall.ENOSPC) {
+					noSpaceDevices.Add(dev)
+					job.fail(target, fmt.Errorf("%w, write dst file fail", ErrTargetNoSpace))
+					return
+				}
+				if errors.Is(rerr, syscall.EROFS) {
+					noSpaceDevices.Add(dev)
+					job.fail(target, fmt.Errorf("%w, write dst file fail", ErrTargetDropToReadonly))
+					return
 				}
 
-				if re := os.Remove(target); re != nil {
-					rerr = multierror.Append(rerr, re)
-				}
-
-				c.reportError(job.path, target, rerr)
-				job.fail(target, rerr)
+				job.fail(target, fmt.Errorf("write dst file fail, %w", rerr))
 			}()
 
 			defer file.Close()
@@ -200,7 +240,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			job.setHash(sha.Sum(nil))
 		})
 	}
-	readErr = c.streamCopy(ctx, chans, job.src, &cntr.bytes)
+	readErr = c.streamCopy(ctx, chans, job.reader, &cntr.bytes)
 }
 
 func (c *Copyer) streamCopy(ctx context.Context, dsts []chan []byte, src io.ReadCloser, bytes *int64) error {
