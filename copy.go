@@ -10,7 +10,6 @@ import (
 	"path"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	mapset "github.com/deckarep/golang-set/v2"
@@ -24,9 +23,6 @@ const (
 
 var (
 	sha256Pool = &sync.Pool{New: func() interface{} { return sha256.New() }}
-
-	ErrTargetNoSpace        = fmt.Errorf("acp: target have no space")
-	ErrTargetDropToReadonly = fmt.Errorf("acp: target droped into readonly")
 )
 
 func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *baseJob {
@@ -126,37 +122,14 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 		}
 
 		if err := os.MkdirAll(path.Dir(target), os.ModePerm); err != nil {
-			// if no space
-			if errors.Is(err, syscall.ENOSPC) {
-				noSpaceDevices.Add(dev)
-				job.fail(target, fmt.Errorf("%w, mkdir dst dir fail", ErrTargetNoSpace))
-				continue
-			}
-			if errors.Is(err, syscall.EROFS) {
-				noSpaceDevices.Add(dev)
-				job.fail(target, fmt.Errorf("%w, mkdir dst dir fail", ErrTargetDropToReadonly))
-				continue
-			}
-
-			job.fail(target, fmt.Errorf("mkdir dst dir fail, %w", err))
+			job.fail(target, fmt.Errorf("mkdir dst dir fail, %w", mappingError(err)))
 			continue
 		}
 
 		file, err := os.OpenFile(target, c.createFlag, job.mode)
 		if err != nil {
 			// if no space
-			if errors.Is(err, syscall.ENOSPC) {
-				noSpaceDevices.Add(dev)
-				job.fail(target, fmt.Errorf("%w, open dst file fail", ErrTargetNoSpace))
-				continue
-			}
-			if errors.Is(err, syscall.EROFS) {
-				noSpaceDevices.Add(dev)
-				job.fail(target, fmt.Errorf("%w, open dst file fail", ErrTargetDropToReadonly))
-				continue
-			}
-
-			job.fail(target, fmt.Errorf("open dst file fail, %w", err))
+			job.fail(target, fmt.Errorf("open dst file fail, %w", mappingError(err)))
 			continue
 		}
 
@@ -182,19 +155,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 					c.reportError(job.path, target, fmt.Errorf("delete failed file has error, %w", err))
 				}
 
-				// if no space
-				if errors.Is(rerr, syscall.ENOSPC) {
-					noSpaceDevices.Add(dev)
-					job.fail(target, fmt.Errorf("%w, write dst file fail", ErrTargetNoSpace))
-					return
-				}
-				if errors.Is(rerr, syscall.EROFS) {
-					noSpaceDevices.Add(dev)
-					job.fail(target, fmt.Errorf("%w, write dst file fail", ErrTargetDropToReadonly))
-					return
-				}
-
-				job.fail(target, fmt.Errorf("write dst file fail, %w", rerr))
+				job.fail(target, fmt.Errorf("write dst file fail, %w", mappingError(rerr)))
 			}()
 
 			defer file.Close()

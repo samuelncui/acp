@@ -1,8 +1,10 @@
 package acp
 
 import (
+	"errors"
 	"fmt"
 	"sync"
+	"syscall"
 
 	"github.com/samuelncui/godf"
 )
@@ -10,6 +12,22 @@ import (
 const (
 	defaultDiskUsageFreshInterval = 1024 * 1024 * 1024 * 2
 )
+
+var (
+	ErrTargetNoSpace        = fmt.Errorf("acp: target have no space")
+	ErrTargetDropToReadonly = fmt.Errorf("acp: target droped into readonly")
+
+	errorMapping = []errorPair{
+		{from: syscall.ENOSPC, to: ErrTargetNoSpace},
+		{from: syscall.EROFS, to: ErrTargetDropToReadonly},
+		{from: syscall.EIO, to: ErrTargetDropToReadonly},
+	}
+)
+
+type errorPair struct {
+	from error
+	to   error
+}
 
 type diskUsageCache struct {
 	mountPoint    string
@@ -48,4 +66,18 @@ func (m *diskUsageCache) check(need int64) error {
 	}
 
 	return nil
+}
+
+func mappingError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	for _, p := range errorMapping {
+		if errors.Is(err, p.from) {
+			return fmt.Errorf("%w: %w", p.to, err)
+		}
+	}
+
+	return err
 }
