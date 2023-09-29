@@ -22,6 +22,10 @@ var (
 		{from: syscall.EROFS, to: ErrTargetDropToReadonly},
 		{from: syscall.EIO, to: ErrTargetDropToReadonly},
 	}
+	abortErrors = []error{
+		ErrTargetNoSpace,
+		ErrTargetDropToReadonly,
+	}
 )
 
 type errorPair struct {
@@ -80,4 +84,14 @@ func mappingError(err error) error {
 	}
 
 	return err
+}
+
+func checkErrorAbort(err error) bool {
+	for _, e := range abortErrors {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+
+	return false
 }

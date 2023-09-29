@@ -121,15 +121,22 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			continue
 		}
 
-		if err := os.MkdirAll(path.Dir(target), os.ModePerm); err != nil {
-			job.fail(target, fmt.Errorf("mkdir dst dir fail, %w", mappingError(err)))
+		if err := mappingError(os.MkdirAll(path.Dir(target), os.ModePerm)); err != nil {
+			if checkErrorAbort(err) {
+				noSpaceDevices.Add(dev)
+			}
+
+			job.fail(target, fmt.Errorf("mkdir dst dir fail, %w", err))
 			continue
 		}
 
 		file, err := os.OpenFile(target, c.createFlag, job.mode)
-		if err != nil {
-			// if no space
-			job.fail(target, fmt.Errorf("open dst file fail, %w", mappingError(err)))
+		if err = mappingError(err); err != nil {
+			if checkErrorAbort(err) {
+				noSpaceDevices.Add(dev)
+			}
+
+			job.fail(target, fmt.Errorf("open dst file fail, %w", err))
 			continue
 		}
 
@@ -155,7 +162,12 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 					c.reportError(job.path, target, fmt.Errorf("delete failed file has error, %w", err))
 				}
 
-				job.fail(target, fmt.Errorf("write dst file fail, %w", mappingError(rerr)))
+				rerr = mappingError(rerr)
+				if checkErrorAbort(rerr) {
+					noSpaceDevices.Add(dev)
+				}
+
+				job.fail(target, fmt.Errorf("write dst file fail, %w", rerr))
 			}()
 
 			defer file.Close()
