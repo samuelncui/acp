@@ -11,7 +11,7 @@ require (
 	github.com/moby/sys/mountinfo v0.6.2
 	github.com/modern-go/reflect2 v1.0.2
 	github.com/samber/lo v1.38.1
-	github.com/samuelncui/godf v0.0.0-20230927093204-37ea5acb9fc1
+	github.com/samuelncui/godf v0.0.0-20231004032257-e436410ad5a0
 	github.com/schollz/progressbar/v3 v3.13.1
 	github.com/sirupsen/logrus v1.9.3
 )

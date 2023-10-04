@@ -63,7 +63,7 @@ func (m *diskUsageCache) check(need int64) error {
 		return fmt.Errorf("get disk usage fail, mount_point= %s, %w", m.mountPoint, err)
 	}
 
-	m.freeSpace = int64(usage.Available())
+	m.freeSpace = usage.Available()
 	m.used = need
 	if m.used > m.freeSpace {
 		return fmt.Errorf("%w, want= %d have= %d", ErrTargetNoSpace, m.used, m.freeSpace)
