@@ -2,6 +2,7 @@ package acp
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	mapset "github.com/deckarep/golang-set/v2"
@@ -33,6 +34,11 @@ func getMountpointCache() (func(string) string, error) {
 
 	mps := mountPoints.ToSlice()
 	return Cache(func(path string) string {
+		path, err := filepath.Abs(path)
+		if err != nil {
+			panic(fmt.Errorf("get abs from file path failed, path= '%s', %w", path, err))
+		}
+
 		for _, mp := range mps {
 			if strings.HasPrefix(path, mp) {
 				return mp
