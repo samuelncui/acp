@@ -22,7 +22,7 @@ func truncate(file *os.File, size int64) error {
 	return nil
 }
 
-func writeSysStat(name string, j *baseJob) error {
+func writeSysStat(name string, j *stat) error {
 	if err := os.Chmod(name, j.mode); err != nil {
 		return fmt.Errorf("chmod fail, %w", err)
 	}

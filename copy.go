@@ -130,7 +130,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			continue
 		}
 
-		file, err := os.OpenFile(target, c.createFlag, job.mode)
+		file, err := os.OpenFile(target, c.createFlag, job.stat.mode)
 		if err = mappingError(err); err != nil {
 			if checkErrorAbort(err) {
 				noSpaceDevices.Add(dev)

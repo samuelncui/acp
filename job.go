@@ -38,11 +38,7 @@ type baseJob struct {
 	copyer *Copyer
 	src    *source
 	path   string
-
-	size    int64       // length in bytes for regular files; system-dependent for others
-	mode    fs.FileMode // file mode bits
-	modTime time.Time   // modification time
-	sys     *sysStat
+	stat   *stat
 
 	lock      sync.Mutex
 	writeTime time.Time
@@ -103,9 +99,9 @@ func (j *baseJob) report() *Job {
 		SuccessTargets: j.successTargets,
 		FailTargets:    j.failedTargets,
 
-		Size:      j.size,
-		Mode:      j.mode,
-		ModTime:   j.modTime,
+		Size:      j.stat.size,
+		Mode:      j.stat.mode,
+		ModTime:   j.stat.modTime,
 		WriteTime: j.writeTime,
 		SHA256:    hex.EncodeToString(j.hash),
 	}

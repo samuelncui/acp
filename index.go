@@ -62,50 +62,51 @@ func (c *Copyer) walk(ctx context.Context) ([]*baseJob, error) {
 
 	jobs := make([]*baseJob, 0, 64)
 	appendJob := func(job *baseJob) {
-		if !job.mode.IsRegular() {
-			c.reportError(job.path, "", fmt.Errorf("unexpected file mode, not regular file, mode= %s", job.mode))
+		if !job.stat.mode.IsRegular() {
+			c.reportError(
+				job.path, "",
+				fmt.Errorf(
+					"unexpected file mode, not regular file, mode= %s",
+					job.stat.mode,
+				),
+			)
 			return
 		}
 
 		c.submit(&EventUpdateJob{job.report()})
 		jobs = append(jobs, job)
 		atomic.AddInt64(&cntr.files, 1)
-		atomic.AddInt64(&cntr.bytes, job.size)
+		atomic.AddInt64(&cntr.bytes, job.stat.size)
 	}
 
 	var walk func(src *source, dsts []string)
 	walk = func(src *source, dsts []string) {
 		path := src.src()
 
-		stat, err := os.Stat(path)
+		fi, err := os.Stat(path)
 		if err != nil {
 			c.reportError(path, "", fmt.Errorf("walk get stat, %w", err))
 			return
 		}
 
-		mode := stat.Mode()
+		mode := fi.Mode()
 		if mode.IsRegular() {
 			targets := make([]string, 0, len(dsts))
 			for _, d := range dsts {
 				targets = append(targets, src.dst(d))
 			}
 
-			sysStat, err := readSysStat(path, stat)
+			stat, err := newStat(path, fi)
 			if err != nil {
 				c.reportError(path, "", fmt.Errorf("read sys stat, %w", err))
 				return
 			}
 
 			appendJob(&baseJob{
-				copyer: c,
-				src:    src,
-				path:   path,
-
-				size:    stat.Size(),
-				mode:    stat.Mode(),
-				modTime: stat.ModTime(),
-				sys:     sysStat,
-
+				copyer:  c,
+				src:     src,
+				path:    path,
+				stat:    stat,
 				targets: targets,
 			})
 			return
@@ -144,31 +145,26 @@ func (c *Copyer) walk(ctx context.Context) ([]*baseJob, error) {
 	}
 
 	for _, j := range c.accurateJobs {
-		stat, err := os.Stat(j.src)
+		fi, err := os.Stat(j.src)
 		if err != nil {
 			c.reportError(j.src, "", fmt.Errorf("accurate job get stat, %w", err))
 			continue
 		}
-		if !stat.Mode().IsRegular() {
+		if !fi.Mode().IsRegular() {
 			continue
 		}
 
-		sysStat, err := readSysStat(j.src, stat)
+		stat, err := newStat(j.src, fi)
 		if err != nil {
 			c.reportError(j.src, "", fmt.Errorf("read sys stat, %w", err))
 			continue
 		}
 
 		appendJob(&baseJob{
-			copyer: c,
-			src:    &source{base: "/", path: lo.Filter(strings.Split(j.src, "/"), func(s string, _ int) bool { return s != "" })},
-			path:   j.src,
-
-			size:    stat.Size(),
-			mode:    stat.Mode(),
-			modTime: stat.ModTime(),
-			sys:     sysStat,
-
+			copyer:  c,
+			src:     &source{base: "/", path: lo.Filter(strings.Split(j.src, "/"), func(s string, _ int) bool { return s != "" })},
+			path:    j.src,
+			stat:    stat,
 			targets: j.dsts,
 		})
 	}

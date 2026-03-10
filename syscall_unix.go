@@ -37,7 +37,7 @@ func readSysStat(path string, stat fs.FileInfo) (*sysStat, error) {
 	return &sysStat{Stat_t: sysstat, xattrs: xattrs}, nil
 }
 
-func writeSysStat(name string, j *baseJob) error {
+func writeSysStat(name string, j *stat) error {
 	if err := writeXattrs(name, j.sys.xattrs); err != nil {
 		return fmt.Errorf("write xattr fail, %w", err)
 	}
