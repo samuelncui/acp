@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -12,6 +13,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/samuelncui/acp"
@@ -32,6 +34,7 @@ type rewriteState struct {
 	Root     string         `json:"root"`
 	Pending  []rewriteEntry `json:"pending,omitempty"`
 	Busy     []rewriteEntry `json:"busy,omitempty"`
+	Missing  []rewriteEntry `json:"missing,omitempty"`
 	TmpFiles []string       `json:"tmp_files,omitempty"`
 }
 
@@ -41,6 +44,12 @@ func main() {
 	statePath := flag.String("state", ".acp-rewrite-state.json", "state storage path")
 	reportPath := flag.String("report", "", "json report storage path")
 	reportIndent := flag.Bool("report-indent", false, "json report with indent")
+	ignorePaths := make([]string, 0, 4)
+
+	flag.Func("ignore", "ignore path, file or dir", func(s string) error {
+		ignorePaths = append(ignorePaths, s)
+		return nil
+	})
 
 	flag.Parse()
 	if flag.NArg() == 0 {
@@ -62,6 +71,10 @@ func main() {
 		if err != nil {
 			logrus.Fatalf("get abs report path fail, %s", err)
 		}
+	}
+	ignoreAbs, err := normalizeIgnorePaths(rootAbs, ignorePaths)
+	if err != nil {
+		logrus.Fatalf("normalize ignore path fail, %s", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -87,8 +100,11 @@ func main() {
 	}
 
 	if len(state.Pending) == 0 && len(state.Busy) == 0 {
-		entries, err := scanEntries(rootAbs, stateAbs, reportAbs)
+		entries, err := scanEntries(ctx, rootAbs, stateAbs, reportAbs, ignoreAbs)
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
 			logrus.Fatalf("scan path fail, %s", err)
 		}
 		state.Pending = entries
@@ -126,6 +142,22 @@ func main() {
 				logrus.Fatalf("save state fail, %s", err)
 			}
 			return
+		}
+
+		if _, err := os.Stat(entry.Path); err != nil {
+			if os.IsNotExist(err) {
+				state.Missing = append(state.Missing, entry)
+				if bar != nil {
+					_ = bar.Add(1)
+				}
+				continue
+			}
+			logrus.Warnf("stat fail, path= '%s', err= %s", entry.Path, err)
+			state.Pending = append(state.Pending, entry)
+			if bar != nil {
+				_ = bar.Add(1)
+			}
+			continue
 		}
 
 		busy, err := isFileBusy(entry.Path)
@@ -170,6 +202,9 @@ func main() {
 		}
 
 		if err != nil {
+			if ctx.Err() != nil {
+				_ = os.Remove(tmpPath)
+			}
 			logrus.Warnf("rewrite fail, path= '%s', err= %s", entry.Path, err)
 			state.Pending = append(state.Pending, entry)
 			if bar != nil {
@@ -204,13 +239,22 @@ func main() {
 	printDuplicates(reportJobs)
 }
 
-func scanEntries(root, statePath, reportPath string) ([]rewriteEntry, error) {
+func scanEntries(ctx context.Context, root, statePath, reportPath string, ignorePaths []string) ([]rewriteEntry, error) {
 	groups := make(map[fileIdentity][]string)
 	entries := make([]rewriteEntry, 0, 128)
 
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if err != nil {
 			return err
+		}
+		if shouldIgnorePath(p, ignorePaths) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
 		if p == statePath || (reportPath != "" && p == reportPath) {
 			return nil
@@ -254,6 +298,45 @@ func scanEntries(root, statePath, reportPath string) ([]rewriteEntry, error) {
 
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
 	return entries, nil
+}
+
+func normalizeIgnorePaths(root string, ignores []string) ([]string, error) {
+	if len(ignores) == 0 {
+		return nil, nil
+	}
+	normalized := make([]string, 0, len(ignores))
+	for _, p := range ignores {
+		if p == "" {
+			continue
+		}
+		if !filepath.IsAbs(p) {
+			p = filepath.Join(root, p)
+		}
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			return nil, err
+		}
+		normalized = append(normalized, filepath.Clean(abs))
+	}
+	return normalized, nil
+}
+
+func shouldIgnorePath(p string, ignores []string) bool {
+	if len(ignores) == 0 {
+		return false
+	}
+	for _, ig := range ignores {
+		if ig == "" {
+			continue
+		}
+		if p == ig {
+			return true
+		}
+		if strings.HasPrefix(p, ig+string(os.PathSeparator)) {
+			return true
+		}
+	}
+	return false
 }
 
 func newTmpPath(path string, rnd *rand.Rand) (string, error) {

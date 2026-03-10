@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -38,7 +39,7 @@ func TestScanEntriesHardlinks(t *testing.T) {
 		t.Fatalf("write c: %v", err)
 	}
 
-	entries, err := scanEntries(root, statePath, reportPath)
+	entries, err := scanEntries(context.Background(), root, statePath, reportPath, nil)
 	if err != nil {
 		t.Fatalf("scan entries: %v", err)
 	}
@@ -66,6 +67,52 @@ func TestScanEntriesHardlinks(t *testing.T) {
 	}
 	if single.Path != c {
 		t.Fatalf("single entry path = %q", single.Path)
+	}
+}
+
+func TestScanEntriesCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	root := t.TempDir()
+	entries, err := scanEntries(ctx, root, "", "", nil)
+	if err == nil || err != context.Canceled {
+		t.Fatalf("expected canceled, got %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("entries count = %d", len(entries))
+	}
+}
+
+func TestScanEntriesIgnorePaths(t *testing.T) {
+	root := t.TempDir()
+	keep := filepath.Join(root, "keep.txt")
+	skipDir := filepath.Join(root, "skip")
+	skipFile := filepath.Join(root, "skip.txt")
+
+	if err := os.MkdirAll(skipDir, 0o755); err != nil {
+		t.Fatalf("mkdir skip: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skipDir, "a.txt"), []byte("a"), 0o644); err != nil {
+		t.Fatalf("write skip a: %v", err)
+	}
+	if err := os.WriteFile(skipFile, []byte("skip"), 0o644); err != nil {
+		t.Fatalf("write skip file: %v", err)
+	}
+	if err := os.WriteFile(keep, []byte("keep"), 0o644); err != nil {
+		t.Fatalf("write keep: %v", err)
+	}
+
+	ignorePaths, err := normalizeIgnorePaths(root, []string{"skip", "skip.txt"})
+	if err != nil {
+		t.Fatalf("normalize ignore: %v", err)
+	}
+	entries, err := scanEntries(context.Background(), root, "", "", ignorePaths)
+	if err != nil {
+		t.Fatalf("scan entries: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Path != keep {
+		t.Fatalf("entries = %+v", entries)
 	}
 }
 
