@@ -90,6 +90,12 @@ func (c *Copyer) walk(ctx context.Context) ([]*baseJob, error) {
 				targets = append(targets, src.dst(d))
 			}
 
+			sysStat, err := readSysStat(path, stat)
+			if err != nil {
+				c.reportError(path, "", fmt.Errorf("read sys stat, %w", err))
+				return
+			}
+
 			appendJob(&baseJob{
 				copyer: c,
 				src:    src,
@@ -98,7 +104,7 @@ func (c *Copyer) walk(ctx context.Context) ([]*baseJob, error) {
 				size:    stat.Size(),
 				mode:    stat.Mode(),
 				modTime: stat.ModTime(),
-				sys:     stat.Sys(),
+				sys:     sysStat,
 
 				targets: targets,
 			})
@@ -147,6 +153,12 @@ func (c *Copyer) walk(ctx context.Context) ([]*baseJob, error) {
 			continue
 		}
 
+		sysStat, err := readSysStat(j.src, stat)
+		if err != nil {
+			c.reportError(j.src, "", fmt.Errorf("read sys stat, %w", err))
+			continue
+		}
+
 		appendJob(&baseJob{
 			copyer: c,
 			src:    &source{base: "/", path: lo.Filter(strings.Split(j.src, "/"), func(s string, _ int) bool { return s != "" })},
@@ -155,7 +167,7 @@ func (c *Copyer) walk(ctx context.Context) ([]*baseJob, error) {
 			size:    stat.Size(),
 			mode:    stat.Mode(),
 			modTime: stat.ModTime(),
-			sys:     stat.Sys(),
+			sys:     sysStat,
 
 			targets: j.dsts,
 		})

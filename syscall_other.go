@@ -5,14 +5,24 @@ package acp
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 )
 
-func truncate(_ *os.File, _ int64) error {
+type sysStat struct{}
+
+func readSysStat(path string, stat fs.FileInfo) (*sysStat, error) {
+	return nil, nil
+}
+
+func truncate(file *os.File, size int64) error {
+	if err := file.Truncate(size); err != nil {
+		return err
+	}
 	return nil
 }
 
-func copyAttrs(name string, j *baseJob) error {
+func writeSysStat(name string, j *baseJob) error {
 	if err := os.Chmod(name, j.mode); err != nil {
 		return fmt.Errorf("chmod fail, %w", err)
 	}

@@ -4,9 +4,11 @@
 package acp
 
 import (
-	"fmt"
+	"errors"
 	"os"
-	"syscall"
+	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 func truncate(file *os.File, size int64) error {
@@ -16,19 +18,10 @@ func truncate(file *os.File, size int64) error {
 	return nil
 }
 
-func copyAttrs(name string, j *baseJob) error {
-	if err := os.Chmod(name, j.mode); err != nil {
-		return fmt.Errorf("chmod fail, %w", err)
-	}
-	if os.Geteuid() == 0 {
-		if stat, ok := j.sys.(*syscall.Stat_t); ok {
-			if err := os.Chown(name, int(stat.Uid), int(stat.Gid)); err != nil {
-				return fmt.Errorf("chown fail, %w", err)
-			}
-		}
-	}
-	if err := os.Chtimes(name, j.modTime, j.modTime); err != nil {
-		return fmt.Errorf("chtimes fail, %w", err)
-	}
-	return nil
+func isNoAttrErr(err error) bool {
+	return errors.Is(err, unix.ENOATTR) || errors.Is(err, unix.ENODATA)
+}
+
+func checkXattrKey(key string) bool {
+	return !strings.HasPrefix(key, "system.")
 }

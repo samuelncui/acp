@@ -42,7 +42,7 @@ type baseJob struct {
 	size    int64       // length in bytes for regular files; system-dependent for others
 	mode    fs.FileMode // file mode bits
 	modTime time.Time   // modification time
-	sys     any
+	sys     *sysStat
 
 	lock      sync.Mutex
 	writeTime time.Time

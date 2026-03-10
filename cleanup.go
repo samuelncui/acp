@@ -14,8 +14,8 @@ func (c *Copyer) cleanupJob(ctx context.Context, copyed <-chan *baseJob) {
 			}
 
 			for _, name := range job.successTargets {
-				if err := copyAttrs(name, job); err != nil {
-					c.reportError(job.path, name, fmt.Errorf("change info, copy attrs fail, %w", err))
+				if err := writeSysStat(name, job); err != nil {
+					c.reportError(job.path, name, fmt.Errorf("change info, write sys stat fail, %w", err))
 				}
 			}
 
