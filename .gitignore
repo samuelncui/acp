@@ -17,3 +17,4 @@
 go.sum
 output/
 test.sh
+upload_test.sh

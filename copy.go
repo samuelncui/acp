@@ -139,6 +139,12 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			job.fail(target, fmt.Errorf("open dst file fail, %w", err))
 			continue
 		}
+		if !job.copyer.toDevice.linear {
+			if err := truncate(file, job.size); err != nil {
+				job.fail(target, fmt.Errorf("truncate dst file fail, %w", err))
+				continue
+			}
+		}
 
 		ch := make(chan []byte, 4)
 		chans = append(chans, ch)
@@ -150,7 +156,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			var rerr error
 			defer func() {
 				if rerr == nil {
-					job.succes(target)
+					job.success(target)
 					return
 				}
 
@@ -183,8 +189,13 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 				}
 			}
 
+			if err := file.Sync(); err != nil {
+				rerr = fmt.Errorf("sync dst file fail, %w", err)
+				return
+			}
 			if readErr != nil {
 				rerr = readErr
+				return
 			}
 		})
 	}

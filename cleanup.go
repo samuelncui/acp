@@ -3,7 +3,6 @@ package acp
 import (
 	"context"
 	"fmt"
-	"os"
 )
 
 func (c *Copyer) cleanupJob(ctx context.Context, copyed <-chan *baseJob) {
@@ -13,9 +12,10 @@ func (c *Copyer) cleanupJob(ctx context.Context, copyed <-chan *baseJob) {
 			if !ok {
 				return
 			}
+
 			for _, name := range job.successTargets {
-				if err := os.Chtimes(name, job.modTime, job.modTime); err != nil {
-					c.reportError(job.path, name, fmt.Errorf("change info, chtimes fail, %w", err))
+				if err := copyAttrs(name, job); err != nil {
+					c.reportError(job.path, name, fmt.Errorf("change info, copy attrs fail, %w", err))
 				}
 			}
 

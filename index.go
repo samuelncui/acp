@@ -98,6 +98,7 @@ func (c *Copyer) walk(ctx context.Context) ([]*baseJob, error) {
 				size:    stat.Size(),
 				mode:    stat.Mode(),
 				modTime: stat.ModTime(),
+				sys:     stat.Sys(),
 
 				targets: targets,
 			})
@@ -154,6 +155,7 @@ func (c *Copyer) walk(ctx context.Context) ([]*baseJob, error) {
 			size:    stat.Size(),
 			mode:    stat.Mode(),
 			modTime: stat.ModTime(),
+			sys:     stat.Sys(),
 
 			targets: j.dsts,
 		})

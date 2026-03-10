@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"os/signal"
+	"strings"
 
 	"github.com/klauspost/cpuid/v2"
 	"github.com/samuelncui/acp"
@@ -63,7 +64,47 @@ func main() {
 	}()
 
 	opts := make([]acp.Option, 0, 8)
-	opts = append(opts, acp.WildcardJob(acp.Source(sources...), acp.Target(targetPaths...)))
+
+	useAccurate := func() bool {
+		if *noTarget {
+			return false
+		}
+		if len(sources) > 1 {
+			return false
+		}
+		if len(targetPaths) > 1 {
+			return false
+		}
+
+		dst, src := targetPaths[0], sources[0]
+		if strings.HasSuffix(dst, "/") {
+			return false
+		}
+
+		dstStat, err := os.Stat(dst)
+		if err == nil {
+			return !dstStat.IsDir()
+		}
+		if !os.IsNotExist(err) {
+			logrus.Fatalf("stat dst path fail, %s", err)
+			panic(err)
+		}
+
+		srcStat, err := os.Stat(src)
+		if err == nil {
+			return srcStat.Mode().IsRegular()
+		}
+
+		logrus.Fatalf("stat src path fail, %s", err)
+		panic(err)
+	}()
+
+	if useAccurate {
+		opts = append(opts, acp.AccurateJob(sources[0], []string{targetPaths[0]}))
+	} else {
+		opts = append(opts, acp.WildcardJob(acp.Source(sources...), acp.Target(targetPaths...)))
+	}
+
 	// if *continueReport != "" {
 	// 	f, err := os.Open(*continueReport)
 	// 	if err != nil {
@@ -106,8 +147,8 @@ func main() {
 			report := getter()
 			r, err := os.Create(*reportPath)
 			if err != nil {
-				logrus.Warnf("open report fail, path= '%s', err= %w", *reportPath, err)
-				logrus.Infof("report: %s", report)
+				logrus.Warnf("open report fail, path= '%s', err= %s", *reportPath, err)
+				logrus.Infof("report= %q", report.ToJSONString(false))
 				return
 			}
 			defer r.Close()

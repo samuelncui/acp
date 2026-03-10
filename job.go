@@ -42,6 +42,7 @@ type baseJob struct {
 	size    int64       // length in bytes for regular files; system-dependent for others
 	mode    fs.FileMode // file mode bits
 	modTime time.Time   // modification time
+	sys     any
 
 	lock      sync.Mutex
 	writeTime time.Time
@@ -73,7 +74,7 @@ func (j *baseJob) setHash(h []byte) {
 	j.copyer.submit(&EventUpdateJob{j.report()})
 }
 
-func (j *baseJob) succes(path string) {
+func (j *baseJob) success(path string) {
 	j.lock.Lock()
 	defer j.lock.Unlock()
 
