@@ -8,8 +8,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
-
-	"github.com/samber/lo"
 )
 
 const (
@@ -162,7 +160,7 @@ func (c *Copyer) walk(ctx context.Context) ([]*baseJob, error) {
 
 		appendJob(&baseJob{
 			copyer:  c,
-			src:     &source{base: "/", path: lo.Filter(strings.Split(j.src, "/"), func(s string, _ int) bool { return s != "" })},
+			src:     &source{base: "/", path: j.src},
 			path:    j.src,
 			stat:    stat,
 			targets: j.dsts,
@@ -175,13 +173,14 @@ func (c *Copyer) walk(ctx context.Context) ([]*baseJob, error) {
 
 func (c *Copyer) joinJobs(jobs []*baseJob) ([]*baseJob, error) {
 	sort.Slice(jobs, func(i int, j int) bool {
-		return comparePath(jobs[i].src.path, jobs[j].src.path) < 0
+		si, sj := strings.ReplaceAll(jobs[i].src.path, "/", "\x00"), strings.ReplaceAll(jobs[j].src.path, "/", "\x00")
+		return si < sj
 	})
 
 	var last *baseJob
 	filtered := make([]*baseJob, 0, len(jobs))
 	for _, job := range jobs {
-		if last != nil && comparePath(last.src.path, job.src.path) == 0 {
+		if last != nil && last.src.path == job.src.path {
 			c.reportError(last.path, "", fmt.Errorf("same relative path, ignored, '%s'", job.path))
 			continue
 		}

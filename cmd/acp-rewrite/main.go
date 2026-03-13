@@ -10,7 +10,6 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
-	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -519,8 +518,7 @@ func removeTmp(tmpFiles []string, tmp string) []string {
 
 func findJob(report *acp.Report, filePath string) (*acp.Job, bool) {
 	for _, job := range report.Jobs {
-		full := job.Base + path.Join(job.Path...)
-		if full == filePath {
+		if job.FullPath == filePath {
 			return job, true
 		}
 	}
@@ -557,8 +555,7 @@ func mergeReport(jobs map[string]*acp.Job, errors *[]*acp.Error, report *acp.Rep
 		return
 	}
 	for _, job := range report.Jobs {
-		full := job.Base + path.Join(job.Path...)
-		jobs[full] = job
+		jobs[job.FullPath] = job
 	}
 	if len(report.Errors) > 0 {
 		*errors = append(*errors, report.Errors...)
@@ -603,9 +600,8 @@ func printDuplicates(jobs map[string]*acp.Job) {
 		if job == nil || job.SHA256 == "" || job.Size == 0 {
 			continue
 		}
-		full := job.Base + path.Join(job.Path...)
 		key := dupKey{size: job.Size, hash: job.SHA256}
-		dups[key] = append(dups[key], full)
+		dups[key] = append(dups[key], job.FullPath)
 	}
 
 	keys := make([]dupKey, 0, len(dups))

@@ -14,6 +14,7 @@ require (
 	github.com/samuelncui/godf v0.0.0-20231004032257-e436410ad5a0
 	github.com/schollz/progressbar/v3 v3.13.1
 	github.com/sirupsen/logrus v1.9.3
+	golang.org/x/sys v0.12.0
 )
 
 require (
@@ -22,6 +23,5 @@ require (
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/rivo/uniseg v0.4.4 // indirect
 	golang.org/x/exp v0.0.0-20230905200255-921286631fa9 // indirect
-	golang.org/x/sys v0.12.0 // indirect
 	golang.org/x/term v0.12.0 // indirect
 )

@@ -9,23 +9,19 @@ import (
 
 type source struct {
 	base string
-	path []string
+	path string
 }
 
 func (s *source) src() string {
-	return s.base + path.Join(s.path...)
+	return path.Join(s.base, s.path)
 }
 
 func (s *source) dst(dst string) string {
-	return dst + path.Join(s.path...)
+	return path.Join(dst, s.path)
 }
 
-func (s *source) append(next ...string) *source {
-	copyed := make([]string, len(s.path)+len(next))
-	copy(copyed, s.path)
-	copy(copyed[len(s.path):], next)
-
-	return &source{base: s.base, path: copyed}
+func (s *source) append(next string) *source {
+	return &source{base: s.base, path: path.Join(s.path, next)}
 }
 
 type option struct {
@@ -79,7 +75,7 @@ type accurateJob struct {
 
 func AccurateJob(src string, dsts []string) Option {
 	return func(o *option) *option {
-		o.accurateJobs = append(o.accurateJobs, &accurateJob{src: src, dsts: dsts})
+		o.accurateJobs = append(o.accurateJobs, &accurateJob{src: path.Clean(src), dsts: dsts})
 		return o
 	}
 }
@@ -143,49 +139,4 @@ func WithEventHandler(h EventHandler) Option {
 		o.eventHanders = append(o.eventHanders, h)
 		return o
 	}
-}
-
-func comparePath(a, b []string) int {
-	al, bl := len(a), len(b)
-
-	l := al
-	if bl < al {
-		l = bl
-	}
-
-	for idx := 0; idx < l; idx++ {
-		if a[idx] < b[idx] {
-			return -1
-		}
-		if a[idx] > b[idx] {
-			return 1
-		}
-	}
-
-	if al < bl {
-		return -1
-	}
-	if al > bl {
-		return 1
-	}
-	return 0
-}
-
-// isChild return -1(not) 0(equal) 1(child)
-func isChild(parent, child []string) int {
-	pl, cl := len(parent), len(child)
-	if pl > cl {
-		return -1
-	}
-
-	for idx := 0; idx < pl; idx++ {
-		if parent[idx] != child[idx] {
-			return -1
-		}
-	}
-
-	if pl == cl {
-		return 0
-	}
-	return 1
 }

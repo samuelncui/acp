@@ -2,7 +2,6 @@ package acp
 
 import (
 	"fmt"
-	"path"
 	"sync"
 	"unsafe"
 
@@ -23,7 +22,7 @@ func NewReportGetter() (EventHandler, ReportGetter) {
 			lock.Lock()
 			defer lock.Unlock()
 
-			key := path.Join(e.Job.Path...)
+			key := e.Job.Path
 			jobs[key] = e.Job
 		case *EventReportError:
 			lock.Lock()

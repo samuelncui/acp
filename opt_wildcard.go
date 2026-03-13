@@ -40,7 +40,8 @@ func (job *wildcardJob) check() error {
 		return fmt.Errorf("source path not found")
 	}
 	sort.Slice(job.src, func(i, j int) bool {
-		return comparePath(job.src[i].path, job.src[j].path) < 0
+		si, sj := strings.ReplaceAll(job.src[i].path, "/", "\x00"), strings.ReplaceAll(job.src[j].path, "/", "\x00")
+		return si < sj
 	})
 	for _, s := range job.src {
 		src := s.src()
@@ -79,16 +80,26 @@ func Source(paths ...string) WildcardJobOption {
 			}
 
 			base, name := path.Split(p)
-			j.src = append(j.src, &source{base: base, path: []string{name}})
+			j.src = append(j.src, &source{base: base, path: name})
 		}
 		return j
 	}
 }
 
+func SourceWithPath(base string, paths ...string) WildcardJobOption {
+	return func(j *wildcardJob) *wildcardJob {
+		for _, p := range paths {
+			j.src = append(j.src, &source{base: base, path: p})
+		}
+		return j
+	}
+}
+
+// Deprecated: use SourceWithPath instead
 func AccurateSource(base string, paths ...[]string) WildcardJobOption {
 	return func(j *wildcardJob) *wildcardJob {
-		for _, path := range paths {
-			j.src = append(j.src, &source{base: base, path: path})
+		for _, p := range paths {
+			j.src = append(j.src, &source{base: base, path: path.Join(p...)})
 		}
 		return j
 	}

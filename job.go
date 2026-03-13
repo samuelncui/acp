@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"io"
 	"io/fs"
+	"path"
 	"sync"
 	"time"
 )
@@ -92,8 +93,9 @@ func (j *baseJob) fail(path string, err error) {
 
 func (j *baseJob) report() *Job {
 	return &Job{
-		Base: j.src.base,
-		Path: j.src.path,
+		FullPath: path.Join(j.src.base, j.src.path),
+		Base:     j.src.base,
+		Path:     j.src.path,
 
 		Status:         statusMapping[j.status],
 		SuccessTargets: j.successTargets,
@@ -142,8 +144,9 @@ func (wj *writeJob) wait() {
 }
 
 type Job struct {
-	Base string   `json:"base"`
-	Path []string `json:"path"`
+	FullPath string `json:"full_path"`
+	Base     string `json:"base"`
+	Path     string `json:"path"`
 
 	Status         string           `json:"status"`
 	SuccessTargets []string         `json:"success_target,omitempty"`
