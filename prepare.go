@@ -1,6 +1,7 @@
 package acp
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -50,10 +51,8 @@ func (c *Copyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-chan *w
 
 							fileInfo, err := file.Stat()
 							if err != nil {
+								_ = file.Close()
 								return nil, 0, fmt.Errorf("get src file stat fail, %w", err)
-							}
-							if fileInfo.Size() == 0 {
-								return nil, 0, fmt.Errorf("get src file, size is zero")
 							}
 
 							return file, fileInfo.Size(), nil
@@ -64,13 +63,19 @@ func (c *Copyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-chan *w
 							return nil, 0, fmt.Errorf("open src file by mmap fail, %w", err)
 						}
 						if readerAt.Len() == 0 {
-							return nil, 0, fmt.Errorf("get src file by mmap, size is zero")
+							if err := readerAt.Close(); err != nil {
+								return nil, 0, fmt.Errorf("close empty src file by mmap fail, %w", err)
+							}
+							return io.NopCloser(bytes.NewReader(nil)), 0, nil
 						}
 
 						return mmap.NewReader(readerAt), int64(readerAt.Len()), nil
 					}(job.path)
 					if err != nil {
 						c.reportError(job.path, "", err)
+						job.fail("", err)
+						job.setStatus(jobStatusFinished)
+						continue
 					}
 
 					wj := newWriteJob(job, file, size, c.fromDevice.linear)

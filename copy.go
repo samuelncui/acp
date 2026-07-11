@@ -7,7 +7,7 @@ import (
 	"hash"
 	"io"
 	"os"
-	"path"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,18 +30,22 @@ func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *ba
 
 	var copying sync.WaitGroup
 	done := make(chan struct{})
+	var reporting sync.WaitGroup
 	defer func() {
 		go wrap(ctx, func() {
-			defer close(done)
-			defer close(ch)
-
 			copying.Wait()
+			close(done)
+			reporting.Wait()
+			close(ch)
 		})
 	}()
 
 	cntr := new(counter)
+	reporting.Add(1)
 	go wrap(ctx, func() {
+		defer reporting.Done()
 		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
@@ -121,7 +125,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			continue
 		}
 
-		if err := mappingError(os.MkdirAll(path.Dir(target), os.ModePerm)); err != nil {
+		if err := mappingError(os.MkdirAll(filepath.Dir(target), os.ModePerm)); err != nil {
 			if checkErrorAbort(err) {
 				noSpaceDevices.Add(dev)
 			}
@@ -139,7 +143,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			job.fail(target, fmt.Errorf("open dst file fail, %w", err))
 			continue
 		}
-		if !job.copyer.toDevice.linear {
+		if !job.copyer.toDevice.linear && job.size > 0 {
 			if err := truncate(file, job.size); err != nil {
 				job.fail(target, fmt.Errorf("truncate dst file fail, %w", err))
 				continue

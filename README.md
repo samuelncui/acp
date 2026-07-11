@@ -41,3 +41,7 @@ acp example -target target1 -target target2
 # do not copy, just get a dir index, write to `report.json`
 acp example -notarget -report report.json
 ```
+
+## Testing
+
+See [TESTING.md](TESTING.md) for unit, race, end-to-end, and cross-platform test instructions.

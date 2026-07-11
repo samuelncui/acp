@@ -53,9 +53,7 @@ func (c *Copyer) Wait() {
 
 func (c *Copyer) run(ctx context.Context) error {
 	defer c.running.Done()
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	defer close(c.eventCh)
 
 	go wrap(ctx, func() { c.eventLoop(ctx) })
 
@@ -112,17 +110,9 @@ func (c *Copyer) eventLoop(ctx context.Context) {
 			close(ch)
 		}
 	}()
-	for {
-		select {
-		case e, ok := <-c.eventCh:
-			if !ok {
-				return
-			}
-			for _, ch := range chans {
-				ch <- e
-			}
-		case <-ctx.Done():
-			return
+	for e := range c.eventCh {
+		for _, ch := range chans {
+			ch <- e
 		}
 	}
 }

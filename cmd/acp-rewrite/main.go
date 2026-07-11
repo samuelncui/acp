@@ -212,7 +212,7 @@ func main() {
 			continue
 		}
 
-		if err := relink(entry); err != nil {
+		if err := relinkOrRetry(state, entry); err != nil {
 			logrus.Warnf("relink fail, path= '%s', err= %s", entry.Path, err)
 		}
 
@@ -425,6 +425,14 @@ func relink(entry rewriteEntry) error {
 		if err := relinkOne(entry.Path, link); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func relinkOrRetry(state *rewriteState, entry rewriteEntry) error {
+	if err := relink(entry); err != nil {
+		state.Pending = append(state.Pending, entry)
+		return err
 	}
 	return nil
 }

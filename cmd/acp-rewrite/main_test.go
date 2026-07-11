@@ -182,3 +182,22 @@ func TestRelinkOnePreserveLinkAttrs(t *testing.T) {
 		t.Fatalf("link content = %q", string(data))
 	}
 }
+
+func TestRelinkOrRetry(t *testing.T) {
+	dir := t.TempDir()
+	entry := rewriteEntry{
+		Path:  filepath.Join(dir, "missing-src"),
+		Links: []string{filepath.Join(dir, "link")},
+	}
+	state := new(rewriteState)
+
+	if err := relinkOrRetry(state, entry); err == nil {
+		t.Fatalf("expected relink error")
+	}
+	if len(state.Pending) != 1 {
+		t.Fatalf("pending entries = %d", len(state.Pending))
+	}
+	if state.Pending[0].Path != entry.Path {
+		t.Fatalf("pending path = %q", state.Pending[0].Path)
+	}
+}

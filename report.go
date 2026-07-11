@@ -1,7 +1,7 @@
 package acp
 
 import (
-	"fmt"
+	"errors"
 	"sync"
 	"unsafe"
 
@@ -89,7 +89,7 @@ func (*errValCoder) Encode(ptr unsafe.Pointer, stream *jsoniter.Stream) {
 
 func (*errValCoder) Decode(ptr unsafe.Pointer, iter *jsoniter.Iterator) {
 	val := (*error)(ptr)
-	*val = fmt.Errorf(iter.ReadString())
+	*val = errors.New(iter.ReadString())
 }
 
 var (
@@ -101,14 +101,14 @@ type reportJSONExtension struct {
 }
 
 func (*reportJSONExtension) CreateDecoder(typ reflect2.Type) jsoniter.ValDecoder {
-	if typ.Implements(errorType2) {
+	if typ == errorType2 {
 		return &errValCoder{}
 	}
 	return nil
 }
 
 func (*reportJSONExtension) CreateEncoder(typ reflect2.Type) jsoniter.ValEncoder {
-	if typ.Implements(errorType2) {
+	if typ == errorType2 {
 		return &errValCoder{}
 	}
 	return nil

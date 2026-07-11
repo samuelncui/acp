@@ -2,6 +2,7 @@ package acp
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -37,6 +38,6 @@ func (e *Error) UnmarshalJSON(buf []byte) error {
 		return err
 	}
 
-	e.Src, e.Dst, e.Err = m.Src, m.Dst, fmt.Errorf(m.Err)
+	e.Src, e.Dst, e.Err = m.Src, m.Dst, errors.New(m.Err)
 	return nil
 }

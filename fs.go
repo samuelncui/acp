@@ -24,12 +24,7 @@ func getMountpointCache() (func(string) string, error) {
 			continue
 		}
 
-		mp := mount.Mountpoint
-		if !strings.HasSuffix(mp, "/") {
-			mp = mp + "/"
-		}
-
-		mountPoints.Add(mp)
+		mountPoints.Add(filepath.Clean(mount.Mountpoint))
 	}
 
 	mps := mountPoints.ToSlice()
@@ -39,11 +34,25 @@ func getMountpointCache() (func(string) string, error) {
 			panic(fmt.Errorf("get abs from file path failed, path= '%s', %w", path, err))
 		}
 
-		for _, mp := range mps {
-			if strings.HasPrefix(path, mp) {
-				return mp
+		return findMountpoint(path, mps)
+	}), nil
+}
+
+func findMountpoint(path string, mountPoints []string) string {
+	matched := ""
+	for _, mountPoint := range mountPoints {
+		if path != mountPoint {
+			prefix := mountPoint
+			if !strings.HasSuffix(prefix, string(filepath.Separator)) {
+				prefix += string(filepath.Separator)
+			}
+			if !strings.HasPrefix(path, prefix) {
+				continue
 			}
 		}
-		return ""
-	}), nil
+		if len(mountPoint) > len(matched) {
+			matched = mountPoint
+		}
+	}
+	return matched
 }

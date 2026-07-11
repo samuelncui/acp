@@ -3,7 +3,7 @@ package acp
 import (
 	"fmt"
 	"os"
-	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -20,9 +20,7 @@ func (job *wildcardJob) check() error {
 		if p == "" {
 			continue
 		}
-		if p[len(p)-1] != '/' {
-			p = p + "/"
-		}
+		p = filepath.Clean(p)
 
 		dstStat, err := os.Stat(p)
 		if err != nil {
@@ -40,8 +38,7 @@ func (job *wildcardJob) check() error {
 		return fmt.Errorf("source path not found")
 	}
 	sort.Slice(job.src, func(i, j int) bool {
-		si, sj := strings.ReplaceAll(job.src[i].path, "/", "\x00"), strings.ReplaceAll(job.src[j].path, "/", "\x00")
-		return si < sj
+		return comparePath(job.src[i].path, job.src[j].path) < 0
 	})
 	for _, s := range job.src {
 		src := s.src()
@@ -74,12 +71,8 @@ type WildcardJobOption func(*wildcardJob) *wildcardJob
 func Source(paths ...string) WildcardJobOption {
 	return func(j *wildcardJob) *wildcardJob {
 		for _, p := range paths {
-			p = path.Clean(p)
-			if p[len(p)-1] == '/' {
-				p = p[:len(p)-1]
-			}
-
-			base, name := path.Split(p)
+			p = filepath.Clean(p)
+			base, name := filepath.Split(p)
 			j.src = append(j.src, &source{base: base, path: name})
 		}
 		return j
@@ -99,7 +92,7 @@ func SourceWithPath(base string, paths ...string) WildcardJobOption {
 func AccurateSource(base string, paths ...[]string) WildcardJobOption {
 	return func(j *wildcardJob) *wildcardJob {
 		for _, p := range paths {
-			j.src = append(j.src, &source{base: base, path: path.Join(p...)})
+			j.src = append(j.src, &source{base: base, path: filepath.Join(p...)})
 		}
 		return j
 	}

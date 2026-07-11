@@ -4,7 +4,6 @@ import (
 	"encoding/hex"
 	"io"
 	"io/fs"
-	"path"
 	"sync"
 	"time"
 )
@@ -93,7 +92,7 @@ func (j *baseJob) fail(path string, err error) {
 
 func (j *baseJob) report() *Job {
 	return &Job{
-		FullPath: path.Join(j.src.base, j.src.path),
+		FullPath: j.path,
 		Base:     j.src.base,
 		Path:     j.src.path,
 

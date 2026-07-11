@@ -2,7 +2,8 @@ package acp
 
 import (
 	"os"
-	"path"
+	"path/filepath"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 )
@@ -13,15 +14,21 @@ type source struct {
 }
 
 func (s *source) src() string {
-	return path.Join(s.base, s.path)
+	return filepath.Join(s.base, s.path)
 }
 
 func (s *source) dst(dst string) string {
-	return path.Join(dst, s.path)
+	return filepath.Join(dst, s.path)
 }
 
 func (s *source) append(next string) *source {
-	return &source{base: s.base, path: path.Join(s.path, next)}
+	return &source{base: s.base, path: filepath.Join(s.path, next)}
+}
+
+func comparePath(a, b string) int {
+	a = strings.ReplaceAll(filepath.ToSlash(a), "/", "\x00")
+	b = strings.ReplaceAll(filepath.ToSlash(b), "/", "\x00")
+	return strings.Compare(a, b)
 }
 
 type option struct {
@@ -75,7 +82,7 @@ type accurateJob struct {
 
 func AccurateJob(src string, dsts []string) Option {
 	return func(o *option) *option {
-		o.accurateJobs = append(o.accurateJobs, &accurateJob{src: path.Clean(src), dsts: dsts})
+		o.accurateJobs = append(o.accurateJobs, &accurateJob{src: filepath.Clean(src), dsts: dsts})
 		return o
 	}
 }

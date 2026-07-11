@@ -1,15 +1,22 @@
 package acp
 
+import "sync"
+
+type cacheEntry[V any] struct {
+	once  sync.Once
+	value V
+}
+
 func Cache[K comparable, V any](f func(in K) V) func(in K) V {
-	cache := make(map[K]V, 0)
+	var cache sync.Map
 	return func(in K) V {
-		cached, has := cache[in]
-		if has {
-			return cached
+		cached, has := cache.Load(in)
+		if !has {
+			cached, _ = cache.LoadOrStore(in, new(cacheEntry[V]))
 		}
 
-		out := f(in)
-		cache[in] = out
-		return out
+		entry := cached.(*cacheEntry[V])
+		entry.once.Do(func() { entry.value = f(in) })
+		return entry.value
 	}
 }

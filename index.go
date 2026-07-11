@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
-	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -42,11 +42,18 @@ func (c *Copyer) index(ctx context.Context) (<-chan *baseJob, error) {
 
 func (c *Copyer) walk(ctx context.Context) ([]*baseJob, error) {
 	done := make(chan struct{})
-	defer close(done)
+	var reporting sync.WaitGroup
+	reporting.Add(1)
+	defer func() {
+		close(done)
+		reporting.Wait()
+	}()
 
 	cntr := new(counter)
 	go wrap(ctx, func() {
+		defer reporting.Done()
 		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
@@ -173,8 +180,7 @@ func (c *Copyer) walk(ctx context.Context) ([]*baseJob, error) {
 
 func (c *Copyer) joinJobs(jobs []*baseJob) ([]*baseJob, error) {
 	sort.Slice(jobs, func(i int, j int) bool {
-		si, sj := strings.ReplaceAll(jobs[i].src.path, "/", "\x00"), strings.ReplaceAll(jobs[j].src.path, "/", "\x00")
-		return si < sj
+		return comparePath(jobs[i].src.path, jobs[j].src.path) < 0
 	})
 
 	var last *baseJob
