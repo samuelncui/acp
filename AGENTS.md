@@ -35,7 +35,7 @@ The current change set addresses these areas:
 - select the longest matching mountpoint with directory-boundary checks;
 - use `path/filepath` for host file-system paths;
 - centralize platform-aware path ordering in `comparePath`;
-- add semantic, race, cross-platform, and CLI end-to-end coverage.
+- add semantic, race, cross-platform, CLI end-to-end, and library end-to-end coverage.
 
 The working tree may already contain staged or unstaged changes. Preserve them and do not reset, rewrite, or discard unrelated work.
 

@@ -14,7 +14,7 @@ import (
 	"github.com/samuelncui/acp"
 )
 
-func TestACPCopyE2E(t *testing.T) {
+func TestACPCommandE2E(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping end-to-end test in short mode")
 	}

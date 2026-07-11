@@ -28,9 +28,9 @@ Run the suite with the race detector:
 go test -race ./...
 ```
 
-## End-to-end test
+## End-to-end tests
 
-The end-to-end test builds the `acp` command, copies a directory tree through the CLI, and verifies:
+The command end-to-end test builds the `acp` command, copies a directory tree through the CLI, and verifies:
 
 - regular and empty file contents;
 - nested destination paths;
@@ -38,13 +38,32 @@ The end-to-end test builds the `acp` command, copies a directory tree through th
 - JSON report decoding;
 - SHA256 generation for every copied file.
 
-Run only this test with:
+Run only the command test with:
 
 ```sh
-go test -run '^TestACPCopyE2E$' -v .
+go test -run '^TestACPCommandE2E$' -v .
 ```
 
-The test is skipped when `go test` is run with `-short`.
+The library end-to-end test uses the public Go API directly with two destinations and verifies:
+
+- the complete index, prepare, copy, cleanup, and event pipeline;
+- regular, empty, and nested file contents at both destinations;
+- successful report status and destination sets;
+- file size and exact SHA256 values.
+
+Run only the library test with:
+
+```sh
+go test -run '^TestACPLibraryE2E$' -v .
+```
+
+Run both end-to-end tests with:
+
+```sh
+go test -run '^TestACP(Command|Library)E2E$' -v .
+```
+
+Both tests are skipped when `go test` is run with `-short`.
 
 ## Focused tests
 
