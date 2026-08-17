@@ -3,7 +3,9 @@ package acp
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -19,6 +21,10 @@ type counter struct {
 }
 
 func (c *Copyer) index(ctx context.Context) (<-chan *baseJob, error) {
+	if c.streamSource != nil {
+		return c.indexStream(ctx), nil
+	}
+
 	jobs, err := c.walk(ctx)
 	if err != nil {
 		return nil, err
@@ -38,6 +44,67 @@ func (c *Copyer) index(ctx context.Context) (<-chan *baseJob, error) {
 	})
 
 	return ch, nil
+}
+
+func (c *Copyer) indexStream(ctx context.Context) <-chan *baseJob {
+	ch := make(chan *baseJob, 128)
+	go wrap(ctx, func() {
+		defer close(ch)
+
+		var bytes, files int64
+		defer func() {
+			c.submit(&EventUpdateCount{Bytes: bytes, Files: files, Finished: true})
+		}()
+		for {
+			request, err := c.streamSource.Next(ctx)
+			if err != nil {
+				if err != io.EOF {
+					c.reportError("", "", fmt.Errorf("read stream source failed, %w", err))
+				}
+				return
+			}
+			if request == nil {
+				c.reportError("", "", fmt.Errorf("read stream source failed, request is nil"))
+				return
+			}
+
+			sourcePath := filepath.Clean(request.Source)
+			info, err := os.Stat(sourcePath)
+			if err != nil {
+				c.reportError(sourcePath, "", fmt.Errorf("stream job get stat failed, %w", err))
+				return
+			}
+			if !info.Mode().IsRegular() {
+				c.reportError(sourcePath, "", fmt.Errorf("stream job source is not a regular file"))
+				return
+			}
+			stat, err := newStat(sourcePath, info)
+			if err != nil {
+				c.reportError(sourcePath, "", fmt.Errorf("read stream job stat failed, %w", err))
+				return
+			}
+
+			job := &baseJob{
+				copyer:   c,
+				src:      &source{base: filepath.Dir(sourcePath), path: filepath.Base(sourcePath)},
+				path:     sourcePath,
+				stat:     stat,
+				targets:  append([]string(nil), request.Targets...),
+				streamID: request.ID,
+			}
+			c.submit(&EventUpdateJob{job.report()})
+			bytes += stat.size
+			files++
+
+			select {
+			case <-ctx.Done():
+				c.setError(ctx.Err())
+				return
+			case ch <- job:
+			}
+		}
+	})
+	return ch
 }
 
 func (c *Copyer) walk(ctx context.Context) ([]*baseJob, error) {

@@ -5,12 +5,13 @@ import (
 	"fmt"
 )
 
-func (c *Copyer) cleanupJob(ctx context.Context, copyed <-chan *baseJob) {
+func (c *Copyer) cleanupJob(ctx context.Context, copyed <-chan *baseJob) bool {
+	streamSinkFailed := false
 	for {
 		select {
 		case job, ok := <-copyed:
 			if !ok {
-				return
+				return streamSinkFailed
 			}
 
 			for _, dst := range job.successTargets {
@@ -20,8 +21,15 @@ func (c *Copyer) cleanupJob(ctx context.Context, copyed <-chan *baseJob) {
 			}
 
 			job.setStatus(jobStatusFinished)
+			if c.streamSink != nil && !streamSinkFailed {
+				if err := c.streamSink.Write(ctx, &StreamResult{ID: job.streamID, Job: job.report()}); err != nil {
+					c.setError(fmt.Errorf("write stream result failed, id=%d, %w", job.streamID, err))
+					streamSinkFailed = true
+				}
+			}
 		case <-ctx.Done():
-			return
+			c.setError(ctx.Err())
+			return streamSinkFailed
 		}
 	}
 }

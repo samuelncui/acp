@@ -35,10 +35,11 @@ var (
 )
 
 type baseJob struct {
-	copyer *Copyer
-	src    *source
-	path   string
-	stat   *stat
+	copyer   *Copyer
+	src      *source
+	path     string
+	stat     *stat
+	streamID int64
 
 	lock      sync.Mutex
 	writeTime time.Time

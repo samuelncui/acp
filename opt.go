@@ -34,6 +34,8 @@ func comparePath(a, b string) int {
 type option struct {
 	accurateJobs []*accurateJob
 	wildcardJobs []*wildcardJob
+	streamSource StreamSource
+	streamSink   StreamSink
 
 	fromDevice *deviceOption
 	toDevice   *deviceOption

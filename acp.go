@@ -2,6 +2,7 @@ package acp
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/sirupsen/logrus"
@@ -10,6 +11,8 @@ import (
 type Copyer struct {
 	*option
 	running           sync.WaitGroup
+	errLock           sync.Mutex
+	err               error
 	eventCh           chan Event
 	getDevice         func(in string) string
 	getDiskUsageCache func(mountPoint string) *diskUsageCache
@@ -41,7 +44,8 @@ func New(ctx context.Context, opts ...Option) (*Copyer, error) {
 		}),
 	}
 
-	c.running.Add(1)
+	// Account for both pipeline and event dispatch before either goroutine starts.
+	c.running.Add(2)
 	go wrap(ctx, func() { c.run(ctx) })
 
 	return c, nil
@@ -49,6 +53,25 @@ func New(ctx context.Context, opts ...Option) (*Copyer, error) {
 
 func (c *Copyer) Wait() {
 	c.running.Wait()
+}
+
+// WaitErr waits for the copy pipeline and returns its first error.
+func (c *Copyer) WaitErr() error {
+	c.Wait()
+	c.errLock.Lock()
+	defer c.errLock.Unlock()
+	return c.err
+}
+
+func (c *Copyer) setError(err error) {
+	if err == nil {
+		return
+	}
+	c.errLock.Lock()
+	defer c.errLock.Unlock()
+	if c.err == nil {
+		c.err = err
+	}
 }
 
 func (c *Copyer) run(ctx context.Context) error {
@@ -59,12 +82,18 @@ func (c *Copyer) run(ctx context.Context) error {
 
 	indexed, err := c.index(ctx)
 	if err != nil {
+		c.setError(err)
 		return err
 	}
 
 	prepared := c.prepare(ctx, indexed)
 	copyed := c.copy(ctx, prepared)
-	c.cleanupJob(ctx, copyed)
+	sinkFailed := c.cleanupJob(ctx, copyed)
+	if c.streamSink != nil && !sinkFailed {
+		if err := c.streamSink.Flush(ctx); err != nil {
+			c.setError(fmt.Errorf("flush stream sink failed, %w", err))
+		}
+	}
 
 	// empty pipes
 	for range indexed {
@@ -78,7 +107,6 @@ func (c *Copyer) run(ctx context.Context) error {
 }
 
 func (c *Copyer) eventLoop(ctx context.Context) {
-	c.running.Add(1)
 	defer c.running.Done()
 
 	chans := make([]chan Event, len(c.eventHanders))
@@ -86,13 +114,14 @@ func (c *Copyer) eventLoop(ctx context.Context) {
 		chans[idx] = make(chan Event, 128)
 	}
 
+	var handlers sync.WaitGroup
 	for idx, ch := range chans {
 		handler := c.eventHanders[idx]
 		events := ch
 
-		c.running.Add(1)
+		handlers.Add(1)
 		go wrap(ctx, func() {
-			defer c.running.Done()
+			defer handlers.Done()
 
 			for {
 				e, ok := <-events
@@ -109,6 +138,7 @@ func (c *Copyer) eventLoop(ctx context.Context) {
 		for _, ch := range chans {
 			close(ch)
 		}
+		handlers.Wait()
 	}()
 	for e := range c.eventCh {
 		for _, ch := range chans {
@@ -127,6 +157,7 @@ func (c *Copyer) submit(e Event) {
 
 func (c *Copyer) reportError(src, dst string, err error) {
 	e := &Error{Src: src, Dst: dst, Err: err}
+	c.setError(fmt.Errorf("copy failed, source=%q target=%q, %w", src, dst, err))
 	c.logf(logrus.ErrorLevel, e.Error())
 	c.submit(&EventReportError{Error: e})
 }
