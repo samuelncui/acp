@@ -1,11 +1,15 @@
 package acp
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	mapset "github.com/deckarep/golang-set/v2"
 )
 
 func TestCopyEmptyFile(t *testing.T) {
@@ -71,5 +75,22 @@ func TestCopyEmptyFile(t *testing.T) {
 				t.Fatalf("success targets = %v", job.SuccessTargets)
 			}
 		})
+	}
+}
+
+func TestWritePublishesFinishingJob(t *testing.T) {
+	// Build a target-free write Job so only the worker-to-cleanup handoff is exercised.
+	copyer := &Copyer{option: newOption(), eventCh: make(chan Event, 8)}
+	job := newWriteJob(&baseJob{
+		copyer: copyer,
+		src:    &source{},
+		stat:   &stat{},
+	}, io.NopCloser(bytes.NewReader(nil)), 0, false)
+	completed := make(chan *baseJob, 1)
+
+	// The copy worker must finish all mutations before publishing ownership to cleanup.
+	copyer.write(context.Background(), job, completed, new(counter), mapset.NewSet[string]())
+	if status := (<-completed).status; status != jobStatusFinishing {
+		t.Fatalf("published status = %q, want %q", status, jobStatusFinishing)
 	}
 }

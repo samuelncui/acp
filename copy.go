@@ -83,12 +83,12 @@ func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *ba
 
 func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, cntr *counter, noSpaceDevices mapset.Set[string]) {
 	job.setStatus(jobStatusCopying)
-	defer job.setStatus(jobStatusFinishing)
 
 	var wg sync.WaitGroup
 	defer func() {
 		wg.Wait()
 		job.done()
+		job.setStatus(jobStatusFinishing)
 		ch <- job.baseJob
 	}()
 
