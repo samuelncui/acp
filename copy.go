@@ -63,17 +63,13 @@ func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *ba
 		go wrap(ctx, func() {
 			defer copying.Done()
 
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case job, ok := <-prepared:
-					if !ok {
-						return
-					}
-
-					wrap(ctx, func() { c.write(ctx, job, ch, cntr, noSpaceDevices) })
+			for job := range prepared {
+				if ctx.Err() != nil {
+					job.finishSource()
+					continue
 				}
+
+				wrap(ctx, func() { c.write(ctx, job, ch, cntr, noSpaceDevices) })
 			}
 		})
 	}
@@ -82,18 +78,26 @@ func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *ba
 }
 
 func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, cntr *counter, noSpaceDevices mapset.Set[string]) {
-	job.setStatus(jobStatusCopying)
-
 	var wg sync.WaitGroup
 	defer func() {
 		wg.Wait()
-		job.done()
+		job.finishSource()
 		job.setStatus(jobStatusFinishing)
-		ch <- job.baseJob
+		select {
+		case ch <- job.baseJob:
+		case <-ctx.Done():
+		}
 	}()
 
-	// shortcut
-	if noSpaceDevices.Contains(lo.Map(job.targets, func(target string, _ int) string { return c.getDevice(target) })...) {
+	job.setStatus(jobStatusCopying)
+	if job.size != job.stat.size {
+		job.fail("", fmt.Errorf("source size changed, indexed=%d current=%d", job.stat.size, job.size))
+		return
+	}
+
+	// Skip jobs only when every requested target device is already exhausted.
+	targetDevices := lo.Map(job.targets, func(target string, _ int) string { return c.getDevice(target) })
+	if len(targetDevices) > 0 && noSpaceDevices.Contains(targetDevices...) {
 		job.fail("", ErrTargetNoSpace)
 		return
 	}
@@ -145,6 +149,8 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 		}
 		if !job.copyer.toDevice.linear && job.size > 0 {
 			if err := truncate(file, job.size); err != nil {
+				_ = file.Close()
+				_ = os.Remove(target)
 				job.fail(target, fmt.Errorf("truncate dst file fail, %w", err))
 				continue
 			}
@@ -180,7 +186,11 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 				job.fail(target, fmt.Errorf("write dst file fail, %w", rerr))
 			}()
 
-			defer file.Close()
+			defer func() {
+				if file != nil {
+					_ = file.Close()
+				}
+			}()
 			for buf := range ch {
 				n, err := file.Write(buf)
 				if err != nil {
@@ -193,20 +203,25 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 				}
 			}
 
-			if err := file.Sync(); err != nil {
-				rerr = fmt.Errorf("sync dst file fail, %w", err)
+			// A linear target publishes its durability boundary when the caller unmounts it.
+			if !c.toDevice.linear {
+				if err := file.Sync(); err != nil {
+					rerr = fmt.Errorf("sync dst file fail, %w", err)
+					return
+				}
+			}
+			if err := file.Close(); err != nil {
+				file = nil
+				rerr = fmt.Errorf("close dst file fail, %w", err)
 				return
 			}
+			file = nil
 			if readErr != nil {
 				rerr = readErr
 				return
 			}
 		})
 	}
-	if len(chans) == 0 {
-		return
-	}
-
 	if c.withHash {
 		sha := sha256Pool.Get().(hash.Hash)
 		sha.Reset()
@@ -226,17 +241,25 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			job.setHash(sha.Sum(nil))
 		})
 	}
-	readErr = c.streamCopy(ctx, chans, job.reader, &cntr.bytes)
+	if len(chans) == 0 {
+		return
+	}
+	var copied int64
+	copied, readErr = c.streamCopy(ctx, chans, job.reader, &cntr.bytes)
+	if readErr == nil && copied != job.size {
+		readErr = fmt.Errorf("source size changed while copying, expected=%d copied=%d", job.size, copied)
+	}
 }
 
-func (c *Copyer) streamCopy(ctx context.Context, dsts []chan []byte, src io.ReadCloser, bytes *int64) error {
-	for idx := int64(0); ; idx += batchSize {
+func (c *Copyer) streamCopy(ctx context.Context, dsts []chan []byte, src io.ReadCloser, bytes *int64) (int64, error) {
+	var copied int64
+	for {
 		buf := make([]byte, batchSize)
 
 		n, err := io.ReadFull(src, buf)
 		if err != nil {
 			if !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
-				return fmt.Errorf("slice mmap fail, %w", err)
+				return copied, fmt.Errorf("slice mmap fail, %w", err)
 			}
 		}
 
@@ -246,14 +269,15 @@ func (c *Copyer) streamCopy(ctx context.Context, dsts []chan []byte, src io.Read
 		}
 
 		nr := len(buf)
+		copied += int64(nr)
 		atomic.AddInt64(bytes, int64(nr))
 		if nr < batchSize {
-			return nil
+			return copied, nil
 		}
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return copied, ctx.Err()
 		default:
 		}
 	}

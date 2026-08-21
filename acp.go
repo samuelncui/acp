@@ -95,10 +95,11 @@ func (c *Copyer) run(ctx context.Context) error {
 		}
 	}
 
-	// empty pipes
+	// Drain remaining stages in dependency order. Prepared jobs retain open sources.
 	for range indexed {
 	}
-	for range prepared {
+	for job := range prepared {
+		job.finishSource()
 	}
 	for range copyed {
 	}

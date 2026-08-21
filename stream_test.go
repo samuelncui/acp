@@ -2,6 +2,8 @@ package acp
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +11,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type sliceStreamSource struct {
@@ -84,6 +87,33 @@ func TestRunStreamCopiesRequestsInLinearOrder(t *testing.T) {
 	}
 	if sink.flushes != 1 {
 		t.Fatalf("sink flushed %d times, want 1", sink.flushes)
+	}
+}
+
+func TestRunStreamHashesWithoutTargets(t *testing.T) {
+	// Submit one targetless request through the same bounded stream interface.
+	content := []byte("hash-only fixture")
+	input := filepath.Join(t.TempDir(), "source.txt")
+	if err := os.WriteFile(input, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	source := &sliceStreamSource{requests: []*StreamRequest{{ID: 1, Source: input}}}
+	sink := new(collectingStreamSink)
+
+	// Verify ACP reads the source once and reports its SHA-256 without creating a target.
+	if err := RunStream(context.Background(), source, sink, WithHash(true)); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.results) != 1 {
+		t.Fatalf("received %d results, want 1", len(sink.results))
+	}
+	job := sink.results[0].Job
+	wantHash := sha256.Sum256(content)
+	if job.Status != JobStatusFinished || job.SHA256 != hex.EncodeToString(wantHash[:]) {
+		t.Fatalf("unexpected hash-only result: %#v", job)
+	}
+	if len(job.SuccessTargets) != 0 || len(job.FailTargets) != 0 {
+		t.Fatalf("hash-only targets = success:%v fail:%v", job.SuccessTargets, job.FailTargets)
 	}
 }
 
@@ -174,5 +204,68 @@ func TestRunStreamAppliesBoundedBackpressure(t *testing.T) {
 	}
 	if maximum := atomic.LoadInt64(&source.maximum); maximum >= total/2 {
 		t.Fatalf("maximum outstanding requests = %d, want less than %d", maximum, total/2)
+	}
+}
+
+type untilCanceledStreamSource struct {
+	input  string
+	target string
+	nextID int64
+}
+
+func (s *untilCanceledStreamSource) Next(ctx context.Context) (*StreamRequest, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	s.nextID++
+	return &StreamRequest{
+		ID:      s.nextID,
+		Source:  s.input,
+		Targets: []string{filepath.Join(s.target, fmt.Sprintf("%04d", s.nextID))},
+	}, nil
+}
+
+func TestRunStreamCancellationDrainsPrefetchedJobs(t *testing.T) {
+	// Feed work until Prepare starts so cancellation occurs with an active pipeline.
+	root := t.TempDir()
+	input := filepath.Join(root, "source.txt")
+	if err := os.WriteFile(input, []byte("fixture"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	source := &untilCanceledStreamSource{input: input, target: filepath.Join(root, "target")}
+	cancelWhenPreparing := func(event Event) {
+		update, ok := event.(*EventUpdateJob)
+		if !ok {
+			return
+		}
+		if update.Job.Status != JobStatusPreparing {
+			return
+		}
+		cancel()
+	}
+
+	// The canceled pipeline must drain its queues and return the context error.
+	done := make(chan error, 1)
+	go func() {
+		done <- RunStream(
+			ctx,
+			source,
+			new(collectingStreamSink),
+			SetToDevice(LinearDevice(true)),
+			WithEventHandler(cancelWhenPreparing),
+		)
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunStream() error = %v, want %v", err, context.Canceled)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunStream did not return after cancellation")
 	}
 }

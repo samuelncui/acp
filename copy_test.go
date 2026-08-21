@@ -12,6 +12,19 @@ import (
 	mapset "github.com/deckarep/golang-set/v2"
 )
 
+type trackingReadCloser struct {
+	closed int
+}
+
+func (*trackingReadCloser) Read([]byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (r *trackingReadCloser) Close() error {
+	r.closed++
+	return nil
+}
+
 func TestCopyEmptyFile(t *testing.T) {
 	tests := []struct {
 		name string
@@ -92,5 +105,68 @@ func TestWritePublishesFinishingJob(t *testing.T) {
 	copyer.write(context.Background(), job, completed, new(counter), mapset.NewSet[string]())
 	if status := (<-completed).status; status != jobStatusFinishing {
 		t.Fatalf("published status = %q, want %q", status, jobStatusFinishing)
+	}
+}
+
+func TestWriteJobWaitConsumedReturnsOnCancellation(t *testing.T) {
+	// Model a linear source whose reader has already moved to the Copy stage.
+	job := newWriteJob(nil, new(trackingReadCloser), 0, true)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Cancellation must release Prepare without waiting for Copy to consume the reader.
+	if job.waitConsumed(ctx) {
+		t.Fatal("waitConsumed() = true after cancellation, want false")
+	}
+}
+
+func TestCopyClosesPreparedSourcesAfterCancellation(t *testing.T) {
+	// Queue one prefetched reader before starting an already-canceled Copy stage.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	copyer := &Copyer{option: newOption(), eventCh: make(chan Event, 1)}
+	copyer.toDevice.threads = 1
+	reader := new(trackingReadCloser)
+	job := newWriteJob(nil, reader, 0, true)
+	prepared := make(chan *writeJob, 1)
+	prepared <- job
+	close(prepared)
+
+	// Copy owns accepted readers and must drain and close them during cancellation.
+	for range copyer.copy(ctx, prepared) {
+	}
+	if reader.closed != 1 {
+		t.Fatalf("reader closed %d times, want 1", reader.closed)
+	}
+	if !job.waitConsumed(context.Background()) {
+		t.Fatal("linear source was not notified that the reader was consumed")
+	}
+}
+
+func TestWriteReturnsWhenCanceledBeforePublishing(t *testing.T) {
+	// Use an unbuffered completion channel with no receiver to expose a blocked handoff.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	copyer := &Copyer{option: newOption(), eventCh: make(chan Event, 8)}
+	reader := new(trackingReadCloser)
+	job := newWriteJob(&baseJob{
+		copyer: copyer,
+		src:    &source{},
+		stat:   &stat{},
+	}, reader, 0, false)
+	done := make(chan struct{})
+	go func() {
+		copyer.write(ctx, job, make(chan *baseJob), new(counter), mapset.NewSet[string]())
+		close(done)
+	}()
+
+	// Cancellation must skip the completion handoff while retaining source cleanup.
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("write did not return after cancellation")
+	}
+	if reader.closed != 1 {
+		t.Fatalf("reader closed %d times, want 1", reader.closed)
 	}
 }

@@ -79,8 +79,16 @@ func (c *Copyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-chan *w
 					}
 
 					wj := newWriteJob(job, file, size, c.fromDevice.linear)
-					ch <- wj
-					wj.wait()
+					select {
+					case ch <- wj:
+					case <-ctx.Done():
+						wj.finishSource()
+						return
+					}
+
+					if !wj.waitConsumed(ctx) {
+						return
+					}
 				}
 			}
 		})

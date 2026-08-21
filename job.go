@@ -1,6 +1,7 @@
 package acp
 
 import (
+	"context"
 	"encoding/hex"
 	"io"
 	"io/fs"
@@ -111,36 +112,42 @@ func (j *baseJob) report() *Job {
 
 type writeJob struct {
 	*baseJob
-	reader io.ReadCloser
-	size   int64
-	ch     chan struct{}
+	reader   io.ReadCloser
+	size     int64
+	consumed chan struct{}
 }
 
-func newWriteJob(job *baseJob, src io.ReadCloser, size int64, needWait bool) *writeJob {
+func newWriteJob(job *baseJob, src io.ReadCloser, size int64, waitConsumed bool) *writeJob {
 	j := &writeJob{
 		baseJob: job,
 		reader:  src,
 		size:    size,
 	}
-	if needWait {
-		j.ch = make(chan struct{})
+	if waitConsumed {
+		j.consumed = make(chan struct{})
 	}
 	return j
 }
 
-func (wj *writeJob) done() {
-	wj.reader.Close()
+func (wj *writeJob) finishSource() {
+	_ = wj.reader.Close()
 
-	if wj.ch != nil {
-		close(wj.ch)
+	if wj.consumed != nil {
+		close(wj.consumed)
 	}
 }
 
-func (wj *writeJob) wait() {
-	if wj.ch == nil {
-		return
+func (wj *writeJob) waitConsumed(ctx context.Context) bool {
+	if wj.consumed == nil {
+		return true
 	}
-	<-wj.ch
+
+	select {
+	case <-wj.consumed:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 type Job struct {
