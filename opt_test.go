@@ -51,3 +51,50 @@ func TestComparePath(t *testing.T) {
 		}
 	}
 }
+
+func TestLinearDeviceOnlySerializesItsOwnStage(t *testing.T) {
+	// Cover each directional linear constraint independently.
+	tests := []struct {
+		name            string
+		options         []Option
+		wantFromThreads int
+		wantToThreads   int
+	}{
+		{
+			name: "linear target",
+			options: []Option{
+				SetToDevice(LinearDevice(true)),
+			},
+			wantFromThreads: 8,
+			wantToThreads:   1,
+		},
+		{
+			name: "linear source",
+			options: []Option{
+				SetFromDevice(LinearDevice(true)),
+			},
+			wantFromThreads: 1,
+			wantToThreads:   8,
+		},
+	}
+
+	// Keep the unconstrained side parallel while serializing only the linear stage.
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			option := newOption()
+			for _, apply := range test.options {
+				option = apply(option)
+			}
+
+			if err := option.check(); err != nil {
+				t.Fatal(err)
+			}
+			if option.fromDevice.threads != test.wantFromThreads {
+				t.Fatalf("source threads = %d, want %d", option.fromDevice.threads, test.wantFromThreads)
+			}
+			if option.toDevice.threads != test.wantToThreads {
+				t.Fatalf("target threads = %d, want %d", option.toDevice.threads, test.wantToThreads)
+			}
+		})
+	}
+}
