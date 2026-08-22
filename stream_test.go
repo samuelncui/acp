@@ -53,8 +53,8 @@ func (s *collectingStreamSink) Flush(context.Context) error {
 	return nil
 }
 
-func TestRunStreamCopiesRequestsInLinearOrder(t *testing.T) {
-	// Create an ordered source stream without building ACP options per file.
+func TestRunStreamCopiesRequestsToLinearTarget(t *testing.T) {
+	// Create a source stream without building ACP options per file.
 	root := t.TempDir()
 	source := new(sliceStreamSource)
 	for index, content := range []string{"first", "second", "third"} {
@@ -70,17 +70,22 @@ func TestRunStreamCopiesRequestsInLinearOrder(t *testing.T) {
 	}
 	sink := new(collectingStreamSink)
 
-	// Run the linear pipeline and verify every final result is emitted once.
+	// Keep the target serialized while allowing source preparation to complete in any order.
 	if err := RunStream(context.Background(), source, sink, WithHash(true), SetToDevice(LinearDevice(true))); err != nil {
 		t.Fatal(err)
 	}
 	if len(sink.results) != len(source.requests) {
 		t.Fatalf("received %d results, want %d", len(sink.results), len(source.requests))
 	}
-	for index, result := range sink.results {
-		if result.ID != int64(index+1) {
-			t.Fatalf("result ID = %d, want %d", result.ID, index+1)
+	seen := make(map[int64]struct{}, len(sink.results))
+	for _, result := range sink.results {
+		if result.ID < 1 || result.ID > int64(len(source.requests)) {
+			t.Fatalf("unexpected result ID: %d", result.ID)
 		}
+		if _, exists := seen[result.ID]; exists {
+			t.Fatalf("duplicate result ID: %d", result.ID)
+		}
+		seen[result.ID] = struct{}{}
 		if result.Job.Status != JobStatusFinished || len(result.Job.SuccessTargets) != 1 || result.Job.SHA256 == "" {
 			t.Fatalf("unexpected result: %#v", result.Job)
 		}
