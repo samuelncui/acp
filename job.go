@@ -3,6 +3,7 @@ package acp
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"io/fs"
 	"sync"
@@ -81,6 +82,7 @@ func (j *baseJob) success(path string) {
 }
 
 func (j *baseJob) fail(path string, err error) {
+	j.copyer.setError(fmt.Errorf("copy failed, source=%q target=%q, %w", j.path, path, err))
 	j.lock.Lock()
 	defer j.lock.Unlock()
 

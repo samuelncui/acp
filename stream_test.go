@@ -33,10 +33,11 @@ func (s *sliceStreamSource) Next(context.Context) (*StreamRequest, error) {
 }
 
 type collectingStreamSink struct {
-	results []*StreamResult
-	writes  int
-	flushes int
-	err     error
+	results  []*StreamResult
+	writes   int
+	flushes  int
+	err      error
+	flushErr error
 }
 
 func (s *collectingStreamSink) Write(_ context.Context, result *StreamResult) error {
@@ -50,7 +51,7 @@ func (s *collectingStreamSink) Write(_ context.Context, result *StreamResult) er
 
 func (s *collectingStreamSink) Flush(context.Context) error {
 	s.flushes++
-	return nil
+	return s.flushErr
 }
 
 func TestRunStreamCopiesRequestsToLinearTarget(t *testing.T) {
@@ -148,6 +149,47 @@ func TestRunStreamReturnsSourceAndSinkErrors(t *testing.T) {
 	}
 	if sink.writes != 1 || sink.flushes != 0 {
 		t.Fatalf("sink calls = writes:%d flushes:%d, want writes:1 flushes:0", sink.writes, sink.flushes)
+	}
+
+	// Verify that final persistence failures cross the synchronous stream interface.
+	flushErr := errors.New("flush failed")
+	sink = &collectingStreamSink{flushErr: flushErr}
+	err = RunStream(context.Background(), &sliceStreamSource{requests: []*StreamRequest{{
+		ID: 4, Source: input,
+	}}}, sink, WithHash(true))
+	if !errors.Is(err, flushErr) {
+		t.Fatalf("RunStream() error = %v, want %v", err, flushErr)
+	}
+	if sink.writes != 1 || sink.flushes != 1 {
+		t.Fatalf("sink calls = writes:%d flushes:%d, want writes:1 flushes:1", sink.writes, sink.flushes)
+	}
+}
+
+func TestRunStreamReturnsTargetFailure(t *testing.T) {
+	// Force target creation to fail while allowing the Sink to accept the final Job result.
+	root := t.TempDir()
+	input := filepath.Join(root, "source.txt")
+	target := filepath.Join(root, "target.txt")
+	if err := os.WriteFile(input, []byte("fixture"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("existing"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sink := new(collectingStreamSink)
+
+	// A failed copy is a RunStream error even when the Sink records the failed result.
+	err := RunStream(context.Background(), &sliceStreamSource{requests: []*StreamRequest{{
+		ID: 1, Source: input, Targets: []string{target},
+	}}}, sink)
+	if !errors.Is(err, os.ErrExist) {
+		t.Fatalf("RunStream() error = %v, want %v", err, os.ErrExist)
+	}
+	if sink.writes != 1 || len(sink.results) != 1 {
+		t.Fatalf("sink results = writes:%d results:%d, want writes:1 results:1", sink.writes, len(sink.results))
+	}
+	if len(sink.results[0].Job.FailTargets) != 1 {
+		t.Fatalf("failed targets = %v, want one target", sink.results[0].Job.FailTargets)
 	}
 }
 
