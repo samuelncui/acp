@@ -39,6 +39,9 @@ func (c *Copyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-chan *w
 					if !ok {
 						return
 					}
+					if c.linearTargetStopped() {
+						continue
+					}
 
 					job.setStatus(jobStatusPreparing)
 

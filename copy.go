@@ -68,6 +68,10 @@ func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *ba
 					job.finishSource()
 					continue
 				}
+				if c.linearTargetStopped() {
+					job.finishSource()
+					continue
+				}
 
 				wrap(ctx, func() { c.write(ctx, job, ch, cntr, noSpaceDevices) })
 			}
@@ -120,19 +124,22 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			continue
 		}
 
-		if err := c.getDiskUsageCache(dev).check(job.size); err != nil {
-			if errors.Is(err, ErrTargetNoSpace) {
-				noSpaceDevices.Add(dev)
-			}
+		if !c.toDevice.linear {
+			if err := c.getDiskUsageCache(dev).check(job.size); err != nil {
+				if errors.Is(err, ErrTargetNoSpace) {
+					noSpaceDevices.Add(dev)
+				}
 
-			job.fail(target, fmt.Errorf("check disk usage have error, %w", err))
-			continue
+				job.fail(target, fmt.Errorf("check disk usage have error, %w", err))
+				continue
+			}
 		}
 
 		if err := mappingError(os.MkdirAll(filepath.Dir(target), os.ModePerm)); err != nil {
 			if checkErrorAbort(err) {
 				noSpaceDevices.Add(dev)
 			}
+			c.endLinearTarget(err)
 
 			job.fail(target, fmt.Errorf("mkdir dst dir fail, %w", err))
 			continue
@@ -143,6 +150,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			if checkErrorAbort(err) {
 				noSpaceDevices.Add(dev)
 			}
+			c.endLinearTarget(err)
 
 			job.fail(target, fmt.Errorf("open dst file fail, %w", err))
 			continue
@@ -170,20 +178,20 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 					return
 				}
 
-				// avoid block channel
-				for range ch {
-				}
-
-				if err := os.Remove(target); err != nil {
-					c.reportError(job.path, target, fmt.Errorf("delete failed file has error, %w", err))
-				}
-
 				rerr = mappingError(rerr)
 				if checkErrorAbort(rerr) {
 					noSpaceDevices.Add(dev)
 				}
+				c.endLinearTarget(rerr)
+
+				// avoid block channel
+				for range ch {
+				}
 
 				job.fail(target, fmt.Errorf("write dst file fail, %w", rerr))
+				if err := os.Remove(target); err != nil {
+					c.reportError(job.path, target, fmt.Errorf("delete failed file has error, %w", err))
+				}
 			}()
 
 			defer func() {

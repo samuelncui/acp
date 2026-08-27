@@ -14,8 +14,10 @@ func (c *Copyer) cleanupJob(ctx context.Context, copyed <-chan *baseJob) bool {
 				return streamSinkFailed
 			}
 
-			for _, dst := range job.successTargets {
-				if err := writeSysStat(dst, job.stat); err != nil {
+			for _, dst := range append([]string(nil), job.successTargets...) {
+				if err := mappingError(writeSysStat(dst, job.stat)); err != nil {
+					c.endLinearTarget(err)
+					job.fail(dst, fmt.Errorf("change info, write sys stat fail, %w", err))
 					c.reportError(job.path, dst, fmt.Errorf("change info, write sys stat fail, %w", err))
 				}
 			}

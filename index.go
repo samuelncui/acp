@@ -56,6 +56,9 @@ func (c *Copyer) indexStream(ctx context.Context) <-chan *baseJob {
 			c.submit(&EventUpdateCount{Bytes: bytes, Files: files, Finished: true})
 		}()
 		for {
+			if c.linearTargetStopped() {
+				return
+			}
 			request, err := c.streamSource.Next(ctx)
 			if err != nil {
 				if err != io.EOF {

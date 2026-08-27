@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/sirupsen/logrus"
 )
@@ -16,6 +17,7 @@ type Copyer struct {
 	eventCh           chan Event
 	getDevice         func(in string) string
 	getDiskUsageCache func(mountPoint string) *diskUsageCache
+	linearTargetEnded uint32
 }
 
 func New(ctx context.Context, opts ...Option) (*Copyer, error) {
@@ -72,6 +74,17 @@ func (c *Copyer) setError(err error) {
 	if c.err == nil {
 		c.err = err
 	}
+}
+
+func (c *Copyer) endLinearTarget(err error) {
+	if !c.toDevice.linear || !checkErrorAbort(err) {
+		return
+	}
+	atomic.StoreUint32(&c.linearTargetEnded, 1)
+}
+
+func (c *Copyer) linearTargetStopped() bool {
+	return atomic.LoadUint32(&c.linearTargetEnded) != 0
 }
 
 func (c *Copyer) run(ctx context.Context) error {

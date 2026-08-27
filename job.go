@@ -86,6 +86,13 @@ func (j *baseJob) fail(path string, err error) {
 	j.lock.Lock()
 	defer j.lock.Unlock()
 
+	for index, target := range j.successTargets {
+		if target != path {
+			continue
+		}
+		j.successTargets = append(j.successTargets[:index], j.successTargets[index+1:]...)
+		break
+	}
 	if j.failedTargets == nil {
 		j.failedTargets = make(map[string]error, 1)
 	}

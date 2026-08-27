@@ -3,9 +3,11 @@ package acp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -168,5 +170,78 @@ func TestWriteReturnsWhenCanceledBeforePublishing(t *testing.T) {
 	}
 	if reader.closed != 1 {
 		t.Fatalf("reader closed %d times, want 1", reader.closed)
+	}
+}
+
+func TestBaseJobFailureMovesSuccessfulTarget(t *testing.T) {
+	// Seed a completed target before applying a metadata-stage failure.
+	copyer := &Copyer{option: newOption(), eventCh: make(chan Event, 2)}
+	job := &baseJob{
+		copyer: copyer, src: &source{}, stat: &stat{}, successTargets: []string{"target"},
+	}
+
+	// A late target failure must remove the target from the successful result.
+	job.fail("target", syscall.ENOSPC)
+	report := job.report()
+	if len(report.SuccessTargets) != 0 {
+		t.Fatalf("success targets = %v, want none", report.SuccessTargets)
+	}
+	if !errors.Is(report.FailTargets["target"], syscall.ENOSPC) {
+		t.Fatalf("target failure = %v, want %v", report.FailTargets["target"], syscall.ENOSPC)
+	}
+}
+
+func TestFirstTargetFailureRemainsAuthoritative(t *testing.T) {
+	// Record a mapped write failure before the best-effort cleanup error.
+	copyer := &Copyer{option: newOption(), eventCh: make(chan Event, 4)}
+	job := &baseJob{copyer: copyer, src: &source{}, stat: &stat{}}
+	job.fail("target", mappingError(syscall.ENOSPC))
+	copyer.setError(errors.New("remove failed"))
+
+	// Secondary cleanup failures must not hide the no-space classification.
+	if err := copyer.WaitErr(); !errors.Is(err, ErrTargetNoSpace) {
+		t.Fatalf("WaitErr() = %v, want %v", err, ErrTargetNoSpace)
+	}
+}
+
+func TestLinearTargetSkipsDiskUsageEstimate(t *testing.T) {
+	// Build one linear write whose disk-usage lookup would fail the test if called.
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	copyer := &Copyer{
+		option: newOption(), eventCh: make(chan Event, 8),
+		getDevice: func(string) string { return root },
+		getDiskUsageCache: func(string) *diskUsageCache {
+			t.Fatal("linear target queried filesystem capacity")
+			return nil
+		},
+	}
+	copyer.toDevice.linear = true
+	job := newWriteJob(&baseJob{
+		copyer: copyer, src: &source{}, path: "source", stat: &stat{size: 1}, targets: []string{target},
+	}, io.NopCloser(bytes.NewReader([]byte("x"))), 1, false)
+	completed := make(chan *baseJob, 1)
+
+	// The write must reach the target without consulting statfs-derived capacity.
+	copyer.write(context.Background(), job, completed, new(counter), mapset.NewSet[string]())
+	report := (<-completed).report()
+	if len(report.SuccessTargets) != 1 || report.SuccessTargets[0] != target {
+		t.Fatalf("success targets = %v, want %q", report.SuccessTargets, target)
+	}
+}
+
+func TestStoppedLinearTargetDoesNotReadStreamSource(t *testing.T) {
+	// Mark a linear target exhausted before its stream indexer requests more work.
+	source := new(sliceStreamSource)
+	copyer := &Copyer{option: newOption(), eventCh: make(chan Event, 2)}
+	copyer.streamSource = source
+	copyer.toDevice.linear = true
+	copyer.endLinearTarget(ErrTargetNoSpace)
+
+	// A stopped target closes the index stream without consuming another request.
+	for range copyer.indexStream(context.Background()) {
+	}
+	if source.index != 0 {
+		t.Fatalf("source requests = %d, want 0", source.index)
 	}
 }
