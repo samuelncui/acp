@@ -124,15 +124,14 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			continue
 		}
 
-		if !c.toDevice.linear {
-			if err := c.getDiskUsageCache(dev).check(job.size); err != nil {
-				if errors.Is(err, ErrTargetNoSpace) {
-					noSpaceDevices.Add(dev)
-				}
-
-				job.fail(target, fmt.Errorf("check disk usage have error, %w", err))
-				continue
+		if err := c.getDiskUsageCache(dev).check(job.size); err != nil {
+			if errors.Is(err, ErrTargetNoSpace) {
+				noSpaceDevices.Add(dev)
 			}
+			c.endLinearTarget(err)
+
+			job.fail(target, fmt.Errorf("check disk usage have error, %w", err))
+			continue
 		}
 
 		if err := mappingError(os.MkdirAll(filepath.Dir(target), os.ModePerm)); err != nil {

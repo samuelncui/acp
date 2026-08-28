@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	mapset "github.com/deckarep/golang-set/v2"
+	"github.com/samuelncui/godf"
 )
 
 type trackingReadCloser struct {
@@ -204,29 +206,40 @@ func TestFirstTargetFailureRemainsAuthoritative(t *testing.T) {
 	}
 }
 
-func TestLinearTargetSkipsDiskUsageEstimate(t *testing.T) {
-	// Build one linear write whose disk-usage lookup would fail the test if called.
+func TestLinearTargetStopsWhenDiskUsageEstimateIsInsufficient(t *testing.T) {
+	// Size the Job beyond the filesystem estimate without allocating the source payload.
 	root := t.TempDir()
 	target := filepath.Join(root, "target")
+	usage, err := godf.NewDiskUsage(root)
+	if err != nil {
+		t.Fatalf("read disk usage: %v", err)
+	}
+	if usage.Available() > math.MaxInt64-defaultDiskUsageFreshInterval {
+		t.Fatal("available disk space cannot be represented by the test Job size")
+	}
+	size := usage.Available() + defaultDiskUsageFreshInterval
 	copyer := &Copyer{
 		option: newOption(), eventCh: make(chan Event, 8),
-		getDevice: func(string) string { return root },
-		getDiskUsageCache: func(string) *diskUsageCache {
-			t.Fatal("linear target queried filesystem capacity")
-			return nil
-		},
+		getDevice:         func(string) string { return root },
+		getDiskUsageCache: func(string) *diskUsageCache { return newDiskUsageCache(root, defaultDiskUsageFreshInterval) },
 	}
 	copyer.toDevice.linear = true
 	job := newWriteJob(&baseJob{
-		copyer: copyer, src: &source{}, path: "source", stat: &stat{size: 1}, targets: []string{target},
-	}, io.NopCloser(bytes.NewReader([]byte("x"))), 1, false)
+		copyer: copyer, src: &source{}, path: "source", stat: &stat{size: size}, targets: []string{target},
+	}, io.NopCloser(bytes.NewReader(nil)), size, false)
 	completed := make(chan *baseJob, 1)
 
-	// The write must reach the target without consulting statfs-derived capacity.
+	// The hardware-backed estimate must stop a linear target before the oversized write starts.
 	copyer.write(context.Background(), job, completed, new(counter), mapset.NewSet[string]())
 	report := (<-completed).report()
-	if len(report.SuccessTargets) != 1 || report.SuccessTargets[0] != target {
-		t.Fatalf("success targets = %v, want %q", report.SuccessTargets, target)
+	if !errors.Is(report.FailTargets[target], ErrTargetNoSpace) {
+		t.Fatalf("target failure = %v, want %v", report.FailTargets[target], ErrTargetNoSpace)
+	}
+	if !copyer.linearTargetStopped() {
+		t.Fatal("linear target continued after the capacity estimate was exhausted")
+	}
+	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stat target error = %v, want %v", err, os.ErrNotExist)
 	}
 }
 
