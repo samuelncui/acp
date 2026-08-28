@@ -88,20 +88,28 @@ func (c *Copyer) linearTargetStopped() bool {
 }
 
 func (c *Copyer) run(ctx context.Context) error {
+	// Give internal failures one cancellation boundary without canceling the caller.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	defer c.running.Done()
 	defer close(c.eventCh)
 
+	// Keep event dispatch alive until every pipeline stage stops publishing.
 	go wrap(ctx, func() { c.eventLoop(ctx) })
 
+	// Start the bounded index before connecting downstream stages.
 	indexed, err := c.index(ctx)
 	if err != nil {
 		c.setError(err)
 		return err
 	}
 
+	// Run preparation, copying, and result persistence as one pipeline.
 	prepared := c.prepare(ctx, indexed)
 	copyed := c.copy(ctx, prepared)
-	sinkFailed := c.cleanupJob(ctx, copyed)
+	sinkFailed := c.cleanupJob(ctx, cancel, copyed)
+
+	// Flush persisted results unless a Sink write already failed.
 	if c.streamSink != nil && !sinkFailed {
 		if err := c.streamSink.Flush(ctx); err != nil {
 			c.setError(fmt.Errorf("flush stream sink failed, %w", err))

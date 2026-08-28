@@ -260,6 +260,51 @@ type untilCanceledStreamSource struct {
 	nextID int64
 }
 
+type blockingStreamSource struct {
+	request *StreamRequest
+	calls   int
+}
+
+func (s *blockingStreamSource) Next(ctx context.Context) (*StreamRequest, error) {
+	s.calls++
+	if s.calls == 1 {
+		return s.request, nil
+	}
+
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestRunStreamCancelsSourceAfterSinkFailure(t *testing.T) {
+	// Let the source block on its next request after producing one copy Job.
+	root := t.TempDir()
+	input := filepath.Join(root, "source.txt")
+	if err := os.WriteFile(input, []byte("fixture"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	source := &blockingStreamSource{request: &StreamRequest{
+		ID: 1, Source: input, Targets: []string{filepath.Join(root, "target.txt")},
+	}}
+	sinkErr := errors.New("sink failed")
+
+	// A Sink error must cancel the blocked Source instead of copying unpersisted work forever.
+	done := make(chan error, 1)
+	go func() {
+		done <- RunStream(context.Background(), source, &collectingStreamSink{err: sinkErr})
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, sinkErr) {
+			t.Fatalf("RunStream() error = %v, want %v", err, sinkErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RunStream did not cancel its Source after the Sink failed")
+	}
+	if source.calls != 2 {
+		t.Fatalf("source calls = %d, want 2", source.calls)
+	}
+}
+
 func (s *untilCanceledStreamSource) Next(ctx context.Context) (*StreamRequest, error) {
 	select {
 	case <-ctx.Done():

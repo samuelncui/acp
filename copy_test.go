@@ -29,6 +29,18 @@ func (r *trackingReadCloser) Close() error {
 	return nil
 }
 
+type failingReadCloser struct {
+	err error
+}
+
+func (r *failingReadCloser) Read([]byte) (int, error) {
+	return 0, r.err
+}
+
+func (*failingReadCloser) Close() error {
+	return nil
+}
+
 func TestCopyEmptyFile(t *testing.T) {
 	tests := []struct {
 		name string
@@ -109,6 +121,30 @@ func TestWritePublishesFinishingJob(t *testing.T) {
 	copyer.write(context.Background(), job, completed, new(counter), mapset.NewSet[string]())
 	if status := (<-completed).status; status != jobStatusFinishing {
 		t.Fatalf("published status = %q, want %q", status, jobStatusFinishing)
+	}
+}
+
+func TestHashOnlyReadFailureFailsJob(t *testing.T) {
+	// Build a target-free hash Job whose source fails on its first read.
+	readErr := errors.New("read failed")
+	copyer := &Copyer{option: newOption(), eventCh: make(chan Event, 8)}
+	copyer.withHash = true
+	job := newWriteJob(&baseJob{
+		copyer: copyer,
+		src:    &source{},
+		path:   "source",
+		stat:   &stat{size: 1},
+	}, &failingReadCloser{err: readErr}, 1, false)
+	completed := make(chan *baseJob, 1)
+
+	// The source error must cross both the Job result and synchronous error boundary.
+	copyer.write(context.Background(), job, completed, new(counter), mapset.NewSet[string]())
+	report := (<-completed).report()
+	if !errors.Is(report.FailTargets[""], readErr) {
+		t.Fatalf("hash-only failure = %v, want %v", report.FailTargets[""], readErr)
+	}
+	if err := copyer.WaitErr(); !errors.Is(err, readErr) {
+		t.Fatalf("WaitErr() = %v, want %v", err, readErr)
 	}
 }
 

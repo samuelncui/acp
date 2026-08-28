@@ -82,6 +82,7 @@ func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *ba
 }
 
 func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, cntr *counter, noSpaceDevices mapset.Set[string]) {
+	// Release the source and publish ownership only after every consumer stops.
 	var wg sync.WaitGroup
 	defer func() {
 		wg.Wait()
@@ -93,6 +94,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 		}
 	}()
 
+	// Reject source changes before creating any targets.
 	job.setStatus(jobStatusCopying)
 	if job.size != job.stat.size {
 		job.fail("", fmt.Errorf("source size changed, indexed=%d current=%d", job.stat.size, job.size))
@@ -106,6 +108,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 		return
 	}
 
+	// Track progress and close every consumer after the source reader finishes.
 	atomic.AddInt64(&cntr.files, 1)
 	chans := make([]chan []byte, 0, len(job.targets)+1)
 	defer func() {
@@ -114,10 +117,12 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 		}
 	}()
 
+	// Open each viable target before reading the source once.
 	var readErr error
 	for _, target := range job.targets {
 		target := target
 
+		// Reject exhausted targets before reserving capacity.
 		dev := c.getDevice(target)
 		if noSpaceDevices.Contains(dev) {
 			job.fail(target, ErrTargetNoSpace)
@@ -134,6 +139,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			continue
 		}
 
+		// Prepare the target file before attaching its stream consumer.
 		if err := mappingError(os.MkdirAll(filepath.Dir(target), os.ModePerm)); err != nil {
 			if checkErrorAbort(err) {
 				noSpaceDevices.Add(dev)
@@ -163,6 +169,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			}
 		}
 
+		// Consume source buffers in one managed writer for this target.
 		ch := make(chan []byte, 4)
 		chans = append(chans, ch)
 
@@ -170,6 +177,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 		go wrap(ctx, func() {
 			defer wg.Done()
 
+			// Settle target status and discard any incomplete file before exiting.
 			var rerr error
 			defer func() {
 				if rerr == nil {
@@ -193,6 +201,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 				}
 			}()
 
+			// Write every source buffer before publishing the durability boundary.
 			defer func() {
 				if file != nil {
 					_ = file.Close()
@@ -229,6 +238,9 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			}
 		})
 	}
+	targetWriters := len(chans)
+
+	// Add hashing as another consumer of the shared source stream.
 	if c.withHash {
 		sha := sha256Pool.Get().(hash.Hash)
 		sha.Reset()
@@ -248,6 +260,8 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			job.setHash(sha.Sum(nil))
 		})
 	}
+
+	// Read the source only when at least one target or hash consumer needs it.
 	if len(chans) == 0 {
 		return
 	}
@@ -255,6 +269,9 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 	copied, readErr = c.streamCopy(ctx, chans, job.reader, &cntr.bytes)
 	if readErr == nil && copied != job.size {
 		readErr = fmt.Errorf("source size changed while copying, expected=%d copied=%d", job.size, copied)
+	}
+	if readErr != nil && targetWriters == 0 {
+		job.fail("", readErr)
 	}
 }
 
