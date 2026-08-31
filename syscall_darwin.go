@@ -23,5 +23,5 @@ func isNoAttrErr(err error) bool {
 }
 
 func checkXattrKey(key string) bool {
-	return !strings.HasPrefix(key, "system.")
+	return !strings.HasPrefix(key, "system.") && !signatureCacheKey(key)
 }

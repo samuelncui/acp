@@ -1,6 +1,7 @@
 package acp
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,6 +44,9 @@ type option struct {
 	createFlag int
 	withHash   bool
 
+	withSignatureCache bool
+	forceRehash        bool
+
 	logger       *logrus.Logger
 	eventHanders []EventHandler
 }
@@ -64,6 +68,12 @@ func (o *option) check() error {
 
 	o.fromDevice.check()
 	o.toDevice.check()
+	if o.withSignatureCache {
+		o.withHash = true
+	}
+	if o.forceRehash && !o.withSignatureCache {
+		return fmt.Errorf("force rehash requires signature cache")
+	}
 	if o.logger == nil {
 		o.logger = logrus.StandardLogger()
 	}
@@ -128,6 +138,23 @@ func WithProgressBar() Option {
 func WithHash(b bool) Option {
 	return func(o *option) *option {
 		o.withHash = b
+		return o
+	}
+}
+
+// WithSignatureCache enables content-signature reads and writes through xattrs.
+// It also enables hashing so cache misses can be refreshed.
+func WithSignatureCache(enabled bool) Option {
+	return func(o *option) *option {
+		o.withSignatureCache = enabled
+		return o
+	}
+}
+
+// ForceRehash bypasses signature-cache reads while still refreshing the cache.
+func ForceRehash(force bool) Option {
+	return func(o *option) *option {
+		o.forceRehash = force
 		return o
 	}
 }

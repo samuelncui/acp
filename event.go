@@ -32,6 +32,13 @@ type EventReportError struct {
 
 func (*EventReportError) iEvent() {}
 
+// EventSignatureCacheSummary reports aggregate cache behavior for one Copyer.
+type EventSignatureCacheSummary struct {
+	Summary SignatureCacheSummary
+}
+
+func (*EventSignatureCacheSummary) iEvent() {}
+
 type EventFinished struct{}
 
 func (*EventFinished) iEvent() {}

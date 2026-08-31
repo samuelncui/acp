@@ -50,6 +50,8 @@ The working tree may already contain staged or unstaged changes. Preserve them a
 - Persist retry state before considering a rewrite or hardlink operation complete.
 - Preserve build-tagged behavior in `syscall_*`, `mmap/*`, and `cmd/acp-rewrite/file_*` files.
 - Do not add concurrency unless it has explicit ownership, completion, and error semantics.
+- Keep the ACP content-signature xattr a disposable size-and-mtime cache. Transfers always hash content, managed cache keys are not copied as ordinary xattrs, and bounded cache writers drain before the pipeline returns.
+- Report signature-cache read and write failures as aggregate warnings without adding them to `WaitErr`.
 - Add semantic regression tests for every behavior change.
 
 ## Verification

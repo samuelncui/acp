@@ -5,7 +5,14 @@ An Advanced Copy Tools, with following extra features:
 - Multi target path, read once write many
 - Read file with mmap, with small file prefetch hint
 - JSON format job report
+- Optional SHA-256 xattr cache for hash-only streams
 - Can use as a golang library
+
+## Content signature cache
+
+Library callers can opt in with `WithSignatureCache(true)` and bypass reads with `ForceRehash(true)`. ACP stores a fixed binary SHA-256, file size, and nanosecond mtime value in `user.acp.signature` on Linux and the canonical `acp.signature` user attribute on Darwin and FreeBSD.
+
+The xattr is a disposable optimization. Hash-only jobs may reuse a metadata-valid value. Jobs with targets always read and hash content, then refresh the source and every successful target before `WaitErr` or `RunStream` returns. Missing, stale, corrupt, read-only, full, or unsupported xattrs are summarized as warnings and never become copy errors. ACP's managed key is not copied as an ordinary source xattr.
 
 # Install
 ```

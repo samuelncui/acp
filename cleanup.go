@@ -29,6 +29,15 @@ func (c *Copyer) cleanupJob(ctx context.Context, cancel context.CancelFunc, copy
 				}
 			}
 
+			// Refresh only signatures backed by a complete source hash.
+			shouldRefreshSignature := c.signatures != nil && job.hashValid && !job.cacheHit
+			if shouldRefreshSignature {
+				c.signatures.enqueue(job.path, job.hash, job.stat)
+				for _, dst := range job.successTargets {
+					c.signatures.enqueue(dst, job.hash, nil)
+				}
+			}
+
 			// Publish only results whose data and metadata lifecycle has finished.
 			job.setStatus(jobStatusFinished)
 			if c.streamSink == nil {

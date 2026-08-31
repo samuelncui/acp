@@ -51,6 +51,8 @@ type baseJob struct {
 	successTargets []string
 	failedTargets  map[string]error
 	hash           []byte
+	cacheHit       bool
+	hashValid      bool
 }
 
 func (j *baseJob) setStatus(s jobStatus) {
@@ -71,6 +73,22 @@ func (j *baseJob) setHash(h []byte) {
 
 	j.hash = h
 	j.copyer.submit(&EventUpdateJob{j.report()})
+}
+
+func (j *baseJob) setCachedHash(h []byte) {
+	j.lock.Lock()
+	defer j.lock.Unlock()
+
+	j.hash = h
+	j.cacheHit = true
+	j.hashValid = true
+	j.copyer.submit(&EventUpdateJob{j.report()})
+}
+
+func (j *baseJob) validateHash() {
+	j.lock.Lock()
+	j.hashValid = true
+	j.lock.Unlock()
 }
 
 func (j *baseJob) success(path string) {
@@ -116,6 +134,8 @@ func (j *baseJob) report() *Job {
 		ModTime:   j.stat.modTime,
 		WriteTime: j.writeTime,
 		SHA256:    hex.EncodeToString(j.hash),
+
+		SignatureCacheHit: j.cacheHit,
 	}
 }
 
@@ -173,4 +193,6 @@ type Job struct {
 	ModTime   time.Time   `json:"mod_time"`
 	WriteTime time.Time   `json:"write_time"`
 	SHA256    string      `json:"sha256"`
+
+	SignatureCacheHit bool `json:"signature_cache_hit,omitempty"`
 }

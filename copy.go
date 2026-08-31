@@ -100,6 +100,11 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 		job.fail("", fmt.Errorf("source size changed, indexed=%d current=%d", job.stat.size, job.size))
 		return
 	}
+	if job.cacheHit {
+		atomic.AddInt64(&cntr.files, 1)
+		atomic.AddInt64(&cntr.bytes, job.size)
+		return
+	}
 
 	// Skip jobs only when every requested target device is already exhausted.
 	targetDevices := lo.Map(job.targets, func(target string, _ int) string { return c.getDevice(target) })
@@ -150,6 +155,10 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			continue
 		}
 
+		// Invalidate an existing cache before O_TRUNC can replace its content.
+		if c.createFlag&os.O_TRUNC != 0 {
+			c.invalidateSignaturePath(target)
+		}
 		file, err := os.OpenFile(target, c.createFlag, job.stat.mode)
 		if err = mappingError(err); err != nil {
 			if checkErrorAbort(err) {
@@ -160,6 +169,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			job.fail(target, fmt.Errorf("open dst file fail, %w", err))
 			continue
 		}
+		c.invalidateSignature(file, target)
 		if !job.copyer.toDevice.linear && job.size > 0 {
 			if err := truncate(file, job.size); err != nil {
 				_ = file.Close()
@@ -269,6 +279,9 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 	copied, readErr = c.streamCopy(ctx, chans, job.reader, &cntr.bytes)
 	if readErr == nil && copied != job.size {
 		readErr = fmt.Errorf("source size changed while copying, expected=%d copied=%d", job.size, copied)
+	}
+	if readErr == nil && c.withHash {
+		job.validateHash()
 	}
 	if readErr != nil && targetWriters == 0 {
 		job.fail("", readErr)

@@ -18,6 +18,7 @@ type Copyer struct {
 	getDevice         func(in string) string
 	getDiskUsageCache func(mountPoint string) *diskUsageCache
 	linearTargetEnded uint32
+	signatures        *signatureCache
 }
 
 func New(ctx context.Context, opts ...Option) (*Copyer, error) {
@@ -44,6 +45,9 @@ func New(ctx context.Context, opts ...Option) (*Copyer, error) {
 		getDiskUsageCache: Cache(func(mountPoint string) *diskUsageCache {
 			return newDiskUsageCache(mountPoint, defaultDiskUsageFreshInterval)
 		}),
+	}
+	if opt.withSignatureCache {
+		c.signatures = newSignatureCache(signatureWorkers(opt.fromDevice, opt.toDevice))
 	}
 
 	// Account for both pipeline and event dispatch before either goroutine starts.
@@ -93,6 +97,7 @@ func (c *Copyer) run(ctx context.Context) error {
 	defer cancel()
 	defer c.running.Done()
 	defer close(c.eventCh)
+	defer c.finishSignatureCache()
 
 	// Keep event dispatch alive until every pipeline stage stops publishing.
 	go wrap(ctx, func() { c.eventLoop(ctx) })

@@ -23,5 +23,5 @@ func isNoAttrErr(err error) bool {
 }
 
 func checkXattrKey(key string) bool {
-	return true
+	return !signatureCacheKey(key)
 }
