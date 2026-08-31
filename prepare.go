@@ -26,16 +26,16 @@ func (c *Copyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-chan *w
 			defer close(ch)
 			wg.Wait()
 		})
-		}()
+	}()
 
 	// Prepare source readers with the configured source-device concurrency.
 	for idx := 0; idx < c.fromDevice.threads; idx++ {
 		wg.Add(1)
-			go wrap(ctx, func() {
-				defer wg.Done()
+		go wrap(ctx, func() {
+			defer wg.Done()
 
-				// Consume indexed jobs until cancellation or source exhaustion.
-				for {
+			// Consume indexed jobs until cancellation or source exhaustion.
+			for {
 				select {
 				case <-ctx.Done():
 					return
@@ -44,12 +44,12 @@ func (c *Copyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-chan *w
 						return
 					}
 					if c.linearTargetStopped() {
-							continue
-						}
+						continue
+					}
 
-						// Enter preparation and let eligible targetless jobs reuse a valid cache entry.
-						job.setStatus(jobStatusPreparing)
-						var file io.ReadCloser
+					// Enter preparation and let eligible targetless jobs reuse a valid cache entry.
+					job.setStatus(jobStatusPreparing)
+					var file io.ReadCloser
 					var size int64
 					cacheEligible := c.signatures != nil && !c.forceRehash && len(job.targets) == 0
 					if cacheEligible {
@@ -96,19 +96,19 @@ func (c *Copyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-chan *w
 							c.reportError(job.path, "", err)
 							job.fail("", err)
 							job.setStatus(jobStatusFinished)
-								continue
-							}
+							continue
 						}
+					}
 
-						// Publish the prepared reader and preserve linear-source consumption order.
-						wj := newWriteJob(job, file, size, c.fromDevice.linear)
+					// Publish the prepared reader and preserve linear-source consumption order.
+					wj := newWriteJob(job, file, size, c.fromDevice.linear)
 					select {
 					case ch <- wj:
 					case <-ctx.Done():
 						wj.finishSource()
-							return
-						}
-						if !wj.waitConsumed(ctx) {
+						return
+					}
+					if !wj.waitConsumed(ctx) {
 						return
 					}
 				}

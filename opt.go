@@ -66,8 +66,12 @@ func (o *option) check() error {
 		}
 	}
 
-	o.fromDevice.check()
-	o.toDevice.check()
+	if err := o.fromDevice.check(); err != nil {
+		return fmt.Errorf("check source device failed, %w", err)
+	}
+	if err := o.toDevice.check(); err != nil {
+		return fmt.Errorf("check target device failed, %w", err)
+	}
 	if o.withSignatureCache {
 		o.withHash = true
 	}

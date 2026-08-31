@@ -167,6 +167,22 @@ func newSignatureCache(workers int) *signatureCache {
 	return cache
 }
 
+func newCachedSignature(hash []byte, indexed *stat) (CachedSignature, error) {
+	if len(hash) != len(CachedSignature{}.SHA256) {
+		return CachedSignature{}, fmt.Errorf("invalid SHA-256 size=%d", len(hash))
+	}
+	if indexed == nil {
+		return CachedSignature{}, fmt.Errorf("signature metadata is missing")
+	}
+
+	signature := CachedSignature{
+		Size:    indexed.size,
+		MtimeNS: indexed.modTime.UnixNano(),
+	}
+	copy(signature.SHA256[:], hash)
+	return signature, nil
+}
+
 func (c *signatureCache) lookup(path string, indexed *stat) ([]byte, bool) {
 	// Treat every unusable cache read as a non-fatal miss with diagnostics.
 	signature, status, err := readCachedSignature(path)
@@ -193,50 +209,9 @@ func (c *signatureCache) lookup(path string, indexed *stat) ([]byte, bool) {
 	return nil, false
 }
 
-func (c *signatureCache) enqueue(path string, hash []byte, indexed *stat) {
-	// Accept only complete SHA-256 facts from the finished copy pipeline.
-	if len(hash) != len(CachedSignature{}.SHA256) {
-		c.recordFailure(path, fmt.Errorf("invalid SHA-256 size=%d", len(hash)))
-		return
-	}
-
-	// Capture the metadata state that the asynchronous worker must preserve.
-	file, err := os.Open(path)
-	if err != nil {
-		c.recordFailure(path, fmt.Errorf("open signature target failed, %w", err))
-		return
-	}
-	info, statErr := file.Stat()
-	closeErr := file.Close()
-	if statErr != nil {
-		c.recordFailure(path, fmt.Errorf("stat signature target failed, %w", statErr))
-		return
-	}
-	if closeErr != nil {
-		c.recordFailure(path, fmt.Errorf("close signature target failed, %w", closeErr))
-		return
-	}
-	if !info.Mode().IsRegular() {
-		c.recordFailure(path, fmt.Errorf("signature target is not a regular file"))
-		return
-	}
-	if indexed != nil && (info.Size() != indexed.size || info.ModTime().UnixNano() != indexed.modTime.UnixNano()) {
-		c.recordFailure(path, fmt.Errorf("signature source metadata changed"))
-		return
-	}
-
-	var sum [32]byte
-	copy(sum[:], hash)
-
-	// Queue an immutable signature snapshot for descriptor-level revalidation.
-	c.queue <- signatureWrite{
-		path: path,
-		signature: CachedSignature{
-			Size:    info.Size(),
-			MtimeNS: info.ModTime().UnixNano(),
-			SHA256:  sum,
-		},
-	}
+func (c *signatureCache) enqueue(path string, signature CachedSignature) {
+	// Queue the ACP result unchanged for descriptor-level revalidation.
+	c.queue <- signatureWrite{path: path, signature: signature}
 }
 
 func (c *Copyer) invalidateSignature(file *os.File, path string) {

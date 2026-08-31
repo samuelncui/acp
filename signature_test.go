@@ -50,6 +50,42 @@ func TestCachedSignatureCodec(t *testing.T) {
 	}
 }
 
+func TestSignatureCacheWritePreservesACPSnapshot(t *testing.T) {
+	// Build a signature from ACP's completed result rather than live file metadata.
+	content := []byte("snapshot fixture")
+	indexed := &stat{
+		size:    int64(len(content)),
+		modTime: time.Unix(100, 123),
+	}
+	hash := sha256.Sum256(content)
+	want, err := newCachedSignature(hash[:], indexed)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Enqueueing must preserve that immutable snapshot even when the path differs.
+	path := filepath.Join(t.TempDir(), "changed.bin")
+	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), len(content)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	changed := time.Unix(200, 456)
+	if err := os.Chtimes(path, changed, changed); err != nil {
+		t.Fatal(err)
+	}
+	cache := &signatureCache{queue: make(chan signatureWrite, 1)}
+	cache.enqueue(path, want)
+	write := <-cache.queue
+	if write.signature != want {
+		t.Fatalf("queued signature = %#v, want %#v", write.signature, want)
+	}
+
+	// The writer must reject a path that no longer matches ACP's result.
+	cache.write(write)
+	if cache.summary.Writes != 0 || cache.summary.Failures != 1 {
+		t.Fatalf("signature summary = %#v", cache.summary)
+	}
+}
+
 func TestRunStreamSignatureCacheHitStaleAndForce(t *testing.T) {
 	// Create one stable source whose cache lifecycle can be observed across runs.
 	content := []byte("cache fixture")

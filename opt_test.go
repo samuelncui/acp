@@ -1,8 +1,10 @@
 package acp
 
 import (
+	"context"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -94,6 +96,43 @@ func TestLinearDeviceOnlySerializesItsOwnStage(t *testing.T) {
 			}
 			if option.toDevice.threads != test.wantToThreads {
 				t.Fatalf("target threads = %d, want %d", option.toDevice.threads, test.wantToThreads)
+			}
+		})
+	}
+}
+
+func TestNewRejectsNegativeDeviceThreads(t *testing.T) {
+	tests := []struct {
+		name   string
+		option Option
+		want   string
+	}{
+		{
+			name:   "source",
+			option: SetFromDevice(DeviceThreads(-1)),
+			want:   "check source device failed",
+		},
+		{
+			name:   "target",
+			option: SetToDevice(DeviceThreads(-1)),
+			want:   "check target device failed",
+		},
+		{
+			name:   "linear source",
+			option: SetFromDevice(DeviceThreads(-1), LinearDevice(true)),
+			want:   "check source device failed",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			copyer, err := New(context.Background(), test.option)
+			if err == nil {
+				copyer.Wait()
+				t.Fatal("New() error = nil")
+			}
+			if !strings.Contains(err.Error(), test.want) || !strings.Contains(err.Error(), "threads=-1") {
+				t.Fatalf("New() error = %q, want %q and thread count", err, test.want)
 			}
 		})
 	}
