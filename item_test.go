@@ -169,6 +169,38 @@ func (s *blockingSource) calls() int {
 	return s.nexts
 }
 
+// recordingSource delivers prepared batches and records the items it produced, so a test
+// can assert the item contract for exactly the items that were accepted before a stop.
+type recordingSource struct {
+	batches [][]Item
+
+	lock     sync.Mutex
+	index    int
+	produced []*fixtureItem
+}
+
+func (s *recordingSource) Next(context.Context) ([]Item, error) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	if s.index >= len(s.batches) {
+		return nil, io.EOF
+	}
+
+	batch := s.batches[s.index]
+	s.index++
+	for _, item := range batch {
+		s.produced = append(s.produced, item.(*fixtureItem))
+	}
+	return batch, nil
+}
+
+func (s *recordingSource) items() []*fixtureItem {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	return append([]*fixtureItem(nil), s.produced...)
+}
+
 // endlessSource produces one item per call until the caller cancels the context.
 type endlessSource struct {
 	input  string
@@ -692,30 +724,42 @@ func TestRunReportsEveryAcceptedItemExactlyOnce(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
-			const total = 16
+			const (
+				total     = 16
+				batchSize = 4
+			)
 
-			items := make([]Item, 0, total)
-			for index := 0; index < total; index++ {
-				name := fmt.Sprintf("%02d.txt", index)
-				source := writeSourceFile(t, root, name, []byte(strings.Repeat(name, 64)))
-				items = append(items, newFixtureItem(source, filepath.Join(root, "target", name)))
+			// Feed the items in several batches so the stop must also stop the feed.
+			batches := make([][]Item, 0, total/batchSize)
+			for first := 0; first < total; first += batchSize {
+				batch := make([]Item, 0, batchSize)
+				for index := first; index < first+batchSize; index++ {
+					name := fmt.Sprintf("%02d.txt", index)
+					source := writeSourceFile(t, root, name, []byte(strings.Repeat(name, 64)))
+					batch = append(batch, newFixtureItem(source, filepath.Join(root, "target", name)))
+				}
+				batches = append(batches, batch)
 			}
+			source := &recordingSource{batches: batches}
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
-			opts := []Option{WithReadBuffer(4), WithEventHandler(cancelOnFirstCopy(cancel))}
+			opts := []Option{WithReadBuffer(batchSize), WithEventHandler(cancelOnFirstCopy(cancel))}
 			opts = append(opts, test.opts...)
-			err := Run(ctx, newSliceSource(items...), opts...)
+			err := Run(ctx, source, opts...)
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("Run() error = %v, want %v", err, context.Canceled)
 			}
 
 			// Every accepted item owns exactly one terminal outcome, and a stop abandons
 			// the rest with the stopping error instead of dropping them.
+			produced := source.items()
+			if len(produced) == 0 {
+				t.Fatal("the source produced no items")
+			}
 			completed, abandoned := 0, 0
-			for _, submitted := range items {
-				item := submitted.(*fixtureItem)
+			for _, item := range produced {
 				if got := item.callbackCount(); got != 1 {
 					t.Fatalf("item %q received %d callbacks, want 1", item.source, got)
 				}

@@ -136,10 +136,10 @@ Run hash policy tests, which pin the reuse, read, and refresh matrix:
 go test -run '^(TestRunHashPolicyMatrix|TestRunRefreshWritesOnlyWhenStoredHashDiffers|TestRunTransferAlwaysReadsAndRefreshesTargets|TestOverwriteInvalidatesSignatureWithoutCache|TestRunCorruptSignatureIsWarning|TestRunSignatureCacheZeroLength)$' .
 ```
 
-Run every signature cache test, including the drain tests:
+Run every signature cache test, including the codec and the drain tests:
 
 ```sh
-go test -run '^TestRunSignature|^TestSignatureCache' .
+go test -run '^(TestCachedSignatureCodec|TestSignatureCache|TestRunSignature|TestRunHashPolicy|TestRunRefresh|TestRunTransfer|TestOverwriteInvalidates|TestRunCorruptSignature)' .
 ```
 
 Run `acp-rewrite` tests:
