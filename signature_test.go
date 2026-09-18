@@ -79,10 +79,51 @@ func TestSignatureCacheWritePreservesACPSnapshot(t *testing.T) {
 		t.Fatalf("queued signature = %#v, want %#v", write.signature, want)
 	}
 
-	// The writer must reject a path that no longer matches ACP's result.
+	// Seed a decoy so the assertion below proves the writer replaced it, and
+	// skip on filesystems that cannot store the managed attribute at all.
+	seed, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedErr := writeSignatureXattr(seed, encodeCachedSignature(CachedSignature{Size: 7, MtimeNS: 7}))
+	_ = seed.Close()
+	if seedErr != nil {
+		t.Skipf("temporary filesystem does not support signature xattrs: %v", seedErr)
+	}
+
+	// The writer publishes the queued snapshot as-is. Re-deriving it from live
+	// metadata instead would bind this hash to an unrelated version of the file.
 	cache.write(write)
-	if cache.summary.Writes != 0 || cache.summary.Failures != 1 {
+	if cache.summary.Writes != 1 || cache.summary.Failures != 0 {
 		t.Fatalf("signature summary = %#v", cache.summary)
+	}
+
+	// Inspect the raw attribute to confirm ACP's snapshot landed unchanged.
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	encoded, err := readSignatureXattr(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := DecodeCachedSignature(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored != want {
+		t.Fatalf("stored signature = %#v, want %#v", stored, want)
+	}
+
+	// The entry is harmless because the reader owns staleness detection: a
+	// snapshot whose size and mtime no longer match the file reads back as miss.
+	_, valid, err := ReadCachedSignature(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if valid {
+		t.Fatal("snapshot for a changed file was read back as a cache hit")
 	}
 }
 

@@ -13,7 +13,7 @@ An Advanced Copy Tools, with following extra features:
 
 Library callers can opt in with `WithSignatureCache(true)` and bypass reads with `ForceRehash(true)`. ACP stores a fixed binary SHA-256, file size, and nanosecond mtime value in `user.acp.signature` on Linux and the canonical `acp.signature` user attribute on Darwin and FreeBSD.
 
-The xattr is a disposable optimization. Hash-only jobs may reuse a metadata-valid value. Jobs with targets always read and hash content, then refresh the source and every successful target before `WaitErr` or `RunStream` returns. Missing, stale, corrupt, read-only, full, or unsupported xattrs are summarized as warnings and never become copy errors. ACP's managed key is not copied as an ordinary source xattr.
+The xattr is a disposable optimization. Hash-only jobs may reuse a metadata-valid value. Jobs with targets always read and hash content, then refresh the source and every successful target before `WaitErr` or `RunStream` returns. Writers publish the hashed version's size and mtime unchanged, so an entry whose file changed after hashing simply fails the reader's metadata comparison and is treated as stale. Missing, stale, corrupt, read-only, full, or unsupported xattrs are summarized as warnings and never become copy errors. ACP's managed key is not copied as an ordinary source xattr.
 
 # Install
 ```

@@ -210,7 +210,7 @@ func (c *signatureCache) lookup(path string, indexed *stat) ([]byte, bool) {
 }
 
 func (c *signatureCache) enqueue(path string, signature CachedSignature) {
-	// Queue the ACP result unchanged for descriptor-level revalidation.
+	// Queue the ACP result unchanged for a bounded writer to publish as-is.
 	c.queue <- signatureWrite{path: path, signature: signature}
 }
 
@@ -238,7 +238,7 @@ func (c *Copyer) invalidateSignaturePath(path string) {
 }
 
 func (c *signatureCache) write(write signatureWrite) {
-	// Revalidate through the descriptor immediately before changing the xattr.
+	// Open the target and reject anything a content signature cannot describe.
 	file, err := os.Open(write.path)
 	if err != nil {
 		c.recordFailure(write.path, fmt.Errorf("open signature target failed, %w", err))
@@ -246,7 +246,6 @@ func (c *signatureCache) write(write signatureWrite) {
 	}
 	defer file.Close()
 
-	// Verify the queued metadata snapshot before changing the xattr.
 	info, err := file.Stat()
 	if err != nil {
 		c.recordFailure(write.path, fmt.Errorf("stat signature target failed, %w", err))
@@ -256,29 +255,18 @@ func (c *signatureCache) write(write signatureWrite) {
 		c.recordFailure(write.path, fmt.Errorf("signature target is not a regular file"))
 		return
 	}
-	if info.Size() != write.signature.Size || info.ModTime().UnixNano() != write.signature.MtimeNS {
-		c.recordFailure(write.path, fmt.Errorf("signature target metadata changed"))
-		return
-	}
 
-	// Publish the xattr, then remove it if metadata changed during the write.
+	// Publish the queued snapshot unchanged. Rechecking live metadata here would
+	// prove nothing: the reader compares the stored size and mtime against the
+	// file and treats a mismatch as stale, so an entry queued for a version that
+	// has since changed can never be read back as a hit. Rewriting it from live
+	// metadata is not an option either, because the hash belongs to the hashed
+	// version only.
 	if err := writeSignatureXattr(file, encodeCachedSignature(write.signature)); err != nil {
 		c.recordFailure(write.path, fmt.Errorf("write signature xattr failed, %w", err))
 		return
 	}
-	after, err := file.Stat()
-	if err != nil {
-		_ = removeSignatureXattr(file)
-		c.recordFailure(write.path, fmt.Errorf("restat signature target failed, %w", err))
-		return
-	}
-	if after.Size() != write.signature.Size || after.ModTime().UnixNano() != write.signature.MtimeNS {
-		_ = removeSignatureXattr(file)
-		c.recordFailure(write.path, fmt.Errorf("signature target metadata changed during write"))
-		return
-	}
 
-	// Count only signatures that survived the complete publication check.
 	c.lock.Lock()
 	c.summary.Writes++
 	c.lock.Unlock()
