@@ -11,10 +11,7 @@ import (
 func TestCleanupRemovesTargetAfterMetadataFailure(t *testing.T) {
 	// Use a dangling symlink so metadata restoration fails while removal remains possible.
 	root := t.TempDir()
-	sourcePath := filepath.Join(root, "source")
-	if err := os.WriteFile(sourcePath, []byte("fixture"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	sourcePath := writeSourceFile(t, root, "source", []byte("fixture"))
 	info, err := os.Stat(sourcePath)
 	if err != nil {
 		t.Fatal(err)
@@ -29,31 +26,30 @@ func TestCleanupRemovesTargetAfterMetadataFailure(t *testing.T) {
 	}
 
 	// Cleanup must discard the failed target before publishing its final result.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	option := newOption()
-	if err := option.check(); err != nil {
-		t.Fatal(err)
-	}
-	copyer := &Copyer{option: option, eventCh: make(chan Event, 8)}
+	copyer := newTestCopyer(t)
+	item := newFixtureItem(sourcePath, target)
 	job := &baseJob{
 		copyer:         copyer,
+		item:           item,
 		src:            &source{base: root, path: "source"},
 		path:           sourcePath,
 		stat:           stat,
+		targets:        []string{target},
 		successTargets: []string{target},
 	}
 	copyed := make(chan *baseJob, 1)
 	copyed <- job
 	close(copyed)
-	if sinkFailed := copyer.cleanupJob(ctx, cancel, copyed); sinkFailed {
-		t.Fatal("cleanup reported an unexpected Sink failure")
-	}
+	copyer.cleanup(context.Background(), copyed)
+
 	if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stat failed target error = %v, want %v", err, os.ErrNotExist)
 	}
-	report := job.report()
-	if !errors.Is(report.FailTargets[target], os.ErrNotExist) {
-		t.Fatalf("metadata failure = %v, want %v", report.FailTargets[target], os.ErrNotExist)
+	result, terminalErr := item.terminal(t)
+	if terminalErr != nil {
+		t.Fatalf("a metadata failure is a target outcome, not an item failure: %v", terminalErr)
+	}
+	if len(result.Targets) != 1 || !errors.Is(result.Targets[0].Err, os.ErrNotExist) {
+		t.Fatalf("target outcome = %#v, want %v", result.Targets, os.ErrNotExist)
 	}
 }

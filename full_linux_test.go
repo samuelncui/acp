@@ -8,29 +8,80 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
-func TestRunStreamMapsDeviceFullToTargetNoSpace(t *testing.T) {
+func TestRunMapsDeviceFullToTargetNoSpace(t *testing.T) {
 	// Route a disposable target symlink to Linux's deterministic ENOSPC device.
 	root := t.TempDir()
-	input := filepath.Join(root, "source")
+	input := writeSourceFile(t, root, "source", []byte("fixture"))
 	target := filepath.Join(root, "target")
-	if err := os.WriteFile(input, []byte("fixture"), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	if err := os.Symlink("/dev/full", target); err != nil {
 		t.Fatal(err)
 	}
-	source := &sliceStreamSource{requests: []*StreamRequest{{
-		ID: 1, Source: input, Targets: []string{target},
-	}}}
+	item := newFixtureItem(input, target)
 
-	// The synchronous stream boundary must preserve the portable no-space sentinel.
-	err := RunStream(
-		context.Background(), source, new(collectingStreamSink),
-		Overwrite(true), SetToDevice(LinearDevice(true)),
+	// A target failure is an item outcome that keeps the portable no-space sentinel.
+	err := Run(
+		context.Background(),
+		newSliceSource(item),
+		SetToDevice(Overwrite(true), LinearDevice(true)),
 	)
-	if !errors.Is(err, ErrTargetNoSpace) {
-		t.Fatalf("RunStream() error = %v, want %v", err, ErrTargetNoSpace)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	result, terminalErr := item.terminal(t)
+	if terminalErr != nil {
+		t.Fatalf("item failed: %v", terminalErr)
+	}
+	if len(result.Targets) != 1 || !errors.Is(result.Targets[0].Err, ErrTargetNoSpace) {
+		t.Fatalf("target outcome = %#v, want %v", result.Targets, ErrTargetNoSpace)
+	}
+}
+
+func TestDeviceFullWriteFailureDrainsQueuedBuffers(t *testing.T) {
+	// A full device fails the first write while the producer still feeds the writer, which
+	// is the path that must release every queued read buffer.
+	trackChunkPool(t)
+
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	if err := os.Symlink("/dev/full", target); err != nil {
+		t.Fatal(err)
+	}
+
+	size := int64(batchSize) * 4
+	readErr := errors.New("read failed")
+	item := newFixtureItem(filepath.Join(root, "source"), target)
+	copyer := newTestCopyer(t, SetToDevice(Overwrite(true)))
+	job := newWriteJob(&baseJob{
+		copyer:  copyer,
+		item:    item,
+		src:     &source{base: root, path: "source"},
+		path:    filepath.Join(root, "source"),
+		stat:    &stat{size: size, mode: 0o644},
+		targets: []string{target},
+	}, &failingContentReader{err: readErr, batches: 4}, size, false)
+
+	// The writer must fail, release its queued buffers, and let the pipeline return.
+	done := make(chan error, 1)
+	go func() {
+		done <- runWriteJob(copyer, job)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("pipeline failed: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pipeline deadlocked while draining a full target")
+	}
+
+	result, terminalErr := item.terminal(t)
+	if terminalErr != nil {
+		t.Fatalf("an item whose targets failed must still complete: %v", terminalErr)
+	}
+	if len(result.Targets) != 1 || !errors.Is(result.Targets[0].Err, ErrTargetNoSpace) {
+		t.Fatalf("target outcome = %#v, want %v", result.Targets, ErrTargetNoSpace)
 	}
 }

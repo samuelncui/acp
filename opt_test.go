@@ -9,17 +9,15 @@ import (
 )
 
 func TestSourceRoot(t *testing.T) {
+	// The file-system root splits into an empty relative path, which must still resolve as
+	// the root itself and join children onto it.
 	root := string(filepath.Separator)
-	job := Source(root)(new(wildcardJob))
-	if len(job.src) != 1 {
-		t.Fatalf("sources = %d", len(job.src))
-	}
-
-	src := job.src[0]
-	if got := src.src(); got != root {
+	base, name := filepath.Split(filepath.Clean(root))
+	if got := (&source{base: base, path: name}).src(); got != root {
 		t.Fatalf("source root = %q, want %q", got, root)
 	}
 
+	src := &source{base: base, path: name}
 	target := filepath.Join(root, "target")
 	child := src.append("file")
 	if got := child.src(); got != filepath.Join(root, "file") {
@@ -135,5 +133,57 @@ func TestNewRejectsNegativeDeviceThreads(t *testing.T) {
 				t.Fatalf("New() error = %q, want %q and thread count", err, test.want)
 			}
 		})
+	}
+}
+
+func TestNewRejectsInvalidOptions(t *testing.T) {
+	tests := []struct {
+		name   string
+		option Option
+		want   string
+	}{
+		{
+			name:   "empty read buffer",
+			option: WithReadBuffer(0),
+			want:   "read buffer must be at least one item",
+		},
+		{
+			name:   "target read mode",
+			option: SetToDevice(WithReadMode(ReadMapped)),
+			want:   "read mode is a source option",
+		},
+		{
+			name:   "unknown hash policy",
+			option: WithHashPolicy(HashPolicy(0xff)),
+			want:   "unknown hash policy",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			copyer, err := New(context.Background(), test.option)
+			if err == nil {
+				copyer.Wait()
+				t.Fatal("New() error = nil")
+			}
+			if !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("New() error = %q, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestRunRejectsNilBatchSource(t *testing.T) {
+	// Run owns the pipeline lifecycle, so it must reject an input it cannot read.
+	if err := Run(context.Background(), nil); err == nil {
+		t.Fatal("Run() error = nil, want a rejected batch source")
+	}
+}
+
+func TestRunRejectsInvalidOptions(t *testing.T) {
+	// Read mode belongs to the source device, so a target read mode must not start a run.
+	err := Run(context.Background(), newSliceSource(), SetToDevice(WithReadMode(ReadMapped)))
+	if err == nil || !strings.Contains(err.Error(), "read mode is a source option") {
+		t.Fatalf("Run() error = %v, want a rejected target read mode", err)
 	}
 }

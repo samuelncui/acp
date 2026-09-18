@@ -7,6 +7,16 @@ Run all commands from the repository root.
 - Go 1.18 or newer.
 - Enough free space under the system temporary directory for test files and compiled binaries.
 - A host file system that supports the operations exercised by the selected tests.
+- A host file system that supports the managed signature xattr for the cache tests. A test
+  that cannot store it skips itself with a diagnostic.
+
+When this module is checked out inside another Go workspace, run every command with an
+explicit empty `GOFLAGS` and `GOWORK=off` so the parent build flags and workspace do not
+leak into module resolution:
+
+```sh
+GOFLAGS= GOWORK=off go test ./...
+```
 
 ## Standard checks
 
@@ -46,8 +56,9 @@ go test -run '^TestACPCommandE2E$' -v .
 
 The library end-to-end test uses the public Go API directly with two destinations and verifies:
 
-- the complete index, prepare, copy, cleanup, and event pipeline;
+- file selection, item submission, and the complete prepare, copy, cleanup, and event pipeline;
 - regular, empty, and nested file contents at both destinations;
+- one terminal callback per submitted item with one target outcome per destination;
 - successful report status and destination sets;
 - file size and exact SHA256 values.
 
@@ -79,13 +90,57 @@ Run path and mountpoint tests:
 go test -run '^(TestComparePath|TestSourceRoot|TestFindMountpoint)$' .
 ```
 
+Run file selection tests:
+
+```sh
+go test -run '^TestSelectFiles' .
+```
+
+Run item contract tests, which pin one terminal callback per accepted item, one outcome per
+requested target in request order, failure routing, and single-goroutine callback delivery:
+
+```sh
+go test -run '^(TestRunReportsEveryAcceptedItemExactlyOnce|TestRunKeepsLinearOrderingPastAnUnprocessedItem|TestRunReportsUnprocessableItemsAsFailures|TestRunReportsOneOutcomePerRequestedTargetInOrder|TestRunReportsTargetFailureAsItemOutcome|TestRunDeliversTerminalCallbacksFromOneGoroutine|TestPrepareReportsUnstartedItemsWithoutReadingThem|TestPrepareCompletesWithoutOpeningTheSourceWhenPolicyNeedsNoContent)$' .
+```
+
+Run graceful-stop tests, which drive a source that blocks or spans several batches and
+cancel the context mid-run:
+
+```sh
+go test -run '^(TestRunStopsFeedingItemsAfterGracefulStop|TestRunReturnsStoppingErrorWhenBatchSourceEndsFirst|TestRunCancellationDrainsPrefetchedItems|TestRunReportsEveryAcceptedItemExactlyOnce)$' .
+```
+
 Run linear stream-order tests:
 
 ```sh
-go test -run '^(TestRunStreamCopiesRequestsToLinearTarget|TestForwardPreparedOrdersOnlyLinearTargets|TestRunStreamAppliesBoundedBackpressure|TestRunStreamCancellationDrainsPrefetchedJobs|TestLinearTargetStopsWhenDiskUsageEstimateIsInsufficient)$' .
+go test -run '^(TestRunCopiesItemsToLinearTarget|TestForwardPreparedOrdersOnlyLinearTargets|TestRunAppliesBoundedBackpressure|TestLinearTargetStopsWhenDiskUsageEstimateIsInsufficient|TestStoppedLinearTargetDoesNotReadBatchSource)$' .
 ```
 
-On Linux, include `TestRunStreamMapsDeviceFullToTargetNoSpace` to exercise an actual `/dev/full` write failure.
+Run the target-failure drain tests, which prove every read buffer is released and no
+goroutine deadlocks:
+
+```sh
+go test -race -run '^(TestWriteFailureDrainsBuffersAndTargets|TestDeviceFullWriteFailureDrainsQueuedBuffers)$' .
+```
+
+On Linux, include `TestRunMapsDeviceFullToTargetNoSpace` and
+`TestDeviceFullWriteFailureDrainsQueuedBuffers` to exercise actual `/dev/full` write failures:
+
+```sh
+go test -race -run '^(TestRunMapsDeviceFullToTargetNoSpace|TestDeviceFullWriteFailureDrainsQueuedBuffers)$' .
+```
+
+Run hash policy tests, which pin the reuse, read, and refresh matrix:
+
+```sh
+go test -run '^(TestRunHashPolicyMatrix|TestRunRefreshWritesOnlyWhenStoredHashDiffers|TestRunTransferAlwaysReadsAndRefreshesTargets|TestOverwriteInvalidatesSignatureWithoutCache|TestRunCorruptSignatureIsWarning|TestRunSignatureCacheZeroLength)$' .
+```
+
+Run every signature cache test, including the drain tests:
+
+```sh
+go test -run '^TestRunSignature|^TestSignatureCache' .
+```
 
 Run `acp-rewrite` tests:
 

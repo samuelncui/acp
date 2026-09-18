@@ -8,6 +8,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -41,52 +43,121 @@ func (*failingReadCloser) Close() error {
 	return nil
 }
 
-func TestCopyEmptyFile(t *testing.T) {
+// failingContentReader delivers whole batches and then fails, so target writers still hold
+// source buffers when the read stage stops.
+type failingContentReader struct {
+	err     error
+	batches int
+	reads   int
+}
+
+func (r *failingContentReader) Read(p []byte) (int, error) {
+	r.reads++
+	if r.reads <= r.batches {
+		return copy(p, bytes.Repeat([]byte{'x'}, len(p))), nil
+	}
+	return 0, r.err
+}
+
+func (*failingContentReader) Close() error {
+	return nil
+}
+
+// trackChunkPool instruments the shared read-buffer pool so a test can prove that every
+// buffer returns to it, including buffers discarded by a failed target writer.
+func trackChunkPool(t *testing.T) {
+	t.Helper()
+
+	var (
+		lock    sync.Mutex
+		buffers []*chunkBuffer
+	)
+
+	// Empty the shared pool first so every buffer this test uses is tracked here.
+	previousNew := chunkPool.New
+	chunkPool.New = nil
+	for chunkPool.Get() != nil {
+	}
+	t.Cleanup(func() {
+		chunkPool.New = previousNew
+
+		lock.Lock()
+		defer lock.Unlock()
+		if len(buffers) == 0 {
+			t.Error("the pipeline acquired no read buffer")
+		}
+		for index, buffer := range buffers {
+			if refs := atomic.LoadInt32(&buffer.refs); refs != 0 {
+				t.Errorf("read buffer %d still holds %d references after the pipeline stopped", index, refs)
+			}
+		}
+	})
+
+	chunkPool.New = func() interface{} {
+		buffer := &chunkBuffer{data: make([]byte, batchSize)}
+		lock.Lock()
+		buffers = append(buffers, buffer)
+		lock.Unlock()
+		return buffer
+	}
+}
+
+// runWriteJob drives one prepared write Job through the copy and cleanup stages.
+func runWriteJob(copyer *Copyer, job *writeJob) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	prepared := make(chan *writeJob, 1)
+	prepared <- job
+	close(prepared)
+
+	copyed := copyer.copy(ctx, prepared)
+	copyer.cleanup(ctx, copyed)
+	for range copyed {
+	}
+	return copyer.WaitErr()
+}
+
+func TestRunCopiesEmptyFile(t *testing.T) {
 	tests := []struct {
 		name string
 		opts []Option
 	}{
-		{name: "mmap"},
-		{name: "linear", opts: []Option{SetFromDevice(LinearDevice(true))}},
+		{name: "buffered source"},
+		{name: "mapped source", opts: []Option{SetFromDevice(WithReadMode(ReadMapped))}},
+		{name: "linear source", opts: []Option{SetFromDevice(LinearDevice(true))}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dir := t.TempDir()
-			src := filepath.Join(dir, "src")
-			dst := filepath.Join(dir, "dst")
-			if err := os.WriteFile(src, nil, 0o644); err != nil {
-				t.Fatalf("write src: %v", err)
-			}
+			root := t.TempDir()
+			source := writeSourceFile(t, root, "src", nil)
+			target := filepath.Join(root, "dst")
+			item := newFixtureItem(source, target)
 
 			handler, getter := NewReportGetter()
-			opts := append([]Option{
-				AccurateJob(src, []string{dst}),
-				Overwrite(true),
-				WithEventHandler(handler),
-			}, tt.opts...)
-			copyer, err := New(context.Background(), opts...)
-			if err != nil {
-				t.Fatalf("new copyer: %v", err)
+			opts := append([]Option{WithEventHandler(handler)}, tt.opts...)
+			if err := Run(context.Background(), newSliceSource(item), opts...); err != nil {
+				t.Fatalf("run: %v", err)
 			}
 
-			done := make(chan struct{})
-			go func() {
-				copyer.Wait()
-				close(done)
-			}()
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				t.Fatalf("copy empty file timed out")
-			}
-
-			info, err := os.Stat(dst)
+			info, err := os.Stat(target)
 			if err != nil {
 				t.Fatalf("stat dst: %v", err)
 			}
 			if info.Size() != 0 {
 				t.Fatalf("dst size = %d", info.Size())
+			}
+
+			result, err := item.terminal(t)
+			if err != nil {
+				t.Fatalf("item failed: %v", err)
+			}
+			if len(result.Targets) != 1 || result.Targets[0].Err != nil || result.Targets[0].Path != target {
+				t.Fatalf("targets = %v", result.Targets)
+			}
+			if result.Size != 0 {
+				t.Fatalf("result size = %d, want 0", result.Size)
 			}
 
 			report := getter()
@@ -100,7 +171,7 @@ func TestCopyEmptyFile(t *testing.T) {
 			if job.Status != JobStatusFinished {
 				t.Fatalf("job status = %q", job.Status)
 			}
-			if len(job.SuccessTargets) != 1 || job.SuccessTargets[0] != dst {
+			if len(job.SuccessTargets) != 1 || job.SuccessTargets[0] != target {
 				t.Fatalf("success targets = %v", job.SuccessTargets)
 			}
 		})
@@ -109,7 +180,7 @@ func TestCopyEmptyFile(t *testing.T) {
 
 func TestWritePublishesFinishingJob(t *testing.T) {
 	// Build a target-free write Job so only the worker-to-cleanup handoff is exercised.
-	copyer := &Copyer{option: newOption(), eventCh: make(chan Event, 8)}
+	copyer := newTestCopyer(t)
 	job := newWriteJob(&baseJob{
 		copyer: copyer,
 		src:    &source{},
@@ -124,27 +195,36 @@ func TestWritePublishesFinishingJob(t *testing.T) {
 	}
 }
 
-func TestHashOnlyReadFailureFailsJob(t *testing.T) {
-	// Build a target-free hash Job whose source fails on its first read.
+func TestWriteReportsTargetlessReadFailureAsItemFailure(t *testing.T) {
+	// Build a target-free hash item whose source fails on its first read.
 	readErr := errors.New("read failed")
-	copyer := &Copyer{option: newOption(), eventCh: make(chan Event, 8)}
-	copyer.withHash = true
+	copyer := newTestCopyer(t, WithHashPolicy(HashRead))
+	item := newFixtureItem("source")
 	job := newWriteJob(&baseJob{
 		copyer: copyer,
+		item:   item,
 		src:    &source{},
 		path:   "source",
 		stat:   &stat{size: 1},
 	}, &failingReadCloser{err: readErr}, 1, false)
 	completed := make(chan *baseJob, 1)
 
-	// The source error must cross both the Job result and synchronous error boundary.
+	// An item with no target outcome to report could not be processed at all.
 	copyer.write(context.Background(), job, completed, new(counter), mapset.NewSet[string]())
-	report := (<-completed).report()
-	if !errors.Is(report.FailTargets[""], readErr) {
-		t.Fatalf("hash-only failure = %v, want %v", report.FailTargets[""], readErr)
+	if err := (<-completed).itemError; !errors.Is(err, readErr) {
+		t.Fatalf("item error = %v, want %v", err, readErr)
 	}
-	if err := copyer.WaitErr(); !errors.Is(err, readErr) {
-		t.Fatalf("WaitErr() = %v, want %v", err, readErr)
+
+	// Cleanup must route that item to its failure callback instead of completing it.
+	copyed := make(chan *baseJob, 1)
+	copyed <- job.baseJob
+	close(copyed)
+	copyer.cleanup(context.Background(), copyed)
+	if result, err := item.terminal(t); !errors.Is(err, readErr) {
+		t.Fatalf("terminal outcome = %#v / %v, want failure %v", result, err, readErr)
+	}
+	if err := copyer.WaitErr(); err != nil {
+		t.Fatalf("WaitErr() = %v, want nil: a failed item is an item outcome", err)
 	}
 }
 
@@ -164,10 +244,10 @@ func TestCopyClosesPreparedSourcesAfterCancellation(t *testing.T) {
 	// Queue one prefetched reader before starting an already-canceled Copy stage.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	copyer := &Copyer{option: newOption(), eventCh: make(chan Event, 1)}
+	copyer := newTestCopyer(t)
 	copyer.toDevice.threads = 1
 	reader := new(trackingReadCloser)
-	job := newWriteJob(nil, reader, 0, true)
+	job := newWriteJob(&baseJob{copyer: copyer, item: newFixtureItem("source")}, reader, 0, true)
 	prepared := make(chan *writeJob, 1)
 	prepared <- job
 	close(prepared)
@@ -181,30 +261,43 @@ func TestCopyClosesPreparedSourcesAfterCancellation(t *testing.T) {
 	if !job.waitConsumed(context.Background()) {
 		t.Fatal("linear source was not notified that the reader was consumed")
 	}
+
+	// The abandoned item is handed to cleanup with the stopping error.
+	select {
+	case abandoned := <-copyer.abandoned:
+		if abandoned != job.baseJob {
+			t.Fatalf("abandoned job = %p, want %p", abandoned, job.baseJob)
+		}
+		if !errors.Is(abandoned.itemError, context.Canceled) {
+			t.Fatalf("abandoned item error = %v, want %v", abandoned.itemError, context.Canceled)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("copy did not report the prefetched item")
+	}
 }
 
-func TestWriteReturnsWhenCanceledBeforePublishing(t *testing.T) {
+func TestWriteReturnsAfterHardStopWithoutPublishing(t *testing.T) {
 	// Use an unbuffered completion channel with no receiver to expose a blocked handoff.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	copyer := &Copyer{option: newOption(), eventCh: make(chan Event, 8)}
+	copyer := newTestCopyer(t)
+	copyer.stopHard()
 	reader := new(trackingReadCloser)
 	job := newWriteJob(&baseJob{
 		copyer: copyer,
+		item:   newFixtureItem("source"),
 		src:    &source{},
 		stat:   &stat{},
 	}, reader, 0, false)
 	done := make(chan struct{})
 	go func() {
-		copyer.write(ctx, job, make(chan *baseJob), new(counter), mapset.NewSet[string]())
+		copyer.write(context.Background(), job, make(chan *baseJob), new(counter), mapset.NewSet[string]())
 		close(done)
 	}()
 
-	// Cancellation must skip the completion handoff while retaining source cleanup.
+	// A pipeline failure skips the completion handoff while retaining source cleanup.
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("write did not return after cancellation")
+		t.Fatal("write did not return after the pipeline stopped")
 	}
 	if reader.closed != 1 {
 		t.Fatalf("reader closed %d times, want 1", reader.closed)
@@ -213,32 +306,94 @@ func TestWriteReturnsWhenCanceledBeforePublishing(t *testing.T) {
 
 func TestBaseJobFailureMovesSuccessfulTarget(t *testing.T) {
 	// Seed a completed target before applying a metadata-stage failure.
-	copyer := &Copyer{option: newOption(), eventCh: make(chan Event, 2)}
+	copyer := newTestCopyer(t)
+	item := newFixtureItem("source", "target")
 	job := &baseJob{
-		copyer: copyer, src: &source{}, stat: &stat{}, successTargets: []string{"target"},
+		copyer: copyer, item: item, src: &source{}, stat: &stat{},
+		targets: []string{"target"}, successTargets: []string{"target"},
 	}
 
 	// A late target failure must remove the target from the successful result.
 	job.fail("target", syscall.ENOSPC)
-	report := job.report()
-	if len(report.SuccessTargets) != 0 {
+	result := job.result()
+	if len(result.Targets) != 1 || result.Targets[0].Err == nil {
+		t.Fatalf("targets = %#v, want one failed outcome", result.Targets)
+	}
+	if report := job.report(); len(report.SuccessTargets) != 0 {
 		t.Fatalf("success targets = %v, want none", report.SuccessTargets)
 	}
-	if !errors.Is(report.FailTargets["target"], syscall.ENOSPC) {
-		t.Fatalf("target failure = %v, want %v", report.FailTargets["target"], syscall.ENOSPC)
+	if !errors.Is(result.Targets[0].Err, syscall.ENOSPC) {
+		t.Fatalf("target failure = %v, want %v", result.Targets[0].Err, syscall.ENOSPC)
 	}
 }
 
-func TestFirstTargetFailureRemainsAuthoritative(t *testing.T) {
-	// Record a mapped write failure before the best-effort cleanup error.
-	copyer := &Copyer{option: newOption(), eventCh: make(chan Event, 4)}
-	job := &baseJob{copyer: copyer, src: &source{}, stat: &stat{}}
+func TestTargetFailureKeepsItsIdentityAsItemOutcome(t *testing.T) {
+	// Record a mapped write failure before a later, unrelated pipeline error.
+	copyer := newTestCopyer(t)
+	item := newFixtureItem("source", "target")
+	job := &baseJob{
+		copyer: copyer, item: item, src: &source{}, stat: &stat{}, targets: []string{"target"},
+	}
 	job.fail("target", mappingError(syscall.ENOSPC))
 	copyer.setError(errors.New("remove failed"))
 
-	// Secondary cleanup failures must not hide the no-space classification.
-	if err := copyer.WaitErr(); !errors.Is(err, ErrTargetNoSpace) {
-		t.Fatalf("WaitErr() = %v, want %v", err, ErrTargetNoSpace)
+	// The item outcome keeps the no-space classification the caller classifies on.
+	result := job.result()
+	if len(result.Targets) != 1 || !errors.Is(result.Targets[0].Err, ErrTargetNoSpace) {
+		t.Fatalf("target outcome = %#v, want %v", result.Targets, ErrTargetNoSpace)
+	}
+}
+
+func TestWriteFailureDrainsBuffersAndTargets(t *testing.T) {
+	// Fail the source read after a whole batch, so every target writer runs its failure
+	// drain while the pipeline still holds the failed item's buffers.
+	trackChunkPool(t)
+
+	root := t.TempDir()
+	readErr := errors.New("read failed")
+	targets := []string{filepath.Join(root, "target-1"), filepath.Join(root, "target-2")}
+	item := newFixtureItem(filepath.Join(root, "source"), targets...)
+	copyer := newTestCopyer(t, WithHashPolicy(HashRead))
+	job := newWriteJob(&baseJob{
+		copyer:  copyer,
+		item:    item,
+		src:     &source{base: root, path: "source"},
+		path:    filepath.Join(root, "source"),
+		stat:    &stat{size: batchSize, mode: 0o644},
+		targets: targets,
+	}, &failingContentReader{err: readErr, batches: 1}, batchSize, false)
+
+	// The pipeline must drain every writer, report exactly one outcome, and return.
+	done := make(chan error, 1)
+	go func() {
+		done <- runWriteJob(copyer, job)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("pipeline failed: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pipeline deadlocked while draining failed target writers")
+	}
+
+	result, err := item.terminal(t)
+	if err != nil {
+		t.Fatalf("an item whose targets failed must still complete: %v", err)
+	}
+	if len(result.SHA256) != 0 {
+		t.Fatalf("SHA256 = %x, want none: the read stopped before the source ended", result.SHA256)
+	}
+	if len(result.Targets) != 2 {
+		t.Fatalf("targets = %#v, want one outcome per requested target", result.Targets)
+	}
+	for _, outcome := range result.Targets {
+		if !errors.Is(outcome.Err, readErr) {
+			t.Fatalf("target %q error = %v, want %v", outcome.Path, outcome.Err, readErr)
+		}
+		if _, statErr := os.Stat(outcome.Path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("failed target %q still exists: %v", outcome.Path, statErr)
+		}
 	}
 }
 
@@ -254,22 +409,28 @@ func TestLinearTargetStopsWhenDiskUsageEstimateIsInsufficient(t *testing.T) {
 		t.Fatal("available disk space cannot be represented by the test Job size")
 	}
 	size := usage.Available() + defaultDiskUsageFreshInterval
+	option := newOption()
+	if err := option.check(); err != nil {
+		t.Fatal(err)
+	}
 	copyer := &Copyer{
-		option: newOption(), eventCh: make(chan Event, 8),
+		option: option, eventCh: make(chan Event, 8), hardStop: make(chan struct{}),
 		getDevice:         func(string) string { return root },
 		getDiskUsageCache: func(string) *diskUsageCache { return newDiskUsageCache(root, defaultDiskUsageFreshInterval) },
 	}
 	copyer.toDevice.linear = true
+	item := newFixtureItem("source", target)
 	job := newWriteJob(&baseJob{
-		copyer: copyer, src: &source{}, path: "source", stat: &stat{size: size}, targets: []string{target},
+		copyer: copyer, item: item, src: &source{}, path: "source",
+		stat: &stat{size: size}, targets: []string{target},
 	}, io.NopCloser(bytes.NewReader(nil)), size, false)
 	completed := make(chan *baseJob, 1)
 
 	// The hardware-backed estimate must stop a linear target before the oversized write starts.
 	copyer.write(context.Background(), job, completed, new(counter), mapset.NewSet[string]())
-	report := (<-completed).report()
-	if !errors.Is(report.FailTargets[target], ErrTargetNoSpace) {
-		t.Fatalf("target failure = %v, want %v", report.FailTargets[target], ErrTargetNoSpace)
+	result := (<-completed).result()
+	if len(result.Targets) != 1 || !errors.Is(result.Targets[0].Err, ErrTargetNoSpace) {
+		t.Fatalf("target outcome = %#v, want %v", result.Targets, ErrTargetNoSpace)
 	}
 	if !copyer.linearTargetStopped() {
 		t.Fatal("linear target continued after the capacity estimate was exhausted")
@@ -279,18 +440,47 @@ func TestLinearTargetStopsWhenDiskUsageEstimateIsInsufficient(t *testing.T) {
 	}
 }
 
-func TestStoppedLinearTargetDoesNotReadStreamSource(t *testing.T) {
-	// Mark a linear target exhausted before its stream indexer requests more work.
-	source := new(sliceStreamSource)
-	copyer := &Copyer{option: newOption(), eventCh: make(chan Event, 2)}
-	copyer.streamSource = source
-	copyer.toDevice.linear = true
+func TestStoppedLinearTargetDoesNotReadBatchSource(t *testing.T) {
+	// Mark a linear target exhausted before its batch indexer requests more work.
+	source := newSliceSource()
+	copyer := newTestCopyer(t, SetToDevice(LinearDevice(true)))
+	copyer.batch = source
 	copyer.endLinearTarget(ErrTargetNoSpace)
 
-	// A stopped target closes the index stream without consuming another request.
-	for range copyer.indexStream(context.Background()) {
+	// A stopped target closes the index without consuming another batch.
+	indexed, err := copyer.index(context.Background())
+	if err != nil {
+		t.Fatal(err)
 	}
-	if source.index != 0 {
-		t.Fatalf("source requests = %d, want 0", source.index)
+	for range indexed {
+	}
+	if calls := source.calls(); calls != 0 {
+		t.Fatalf("source calls = %d, want 0", calls)
+	}
+}
+
+func TestIndexReportsBatchSourceFailureAndYieldsAcceptedItems(t *testing.T) {
+	// A source error is a pipeline failure, and items accepted before it stay owned.
+	sourceErr := errors.New("source failed")
+	copyer := newTestCopyer(t)
+	item := newFixtureItem("source")
+	copyer.batch = &sliceSource{batches: [][]Item{{item}}, err: sourceErr}
+
+	indexed, err := copyer.index(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted := 0
+	for job := range indexed {
+		accepted++
+		if job.item != item {
+			t.Fatalf("indexed item = %v, want the submitted item", job.item)
+		}
+	}
+	if accepted != 1 {
+		t.Fatalf("indexed items = %d, want 1", accepted)
+	}
+	if err := copyer.WaitErr(); !errors.Is(err, sourceErr) {
+		t.Fatalf("WaitErr() = %v, want %v", err, sourceErr)
 	}
 }

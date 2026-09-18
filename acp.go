@@ -19,6 +19,13 @@ type Copyer struct {
 	getDiskUsageCache func(mountPoint string) *diskUsageCache
 	linearTargetEnded uint32
 	signatures        *signatureCache
+
+	// hardStop ends the pipeline without per-item accounting, for internal failures.
+	hardStop     chan struct{}
+	hardStopOnce sync.Once
+	// abandoned carries items that will never be processed so the reporting goroutine
+	// can still report them.
+	abandoned chan *baseJob
 }
 
 func New(ctx context.Context, opts ...Option) (*Copyer, error) {
@@ -41,12 +48,14 @@ func New(ctx context.Context, opts ...Option) (*Copyer, error) {
 	c := &Copyer{
 		option:    opt,
 		eventCh:   make(chan Event, 128),
+		hardStop:  make(chan struct{}),
+		abandoned: make(chan *baseJob),
 		getDevice: getDevice,
 		getDiskUsageCache: Cache(func(mountPoint string) *diskUsageCache {
 			return newDiskUsageCache(mountPoint, defaultDiskUsageFreshInterval)
 		}),
 	}
-	if opt.withSignatureCache {
+	if opt.hashPolicy.usesCache() {
 		c.signatures = newSignatureCache(signatureWorkers(opt.fromDevice, opt.toDevice))
 	}
 
@@ -55,6 +64,52 @@ func New(ctx context.Context, opts ...Option) (*Copyer, error) {
 	go wrap(ctx, func() { c.run(ctx) })
 
 	return c, nil
+}
+
+// stopHard ends the pipeline immediately. Per-item accounting is not promised afterwards.
+func (c *Copyer) stopHard() {
+	c.hardStopOnce.Do(func() {
+		close(c.hardStop)
+	})
+}
+
+// stopped reports whether the caller stopped the pipeline gracefully.
+func (c *Copyer) stopped(ctx context.Context) bool {
+	if ctx.Err() != nil || c.linearTargetStopped() {
+		return true
+	}
+	select {
+	case <-c.hardStop:
+		return true
+	default:
+		return false
+	}
+}
+
+// abandonment describes why an accepted item never entered processing.
+func (c *Copyer) abandonment(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if c.linearTargetStopped() {
+		return ErrTargetNoSpace
+	}
+	return context.Canceled
+}
+
+// abandon hands an accepted item to the reporting goroutine, because a stage stops
+// reading its input but must not drop a job it already owns.
+func (c *Copyer) abandon(job *baseJob, reason error) bool {
+	if job == nil || job.item == nil {
+		return false
+	}
+	job.itemError = reason
+	select {
+	case c.abandoned <- job:
+		return true
+	case <-c.hardStop:
+		return false
+	}
 }
 
 func (c *Copyer) Wait() {
@@ -106,22 +161,17 @@ func (c *Copyer) run(ctx context.Context) error {
 	indexed, err := c.index(ctx)
 	if err != nil {
 		c.setError(err)
+		c.stopHard()
 		return err
 	}
 
-	// Run preparation, copying, and result persistence as one pipeline.
+	// Run preparation, copying, and result reporting as one pipeline. Every stage drains
+	// what it holds, so a graceful stop still reports every accepted item.
 	prepared := c.prepare(ctx, indexed)
 	copyed := c.copy(ctx, prepared)
-	sinkFailed := c.cleanupJob(ctx, cancel, copyed)
+	c.cleanup(ctx, copyed)
 
-	// Flush persisted results unless a Sink write already failed.
-	if c.streamSink != nil && !sinkFailed {
-		if err := c.streamSink.Flush(ctx); err != nil {
-			c.setError(fmt.Errorf("flush stream sink failed, %w", err))
-		}
-	}
-
-	// Drain remaining stages in dependency order. Prepared jobs retain open sources.
+	// Drain remaining stages in dependency order. A hard stop leaves jobs behind.
 	for range indexed {
 	}
 	for job := range prepared {
@@ -185,6 +235,14 @@ func (c *Copyer) submit(e Event) {
 func (c *Copyer) reportError(src, dst string, err error) {
 	e := &Error{Src: src, Dst: dst, Err: err}
 	c.setError(fmt.Errorf("copy failed, source=%q target=%q, %w", src, dst, err))
+	c.logf(logrus.ErrorLevel, e.Error())
+	c.submit(&EventReportError{Error: e})
+}
+
+// reportItemError reports one item's failure without failing the pipeline: the caller
+// receives the failure as an item outcome and decides what it means.
+func (c *Copyer) reportItemError(src, dst string, err error) {
+	e := &Error{Src: src, Dst: dst, Err: err}
 	c.logf(logrus.ErrorLevel, e.Error())
 	c.submit(&EventReportError{Error: e})
 }

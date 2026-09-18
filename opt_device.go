@@ -2,9 +2,31 @@ package acp
 
 import "fmt"
 
+// ReadMode selects how a source device reads its content.
+type ReadMode uint8
+
+const (
+	// ReadBuffered reads through the kernel's buffered path, which is the default.
+	ReadBuffered ReadMode = iota
+	// ReadMapped reads through a memory mapping.
+	ReadMapped
+)
+
+func (m ReadMode) String() string {
+	switch m {
+	case ReadBuffered:
+		return "buffered"
+	case ReadMapped:
+		return "mapped"
+	}
+	return fmt.Sprintf("unknown(%d)", uint8(m))
+}
+
 type deviceOption struct {
-	linear  bool
-	threads int
+	linear    bool
+	threads   int
+	overwrite bool
+	readMode  ReadMode
 }
 
 func (do *deviceOption) check() error {
@@ -32,6 +54,15 @@ func LinearDevice(b bool) DeviceOption {
 func DeviceThreads(threads int) DeviceOption {
 	return func(d *deviceOption) *deviceOption {
 		d.threads = threads
+		return d
+	}
+}
+
+// WithReadMode selects how a source device reads its content. It applies to the source
+// device only and defaults to buffered reads.
+func WithReadMode(mode ReadMode) DeviceOption {
+	return func(d *deviceOption) *deviceOption {
+		d.readMode = mode
 		return d
 	}
 }

@@ -32,20 +32,20 @@ func comparePath(a, b string) int {
 	return strings.Compare(a, b)
 }
 
+// defaultReadBuffer is how many items ACP may hold in its read buffer when the caller
+// does not set one.
+const defaultReadBuffer = 4096
+
 type option struct {
-	accurateJobs []*accurateJob
-	wildcardJobs []*wildcardJob
-	streamSource StreamSource
-	streamSink   StreamSink
+	batch BatchSource
 
 	fromDevice *deviceOption
 	toDevice   *deviceOption
 
 	createFlag int
-	withHash   bool
+	hashPolicy HashPolicy
 
-	withSignatureCache bool
-	forceRehash        bool
+	readBuffer int
 
 	logger       *logrus.Logger
 	eventHanders []EventHandler
@@ -56,27 +56,28 @@ func newOption() *option {
 		fromDevice: new(deviceOption),
 		toDevice:   new(deviceOption),
 		createFlag: os.O_WRONLY | os.O_CREATE | os.O_EXCL,
+		readBuffer: defaultReadBuffer,
 	}
 }
 
 func (o *option) check() error {
-	for _, job := range o.wildcardJobs {
-		if err := job.check(); err != nil {
-			return err
-		}
-	}
-
 	if err := o.fromDevice.check(); err != nil {
 		return fmt.Errorf("check source device failed, %w", err)
 	}
 	if err := o.toDevice.check(); err != nil {
 		return fmt.Errorf("check target device failed, %w", err)
 	}
-	if o.withSignatureCache {
-		o.withHash = true
+	if o.toDevice.readMode != ReadBuffered {
+		return fmt.Errorf("read mode is a source option, mode= %s", o.toDevice.readMode)
 	}
-	if o.forceRehash && !o.withSignatureCache {
-		return fmt.Errorf("force rehash requires signature cache")
+	if o.readBuffer < 1 {
+		return fmt.Errorf("read buffer must be at least one item, items=%d", o.readBuffer)
+	}
+	if o.toDevice.overwrite {
+		o.createFlag = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	}
+	if !o.hashPolicy.valid() {
+		return fmt.Errorf("unknown hash policy, policy= %s", o.hashPolicy)
 	}
 	if o.logger == nil {
 		o.logger = logrus.StandardLogger()
@@ -86,18 +87,6 @@ func (o *option) check() error {
 }
 
 type Option func(*option) *option
-
-type accurateJob struct {
-	src  string
-	dsts []string
-}
-
-func AccurateJob(src string, dsts []string) Option {
-	return func(o *option) *option {
-		o.accurateJobs = append(o.accurateJobs, &accurateJob{src: filepath.Clean(src), dsts: dsts})
-		return o
-	}
-}
 
 func SetFromDevice(opts ...DeviceOption) Option {
 	return func(o *option) *option {
@@ -123,14 +112,26 @@ func SetToDevice(opts ...DeviceOption) Option {
 	}
 }
 
-func Overwrite(b bool) Option {
-	return func(o *option) *option {
-		if b {
-			o.createFlag = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
-			return o
-		}
+func Overwrite(b bool) DeviceOption {
+	return func(d *deviceOption) *deviceOption {
+		d.overwrite = b
+		return d
+	}
+}
 
-		o.createFlag = os.O_WRONLY | os.O_CREATE | os.O_EXCL
+// WithReadBuffer sets how many items ACP may hold in its read buffer. A Job runner
+// passes its configured read buffer here.
+func WithReadBuffer(items int) Option {
+	return func(o *option) *option {
+		o.readBuffer = items
+		return o
+	}
+}
+
+// withBatchSource installs the caller's item source.
+func withBatchSource(source BatchSource) Option {
+	return func(o *option) *option {
+		o.batch = source
 		return o
 	}
 }
@@ -139,26 +140,11 @@ func WithProgressBar() Option {
 	return WithEventHandler(NewProgressBar())
 }
 
-func WithHash(b bool) Option {
+// WithHashPolicy sets the content hash policy, which also decides how the stored hash
+// cache is read and refreshed. It defaults to HashOff.
+func WithHashPolicy(policy HashPolicy) Option {
 	return func(o *option) *option {
-		o.withHash = b
-		return o
-	}
-}
-
-// WithSignatureCache enables content-signature reads and writes through xattrs.
-// It also enables hashing so cache misses can be refreshed.
-func WithSignatureCache(enabled bool) Option {
-	return func(o *option) *option {
-		o.withSignatureCache = enabled
-		return o
-	}
-}
-
-// ForceRehash bypasses signature-cache reads while still refreshing the cache.
-func ForceRehash(force bool) Option {
-	return func(o *option) *option {
-		o.forceRehash = force
+		o.hashPolicy = policy
 		return o
 	}
 }

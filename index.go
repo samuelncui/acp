@@ -2,14 +2,11 @@ package acp
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
 const (
@@ -20,35 +17,16 @@ type counter struct {
 	bytes, files int64
 }
 
+// index reads caller-owned items in batches and turns them into jobs. It stops asking the
+// batch source for work as soon as the pipeline stops, and reports the items of the batch
+// it already holds rather than dropping them.
 func (c *Copyer) index(ctx context.Context) (<-chan *baseJob, error) {
-	if c.streamSource != nil {
-		return c.indexStream(ctx), nil
+	if c.batch == nil {
+		return nil, fmt.Errorf("batch source is nil")
 	}
 
-	jobs, err := c.walk(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	ch := make(chan *baseJob, 128)
-	go wrap(ctx, func() {
-		defer close(ch)
-
-		for order, job := range jobs {
-			job.order = uint64(order)
-			select {
-			case <-ctx.Done():
-				return
-			case ch <- job:
-			}
-		}
-	})
-
-	return ch, nil
-}
-
-func (c *Copyer) indexStream(ctx context.Context) <-chan *baseJob {
-	ch := make(chan *baseJob, 128)
+	// The channel capacity is the read buffer, so no separate prefetch stage is needed.
+	ch := make(chan *baseJob, c.readBuffer)
 	go wrap(ctx, func() {
 		defer close(ch)
 
@@ -57,217 +35,104 @@ func (c *Copyer) indexStream(ctx context.Context) <-chan *baseJob {
 		defer func() {
 			c.submit(&EventUpdateCount{Bytes: bytes, Files: files, Finished: true})
 		}()
+
 		for {
-			if c.linearTargetStopped() {
+			// A stop ends the feed without asking the caller for another batch.
+			if c.stopped(ctx) {
 				return
 			}
-			request, err := c.streamSource.Next(ctx)
+
+			batch, err := c.batch.Next(ctx)
 			if err != nil {
-				if err != io.EOF {
-					c.reportError("", "", fmt.Errorf("read stream source failed, %w", err))
+				if !errors.Is(err, io.EOF) {
+					err = fmt.Errorf("read batch source failed, %w", err)
+					c.reportError("", "", err)
+					c.setError(err)
 				}
 				return
 			}
-			if request == nil {
-				c.reportError("", "", fmt.Errorf("read stream source failed, request is nil"))
-				return
-			}
 
-			sourcePath := filepath.Clean(request.Source)
-			info, err := os.Stat(sourcePath)
-			if err != nil {
-				c.reportError(sourcePath, "", fmt.Errorf("stream job get stat failed, %w", err))
-				return
-			}
-			if !info.Mode().IsRegular() {
-				c.reportError(sourcePath, "", fmt.Errorf("stream job source is not a regular file"))
-				return
-			}
-			stat, err := newStat(sourcePath, info)
-			if err != nil {
-				c.reportError(sourcePath, "", fmt.Errorf("read stream job stat failed, %w", err))
-				return
-			}
-
-			job := &baseJob{
-				copyer:   c,
-				src:      &source{base: filepath.Dir(sourcePath), path: filepath.Base(sourcePath)},
-				path:     sourcePath,
-				stat:     stat,
-				targets:  append([]string(nil), request.Targets...),
-				streamID: request.ID,
-				order:    order,
-			}
-			c.submit(&EventUpdateJob{job.report()})
-			bytes += stat.size
-			files++
-
-			select {
-			case <-ctx.Done():
-				c.setError(ctx.Err())
-				return
-			case ch <- job:
+			for index, item := range batch {
+				if !c.accept(ch, item, order, &bytes, &files) {
+					c.abandonItems(ctx, batch[index:])
+					return
+				}
 				order++
 			}
+			c.submit(&EventUpdateCount{Bytes: bytes, Files: files})
 		}
 	})
-	return ch
+	return ch, nil
 }
 
-func (c *Copyer) walk(ctx context.Context) ([]*baseJob, error) {
-	done := make(chan struct{})
-	var reporting sync.WaitGroup
-	reporting.Add(1)
-	defer func() {
-		close(done)
-		reporting.Wait()
-	}()
-
-	cntr := new(counter)
-	go wrap(ctx, func() {
-		defer reporting.Done()
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				c.submit(&EventUpdateCount{Bytes: atomic.LoadInt64(&cntr.bytes), Files: atomic.LoadInt64(&cntr.files)})
-			case <-done:
-				c.submit(&EventUpdateCount{Bytes: atomic.LoadInt64(&cntr.bytes), Files: atomic.LoadInt64(&cntr.files), Finished: true})
-				return
-			}
-		}
-	})
-
-	jobs := make([]*baseJob, 0, 64)
-	appendJob := func(job *baseJob) {
-		if !job.stat.mode.IsRegular() {
-			c.reportError(
-				job.path, "",
-				fmt.Errorf(
-					"unexpected file mode, not regular file, mode= %s",
-					job.stat.mode,
-				),
-			)
-			return
-		}
-
-		c.submit(&EventUpdateJob{job.report()})
-		jobs = append(jobs, job)
-		atomic.AddInt64(&cntr.files, 1)
-		atomic.AddInt64(&cntr.bytes, job.stat.size)
+// accept turns one item into a job and hands it to the read buffer. It reports false when
+// the pipeline stopped before the job was handed over.
+func (c *Copyer) accept(ch chan<- *baseJob, item Item, order uint64, bytes, files *int64) bool {
+	if item == nil {
+		c.reportError("", "", fmt.Errorf("read batch source failed, item is nil"))
+		return false
 	}
 
-	var walk func(src *source, dsts []string)
-	walk = func(src *source, dsts []string) {
-		path := src.src()
-
-		fi, err := os.Stat(path)
-		if err != nil {
-			c.reportError(path, "", fmt.Errorf("walk get stat, %w", err))
-			return
-		}
-
-		mode := fi.Mode()
-		if mode.IsRegular() {
-			targets := make([]string, 0, len(dsts))
-			for _, d := range dsts {
-				targets = append(targets, src.dst(d))
-			}
-
-			stat, err := newStat(path, fi)
-			if err != nil {
-				c.reportError(path, "", fmt.Errorf("read sys stat, %w", err))
-				return
-			}
-
-			appendJob(&baseJob{
-				copyer:  c,
-				src:     src,
-				path:    path,
-				stat:    stat,
-				targets: targets,
-			})
-			return
-		}
-		if mode&UnexpectFileMode != 0 {
-			return
-		}
-
-		files, err := os.ReadDir(path)
-		if err != nil {
-			c.reportError(path, "", fmt.Errorf("walk read dir, %w", err))
-			return
-		}
-		for _, file := range files {
-			walk(src.append(file.Name()), dsts)
-		}
+	job, err := c.newJob(item, order)
+	if err != nil {
+		c.reportItemError(item.Source(), "", err)
+		job = &baseJob{copyer: c, item: item, order: order, targets: itemTargets(item)}
+		job.itemError = err
+	} else {
+		*files++
+		*bytes += job.stat.size
 	}
 
-	results := make([]*baseJob, 0, 64)
-	for _, j := range c.wildcardJobs {
-		for _, s := range j.src {
-			walk(s, j.dst)
-		}
-
-		if len(jobs) == 0 {
-			continue
-		}
-
-		joined, err := c.joinJobs(jobs)
-		if err != nil {
-			return nil, err
-		}
-
-		results = append(results, joined...)
-		jobs = jobs[:0]
+	select {
+	case ch <- job:
+		return true
+	case <-c.hardStop:
+		return false
 	}
-
-	for _, j := range c.accurateJobs {
-		fi, err := os.Stat(j.src)
-		if err != nil {
-			c.reportError(j.src, "", fmt.Errorf("accurate job get stat, %w", err))
-			continue
-		}
-		if !fi.Mode().IsRegular() {
-			continue
-		}
-
-		stat, err := newStat(j.src, fi)
-		if err != nil {
-			c.reportError(j.src, "", fmt.Errorf("read sys stat, %w", err))
-			continue
-		}
-
-		appendJob(&baseJob{
-			copyer:  c,
-			src:     &source{base: "/", path: j.src},
-			path:    j.src,
-			stat:    stat,
-			targets: j.dsts,
-		})
-	}
-	results = append(results, jobs...)
-
-	return results, nil
 }
 
-func (c *Copyer) joinJobs(jobs []*baseJob) ([]*baseJob, error) {
-	sort.Slice(jobs, func(i int, j int) bool {
-		return comparePath(jobs[i].src.path, jobs[j].src.path) < 0
-	})
-
-	var last *baseJob
-	filtered := make([]*baseJob, 0, len(jobs))
-	for _, job := range jobs {
-		if last != nil && last.src.path == job.src.path {
-			c.reportError(last.path, "", fmt.Errorf("same relative path, ignored, '%s'", job.path))
+// abandonItems reports accepted items that the pipeline stopped before processing.
+func (c *Copyer) abandonItems(ctx context.Context, items []Item) {
+	reason := c.abandonment(ctx)
+	for _, item := range items {
+		if item == nil {
 			continue
 		}
+		c.abandon(&baseJob{copyer: c, item: item, targets: itemTargets(item)}, reason)
+	}
+}
 
-		filtered = append(filtered, job)
-		last = job
+// newJob resolves one item's source facts. A source that cannot be described is reported
+// as a failed item, not as a pipeline failure.
+func (c *Copyer) newJob(item Item, order uint64) (*baseJob, error) {
+	path := filepath.Clean(item.Source())
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("get source stat failed, source= '%s', %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("source is not a regular file, source= '%s', mode= %s", path, info.Mode())
 	}
 
-	return filtered, nil
+	stat, err := newStat(path, info)
+	if err != nil {
+		return nil, fmt.Errorf("read source stat failed, source= '%s', %w", path, err)
+	}
+
+	job := &baseJob{
+		copyer:  c,
+		item:    item,
+		src:     &source{base: filepath.Dir(path), path: filepath.Base(path)},
+		path:    path,
+		stat:    stat,
+		targets: itemTargets(item),
+		order:   order,
+	}
+	c.submit(&EventUpdateJob{job.report()})
+
+	return job, nil
+}
+
+func itemTargets(item Item) []string {
+	return append([]string(nil), item.Targets()...)
 }

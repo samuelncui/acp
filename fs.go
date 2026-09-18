@@ -1,7 +1,10 @@
 package acp
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -36,6 +39,17 @@ func getMountpointCache() (func(string) string, error) {
 
 		return findMountpoint(path, mps)
 	}), nil
+}
+
+// openSource opens a source for buffered reading without updating its access time.
+// O_NOATIME needs ownership or privilege, so a refused open falls back to an ordinary one.
+func openSource(path string) (*os.File, error) {
+	file, err := os.OpenFile(path, os.O_RDONLY|openNoAtime, 0)
+	if err == nil || !errors.Is(err, fs.ErrPermission) {
+		return file, err
+	}
+
+	return os.Open(path)
 }
 
 func findMountpoint(path string, mountPoints []string) string {

@@ -3,7 +3,6 @@ package acp
 import (
 	"context"
 	"encoding/hex"
-	"fmt"
 	"io"
 	"io/fs"
 	"sync"
@@ -37,12 +36,16 @@ var (
 )
 
 type baseJob struct {
-	copyer   *Copyer
-	src      *source
-	path     string
-	stat     *stat
-	streamID int64
-	order    uint64
+	copyer *Copyer
+	item   Item
+	src    *source
+	path   string
+	stat   *stat
+	order  uint64
+
+	// itemError reports an item ACP could not process at all through its failure
+	// callback instead of a completion.
+	itemError error
 
 	lock      sync.Mutex
 	writeTime time.Time
@@ -101,7 +104,9 @@ func (j *baseJob) success(path string) {
 }
 
 func (j *baseJob) fail(path string, err error) {
-	j.copyer.setError(fmt.Errorf("copy failed, source=%q target=%q, %w", j.path, path, err))
+	// One failed target is an item outcome, not a pipeline failure: the caller classifies
+	// target errors and decides whether the operation continues.
+	j.copyer.reportItemError(j.path, path, err)
 	j.lock.Lock()
 	defer j.lock.Unlock()
 
@@ -140,11 +145,62 @@ func (j *baseJob) report() *Job {
 	}
 }
 
+// failAll marks every requested target failed with one error, which reports a job that
+// could not be written anywhere as a completed item with failed target outcomes.
+func (j *baseJob) failAll(err error) {
+	j.copyer.reportItemError(j.path, "", err)
+
+	j.lock.Lock()
+	defer j.lock.Unlock()
+
+	if len(j.targets) == 0 {
+		j.failedTargets = map[string]error{"": err}
+		return
+	}
+	for _, target := range j.targets {
+		if j.failedTargets == nil {
+			j.failedTargets = make(map[string]error, len(j.targets))
+		}
+		j.failedTargets[target] = err
+	}
+	j.copyer.submit(&EventUpdateJob{j.report()})
+}
+
+// result reports the content facts of a finished job and one outcome per requested
+// target, in request order.
+func (j *baseJob) result() *Result {
+	j.lock.Lock()
+	defer j.lock.Unlock()
+
+	result := &Result{
+		Source:            j.path,
+		Size:              j.stat.size,
+		Mode:              j.stat.mode,
+		ModTime:           j.stat.modTime,
+		WriteTime:         j.writeTime,
+		SHA256:            append([]byte(nil), j.hash...),
+		SignatureCacheHit: j.cacheHit,
+		Targets:           make([]TargetResult, 0, len(j.targets)),
+	}
+	for _, target := range j.targets {
+		outcome := TargetResult{Path: target, Size: j.stat.size, WriteTime: j.writeTime}
+		if err, failed := j.failedTargets[target]; failed {
+			outcome.Err = err
+		}
+		result.Targets = append(result.Targets, outcome)
+	}
+
+	return result
+}
+
 type writeJob struct {
 	*baseJob
 	reader   io.ReadCloser
 	size     int64
 	consumed chan struct{}
+
+	// skipContent marks an item whose policy never reads the source content.
+	skipContent bool
 }
 
 func newWriteJob(job *baseJob, src io.ReadCloser, size int64, waitConsumed bool) *writeJob {
@@ -160,7 +216,9 @@ func newWriteJob(job *baseJob, src io.ReadCloser, size int64, waitConsumed bool)
 }
 
 func (wj *writeJob) finishSource() {
-	_ = wj.reader.Close()
+	if wj.reader != nil {
+		_ = wj.reader.Close()
+	}
 
 	if wj.consumed != nil {
 		close(wj.consumed)

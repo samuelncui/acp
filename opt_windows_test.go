@@ -2,15 +2,15 @@
 
 package acp
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 func TestSourceWindowsPath(t *testing.T) {
-	job := Source(`C:\src\file.txt`)(new(wildcardJob))
-	if len(job.src) != 1 {
-		t.Fatalf("sources = %d", len(job.src))
-	}
+	base, name := filepath.Split(`C:\src\file.txt`)
+	src := &source{base: base, path: name}
 
-	src := job.src[0]
 	if got := src.src(); got != `C:\src\file.txt` {
 		t.Fatalf("source = %q", got)
 	}
@@ -20,12 +20,9 @@ func TestSourceWindowsPath(t *testing.T) {
 }
 
 func TestSourceWindowsRoot(t *testing.T) {
-	job := Source(`C:\`)(new(wildcardJob))
-	if len(job.src) != 1 {
-		t.Fatalf("sources = %d", len(job.src))
-	}
+	base, name := filepath.Split(filepath.Clean(`C:\`))
+	src := &source{base: base, path: name}
 
-	src := job.src[0]
 	if got := src.src(); got != `C:\` {
 		t.Fatalf("source root = %q", got)
 	}

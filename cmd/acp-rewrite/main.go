@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"math/rand"
 	"os"
@@ -359,6 +360,36 @@ func newTmpPath(path string, rnd *rand.Rand) (string, error) {
 	return "", fmt.Errorf("tmp path collide")
 }
 
+// rewriteSource supplies one file as the only item of a rewrite run.
+type rewriteSource struct {
+	source string
+	target string
+
+	done bool
+}
+
+func (s *rewriteSource) Next(ctx context.Context) ([]acp.Item, error) {
+	if s.done {
+		return nil, io.EOF
+	}
+	s.done = true
+
+	return []acp.Item{&rewriteItem{source: s.source, target: s.target}}, nil
+}
+
+// rewriteItem carries one file through the copy pipeline. The rewrite state and the
+// report come from events and the rewritten file, so the terminal callbacks record
+// nothing here.
+type rewriteItem struct {
+	source string
+	target string
+}
+
+func (i *rewriteItem) Source() string        { return i.source }
+func (i *rewriteItem) Targets() []string     { return []string{i.target} }
+func (i *rewriteItem) Completed(*acp.Result) {}
+func (i *rewriteItem) Failed(error)          {}
+
 func rewriteFile(ctx context.Context, entry rewriteEntry, tmpPath string) (*acp.Report, error) {
 	stat, err := os.Stat(entry.Path)
 	if err != nil {
@@ -369,19 +400,17 @@ func rewriteFile(ctx context.Context, entry rewriteEntry, tmpPath string) (*acp.
 	}
 
 	opts := []acp.Option{
-		acp.AccurateJob(entry.Path, []string{tmpPath}),
-		acp.WithHash(true),
-		acp.Overwrite(true),
+		acp.WithHashPolicy(acp.HashRead),
+		acp.SetToDevice(acp.Overwrite(true)),
 	}
 
 	handler, getter := acp.NewReportGetter()
 	opts = append(opts, acp.WithEventHandler(handler))
 
-	c, err := acp.New(ctx, opts...)
-	if err != nil {
+	items := &rewriteSource{source: entry.Path, target: tmpPath}
+	if err := acp.Run(ctx, items, opts...); err != nil {
 		return nil, err
 	}
-	c.Wait()
 
 	report := getter()
 	if report == nil {
