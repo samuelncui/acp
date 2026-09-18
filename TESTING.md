@@ -79,6 +79,14 @@ Run path and mountpoint tests:
 go test -run '^(TestComparePath|TestSourceRoot|TestFindMountpoint)$' .
 ```
 
+Run linear stream-order tests:
+
+```sh
+go test -run '^(TestRunStreamCopiesRequestsToLinearTarget|TestForwardPreparedOrdersOnlyLinearTargets|TestRunStreamAppliesBoundedBackpressure|TestRunStreamCancellationDrainsPrefetchedJobs|TestLinearTargetStopsWhenDiskUsageEstimateIsInsufficient)$' .
+```
+
+On Linux, include `TestRunStreamMapsDeviceFullToTargetNoSpace` to exercise an actual `/dev/full` write failure.
+
 Run `acp-rewrite` tests:
 
 ```sh

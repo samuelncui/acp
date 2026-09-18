@@ -2,6 +2,7 @@
 An Advanced Copy Tools, with following extra features:
 - Process bar
 - Sorted copy order, to improve tape device read performance
+- Concurrent source preparation with request-ordered writes for linear targets
 - Multi target path, read once write many
 - Read file with mmap, with small file prefetch hint
 - JSON format job report

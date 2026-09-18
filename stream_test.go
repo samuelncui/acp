@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -78,21 +79,67 @@ func TestRunStreamCopiesRequestsToLinearTarget(t *testing.T) {
 	if len(sink.results) != len(source.requests) {
 		t.Fatalf("received %d results, want %d", len(sink.results), len(source.requests))
 	}
-	seen := make(map[int64]struct{}, len(sink.results))
-	for _, result := range sink.results {
-		if result.ID < 1 || result.ID > int64(len(source.requests)) {
-			t.Fatalf("unexpected result ID: %d", result.ID)
+	for index, result := range sink.results {
+		if result.ID != int64(index+1) {
+			t.Fatalf("result %d has ID %d, want %d", index, result.ID, index+1)
 		}
-		if _, exists := seen[result.ID]; exists {
-			t.Fatalf("duplicate result ID: %d", result.ID)
-		}
-		seen[result.ID] = struct{}{}
 		if result.Job.Status != JobStatusFinished || len(result.Job.SuccessTargets) != 1 || result.Job.SHA256 == "" {
 			t.Fatalf("unexpected result: %#v", result.Job)
 		}
 	}
 	if sink.flushes != 1 {
 		t.Fatalf("sink flushed %d times, want 1", sink.flushes)
+	}
+}
+
+func TestForwardPreparedOrdersOnlyLinearTargets(t *testing.T) {
+	newJob := func(order uint64, id int64) *writeJob {
+		return newWriteJob(
+			&baseJob{order: order, streamID: id},
+			io.NopCloser(strings.NewReader("fixture")),
+			int64(len("fixture")),
+			false,
+		)
+	}
+	tests := []struct {
+		name    string
+		linear  bool
+		wantIDs []int64
+	}{
+		{name: "linear request order", linear: true, wantIDs: []int64{1, 3}},
+		{name: "random completion order", wantIDs: []int64{3, 1}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// Deliver later preparation results first; a failed or skipped middle request has no write Job.
+			copyer := &Copyer{option: &option{
+				fromDevice: &deviceOption{threads: 3},
+				toDevice:   &deviceOption{linear: test.linear},
+			}}
+			completed := make(chan prepareResult, 3)
+			completed <- prepareResult{order: 2, job: newJob(2, 3)}
+			completed <- prepareResult{order: 0, job: newJob(0, 1)}
+			completed <- prepareResult{order: 1}
+			close(completed)
+			prepared := make(chan *writeJob, 3)
+
+			// Forwarding must reorder only the serialized target path.
+			copyer.forwardPrepared(context.Background(), completed, prepared)
+			close(prepared)
+			var ids []int64
+			for job := range prepared {
+				ids = append(ids, job.streamID)
+				job.finishSource()
+			}
+			if len(ids) != len(test.wantIDs) {
+				t.Fatalf("prepared IDs = %v, want %v", ids, test.wantIDs)
+			}
+			for index := range ids {
+				if ids[index] != test.wantIDs[index] {
+					t.Fatalf("prepared IDs = %v, want %v", ids, test.wantIDs)
+				}
+			}
+		})
 	}
 }
 

@@ -42,6 +42,7 @@ type baseJob struct {
 	path     string
 	stat     *stat
 	streamID int64
+	order    uint64
 
 	lock      sync.Mutex
 	writeTime time.Time

@@ -34,7 +34,8 @@ func (c *Copyer) index(ctx context.Context) (<-chan *baseJob, error) {
 	go wrap(ctx, func() {
 		defer close(ch)
 
-		for _, job := range jobs {
+		for order, job := range jobs {
+			job.order = uint64(order)
 			select {
 			case <-ctx.Done():
 				return
@@ -52,6 +53,7 @@ func (c *Copyer) indexStream(ctx context.Context) <-chan *baseJob {
 		defer close(ch)
 
 		var bytes, files int64
+		var order uint64
 		defer func() {
 			c.submit(&EventUpdateCount{Bytes: bytes, Files: files, Finished: true})
 		}()
@@ -94,6 +96,7 @@ func (c *Copyer) indexStream(ctx context.Context) <-chan *baseJob {
 				stat:     stat,
 				targets:  append([]string(nil), request.Targets...),
 				streamID: request.ID,
+				order:    order,
 			}
 			c.submit(&EventUpdateJob{job.report()})
 			bytes += stat.size
@@ -104,6 +107,7 @@ func (c *Copyer) indexStream(ctx context.Context) <-chan *baseJob {
 				c.setError(ctx.Err())
 				return
 			case ch <- job:
+				order++
 			}
 		}
 	})
