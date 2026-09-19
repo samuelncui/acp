@@ -363,11 +363,10 @@ c.Wait()
   repeated relative path inside one job option already ends the run, and a library caller that
   submits overlapping job options should treat the shared row as a known limit of the report
   surface.
-- A row keeps the `af05f05c` fields: `base` is the directory the source-relative `path` segments
-  are resolved against, and `path` is an array. `full_path` names the source as one whole path
-  and `signature_cache_hit` reports where the hash came from; both are additive fields, so a row
-  written without them is the document `af05f05c` wrote. `NewReportGetter` still keys a row by
-  the joined relative path.
+- A row carries `base`, the directory the source-relative `path` segments are resolved against, and
+  `path` as an array. `full_path` names the source as one whole path and `signature_cache_hit`
+  reports where the hash came from; both are additive fields that a row written before them does not
+  have. `NewReportGetter` keys a row by the joined relative path.
 - Two behaviours differ from `af05f05c` and are deliberate. First, an error the pipeline reports
   for a path — a walk that could not read a directory, a target that could not be removed after
   its metadata failed — is a run error, so `WaitErr` returns it and `cmd/acp` exits non-zero;
@@ -407,6 +406,11 @@ through the descriptor ACP owns, the end of the content is `io.EOF` and an open 
 file is empty rather than closed, `Close` is idempotent and removes the mapping before it closes
 that descriptor, a slice range is validated before anything is allocated, and a platform without
 a mapping reads through the descriptor instead. Upstream changes are not merged automatically.
+
+Two details of that contract are worth stating: a `ReadAt` that starts past the end of the content
+reports an invalid offset rather than `io.EOF`, because only reaching the end of the content is the
+end of the file; and `File` hands out the descriptor the reader owns, so a caller that keeps it must
+keep the reader reachable, since the finalizer closes the descriptor once the reader is gone.
 
 # Install
 ```

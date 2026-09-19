@@ -12,7 +12,9 @@ type Reader struct {
 
 // File returns the descriptor the mapping was created from, or nil once the reader is closed. The
 // reader owns that descriptor for its whole lifecycle: Close removes the mapping and then closes
-// it, so a caller that still needs the descriptor keeps the reader open until it is done.
+// it, so a caller that still needs the descriptor keeps the reader open until it is done. It must
+// also keep the reader reachable, because the finalizer closes the descriptor once the reader is
+// unreachable, and holding only the returned *os.File does not keep the reader alive.
 func (r *ReaderAt) File() *os.File {
 	return r.file
 }

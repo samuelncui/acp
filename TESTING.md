@@ -267,11 +267,13 @@ GOOS=windows GOARCH=amd64 go test -c -o /tmp/acp-windows.test .
 ```
 
 `make check` builds for Windows but vets only the host platform. `GOOS=windows GOARCH=amd64 go
-vet ./...` reports `possible misuse of unsafe.Pointer` in `mmap/mmap_windows.go`, on the
-`unsafe.Slice` call that turns the address `syscall.MapViewOfFile` returned into the mapped slice.
-That conversion is the supported way to read a mapped address, vet's `unsafeptr` check cannot know
-that a syscall result is a valid pointer, and the only formulation it accepts is the deprecated
-`reflect.SliceHeader` pattern, so the diagnostic is accepted instead of worked around.
+vet ./...` reports the conversion that turns the address `syscall.MapViewOfFile` returned into the
+mapped slice, and it flags that conversion in every formulation this package would use: the
+`unsafe.Slice` call in `mmap/mmap_windows.go`, a typed pointer kept in a variable, an array cast,
+and a `reflect.SliceHeader` literal, which gets its own `possible misuse of reflect.SliceHeader`
+message. The one shape vet accepts is the deprecated `(*reflect.SliceHeader)(unsafe.Pointer(&data))`
+field assignment, which trades a false positive for a less safe conversion, so the diagnostic is
+accepted rather than worked around.
 
 ## Change checklist
 
