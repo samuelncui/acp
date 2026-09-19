@@ -82,8 +82,10 @@ entry point is `NewStream` with `Submit`/`Close`/`Wait`; `Run` and `BatchSource`
   read-only device, and a disk-usage refresh keeps the reservations of copies still in flight.
 - A file system without the managed signature attribute stores no cache at all, which is a
   no-op rather than a recorded failure.
-- `mmap` returns `io.EOF` at the end of the content, releases a mapping whose `madvise` failed,
-  closes idempotently on every platform, validates a slice range before allocating it, and retains
+- `mmap` returns `io.EOF` at the end of the content, reports an open mapping of an empty file as
+  empty rather than closed, releases a mapping whose `madvise` failed, issues the Linux sequential
+  hint and prefetch as one call each (an madvise advice is a value, not a flag bit), closes
+  idempotently on every platform, validates a slice range before allocating it, and retains
   the descriptor it opened: `Close` removes the mapping and then closes that descriptor.
 - One source descriptor serves a whole item. The stored hash is read through the descriptor that
   reads the content, and the computed hash is published through it, synchronously, after the hash

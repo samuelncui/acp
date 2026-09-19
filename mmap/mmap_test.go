@@ -94,6 +94,41 @@ func TestReaderAtContract(t *testing.T) {
 	}
 }
 
+// TestOpenEmptyMappingIsNotEmpty pins the empty mapping against the closed-reader sentinel: an open
+// reader over a zero-length file is empty, not closed, so it behaves like an empty *os.File or
+// bytes.Reader. Reporting it as closed breaks every io.ReaderAt consumer that probes an empty
+// source, such as archive/zip.
+func TestOpenEmptyMappingIsNotClosed(t *testing.T) {
+	reader, err := Open(writeFixture(t, "empty-open.bin", nil))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if reader.Len() != 0 {
+		t.Fatalf("Len() = %d, want 0", reader.Len())
+	}
+
+	if n, err := reader.ReadAt(make([]byte, 4), 0); n != 0 || err != io.EOF {
+		t.Fatalf("ReadAt(4, 0) = (%d, %v), want (0, %v)", n, err, io.EOF)
+	}
+	if n, err := reader.ReadAt(nil, 0); n != 0 || err != nil {
+		t.Fatalf("ReadAt(nil, 0) = (%d, %v), want (0, nil)", n, err)
+	}
+	if window, err := reader.Slice(0, 4); err != nil || len(window) != 0 {
+		t.Fatalf("Slice(0, 4) = (%d bytes, %v), want an empty window", len(window), err)
+	}
+
+	// Only a closed reader reports itself as closed.
+	if err := reader.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := reader.ReadAt(make([]byte, 1), 0); err == nil || errors.Is(err, io.EOF) {
+		t.Fatalf("ReadAt after Close = %v, want a closed-reader error", err)
+	}
+	if _, err := reader.Slice(0, 1); err == nil || errors.Is(err, io.EOF) {
+		t.Fatalf("Slice after Close = %v, want a closed-reader error", err)
+	}
+}
+
 // TestOpenEmptyFile pins the empty mapping: it has no content, it closes cleanly, and a reader
 // over it reports the end of the content instead of a broken reader.
 func TestOpenEmptyFile(t *testing.T) {

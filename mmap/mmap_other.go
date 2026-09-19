@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 )
 
 // ReaderAt reads a memory-mapped file.
@@ -24,8 +25,8 @@ type ReaderAt struct {
 }
 
 // Close closes the reader. It is idempotent: a reader that is already closed reports success,
-// because the file it owned is already gone. A closed reader reports an empty mapping, exactly
-// like the mapping-backed platforms, so a reader that reads after Close sees io.EOF.
+// because the file it owned is already gone. A closed reader reports an empty mapping on every
+// platform, so Len() is zero and a stream over it ends with io.EOF instead of erroring.
 func (r *ReaderAt) Close() error {
 	if r.file == nil {
 		return nil
@@ -114,8 +115,13 @@ func Open(filename string) (*ReaderAt, error) {
 		return nil, fmt.Errorf("mmap: file %q is too large", filename)
 	}
 
-	return &ReaderAt{
+	r := &ReaderAt{
 		file: f,
 		len:  int(fi.Size()),
-	}, nil
+	}
+
+	// A reader that is abandoned without Close releases its descriptor on collection, exactly like
+	// the mapping-backed platforms, so this fallback cannot leak one either.
+	runtime.SetFinalizer(r, (*ReaderAt).Close)
+	return r, nil
 }

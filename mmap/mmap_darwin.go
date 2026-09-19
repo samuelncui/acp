@@ -128,8 +128,9 @@ func Open(filename string) (*ReaderAt, error) {
 		return nil, fmt.Errorf("mmap: file %q is too large", filename)
 	}
 
-	// An empty file has no mapping, but it still has the descriptor this reader owns.
-	var data []byte
+	// An empty file has no mapping, but it still has the descriptor this reader owns. The mapping
+	// of a zero-length file is an empty, non-nil slice, so only a closed reader reports a nil one.
+	data := make([]byte, 0)
 	if size != 0 {
 		data, err = syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
 		if err != nil {

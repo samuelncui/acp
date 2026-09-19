@@ -21,6 +21,19 @@ const (
 	prefetchMaxSize = 16 * 1024 * 1024
 )
 
+// linuxPrefetchAdvice is the advice a file that fits the prefetch window receives. An madvise call
+// takes exactly one advice: these are values, not flag bits, so `MADV_SEQUENTIAL|MADV_WILLNEED` is
+// simply `MADV_WILLNEED` and the sequential hint would be dropped. The read is sequential and the
+// whole mapping should be faulted in up front, so both are issued, one per call.
+var linuxPrefetchAdvice = []int{syscall.MADV_SEQUENTIAL, syscall.MADV_WILLNEED}
+
+// madvise and munmap are indirected so a test can drive the prefetch failure path, which otherwise
+// needs syscall injection.
+var (
+	madvise = syscall.Madvise
+	munmap  = syscall.Munmap
+)
+
 // debug is whether to print debugging messages for manual testing.
 //
 // The runtime.SetFinalizer documentation says that, "The finalizer for x is
@@ -132,8 +145,9 @@ func Open(filename string) (*ReaderAt, error) {
 		return nil, fmt.Errorf("mmap: file %q is too large", filename)
 	}
 
-	// An empty file has no mapping, but it still has the descriptor this reader owns.
-	var data []byte
+	// An empty file has no mapping, but it still has the descriptor this reader owns. The mapping
+	// of a zero-length file is an empty, non-nil slice, so only a closed reader reports a nil one.
+	data := make([]byte, 0)
 	if size != 0 {
 		data, err = syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
 		if err != nil {
@@ -141,12 +155,14 @@ func Open(filename string) (*ReaderAt, error) {
 			return nil, fmt.Errorf("create mmap fail, %q, %w", filename, err)
 		}
 		if size <= prefetchMaxSize {
-			if err := syscall.Madvise(data, syscall.MADV_SEQUENTIAL|syscall.MADV_WILLNEED); err != nil {
-				// The mapping is not reachable through a ReaderAt yet, so nothing else can release
-				// it: the error path owns the unmapping and the descriptor.
-				_ = syscall.Munmap(data)
-				_ = f.Close()
-				return nil, fmt.Errorf("madvise fail, %q, %w", filename, err)
+			for _, advice := range linuxPrefetchAdvice {
+				if err := madvise(data, advice); err != nil {
+					// The mapping is not reachable through a ReaderAt yet, so nothing else can
+					// release it: the error path owns the unmapping and the descriptor.
+					_ = munmap(data)
+					_ = f.Close()
+					return nil, fmt.Errorf("madvise fail, %q, %w", filename, err)
+				}
 			}
 		}
 	}

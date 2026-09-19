@@ -288,7 +288,7 @@ preallocated, what metadata can be restored, and how a mapped read is implemente
 
 | Platform | Source access time | Managed signature attribute | Target preallocation | Metadata restore | Mapped read |
 | --- | --- | --- | --- | --- | --- |
-| Linux | suppressed: a buffered source opens with `O_NOATIME`, falling back to an ordinary open when the flag is refused | `user.acp.signature`, in the `user.` namespace | `fallocate` reserves the whole target size | xattrs, mode, owner as root, times | `syscall.Mmap`, plus `MADV_SEQUENTIAL\|MADV_WILLNEED` for files up to 16 MiB |
+| Linux | suppressed: a buffered source opens with `O_NOATIME`, falling back to an ordinary open when the flag is refused | `user.acp.signature`, in the `user.` namespace | `fallocate` reserves the whole target size | xattrs, mode, owner as root, times | `syscall.Mmap`, plus `MADV_SEQUENTIAL` and `MADV_WILLNEED` (one advice per call) for files up to 16 MiB |
 | Darwin | not suppressed | `acp.signature` | `Truncate` | xattrs, mode, owner as root, times | `syscall.Mmap` |
 | FreeBSD | not suppressed | `acp.signature`, in the user extended-attribute namespace | `Truncate` | mode and times only | no mapping: the descriptor is read with `ReadAt` |
 | Windows | not suppressed | none: the cache is a silent no-op | `Truncate` | mode and times only | `CreateFileMapping` plus `MapViewOfFile` |
@@ -399,7 +399,8 @@ document keep their shape, and the shell fills one terminal row per item.
 ## Divergence from upstream `mmap`
 
 This module started from the Go project's `mmap` package and is maintained here now: reads run
-through the descriptor ACP owns, `Close` is idempotent and removes the mapping before it closes
+through the descriptor ACP owns, the end of the content is `io.EOF` and an open mapping of an empty
+file is empty rather than closed, `Close` is idempotent and removes the mapping before it closes
 that descriptor, a slice range is validated before anything is allocated, and a platform without
 a mapping reads through the descriptor instead. Upstream changes are not merged automatically.
 
