@@ -903,13 +903,21 @@ func TestRunReportsEveryAcceptedItemExactlyOnce(t *testing.T) {
 				t.Fatalf("Submit() error = %v, want the batch in hand accepted", err)
 			}
 			_ = stream.Close()
-			if err := stream.Wait(); !errors.Is(err, context.Canceled) {
-				t.Fatalf("Wait() error = %v, want %v", err, context.Canceled)
+			// A stop the run observed is the run's error, while a pipeline that drained before
+			// the callback cancelled reports success, exactly as
+			// TestRunDoesNotReportAStopAfterACompleteRun pins. Which of the two happens depends
+			// on how far the pipeline got, so only the stopping reason is asserted here.
+			if err := stream.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+				t.Fatalf("Wait() error = %v, want nil or %v", err, context.Canceled)
 			}
 
-			// Every accepted item owns exactly one outcome, and a stop abandons the rest with
-			// the stopping error instead of dropping them.
-			completed, abandoned := 0, 0
+			// The stop must not break the accounting: every accepted item owns exactly one
+			// terminal outcome, none of them is duplicated, and an item the stop reached is
+			// reported with the stopping reason instead of a completion. How many items are
+			// abandoned depends on how far the pipeline got before the callback cancelled, so
+			// the test asserts the accounting rather than a count: a fast run may finish every
+			// item it accepted.
+			completed := 0
 			for _, item := range fixtures {
 				if got := item.callbackCount(); got != 1 {
 					t.Fatalf("item %q received %d outcomes, want 1", item.source, got)
@@ -919,19 +927,22 @@ func TestRunReportsEveryAcceptedItemExactlyOnce(t *testing.T) {
 					if !errors.Is(itemErr, context.Canceled) {
 						t.Fatalf("abandoned item %q error = %v, want %v", item.source, itemErr, context.Canceled)
 					}
-					abandoned++
 					continue
 				}
 				if len(result.Targets) != 1 || result.Targets[0].Err != nil {
 					t.Fatalf("completed item %q targets = %v", item.source, result.Targets)
 				}
+				if _, err := os.Stat(result.Targets[0].Path); err != nil {
+					t.Fatalf("completed item %q target %q: %v", item.source, result.Targets[0].Path, err)
+				}
 				completed++
 			}
+
+			// The delivery that cancelled the run carries the first result the pipeline produced,
+			// and a result produced before the stop cannot carry the stopping reason, so the run
+			// always completes at least the item whose delivery stopped it.
 			if completed == 0 {
-				t.Fatal("no item finished after the stop")
-			}
-			if abandoned == 0 {
-				t.Fatal("no item was abandoned after the stop")
+				t.Fatal("no item finished before the stop")
 			}
 		})
 	}
