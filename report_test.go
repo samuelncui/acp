@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path"
 	"strings"
 	"testing"
 	"time"
@@ -226,6 +227,31 @@ func TestReportToJSONStringIndentUsesSpaces(t *testing.T) {
 	}
 	if len(decoded.Jobs) != 1 || decoded.Jobs[0].FailTargets["/target/a.txt"] == nil {
 		t.Fatalf("decoded report = %#v", decoded)
+	}
+}
+
+// TestReportGetterOrdersRowsByTheJoinedRelativePath pins the report document's row order: a row is
+// keyed by the joined relative path, and the getter emits the rows in that key's order, so the same
+// items always render the same document instead of following the map's iteration order.
+func TestReportGetterOrdersRowsByTheJoinedRelativePath(t *testing.T) {
+	handler, getter := NewReportGetter()
+
+	for _, segments := range [][]string{{"z.txt"}, {"nested", "b.txt"}, {"a.txt"}, {"nested", "a.txt"}} {
+		handler(&EventUpdateJob{Job: &Job{Base: "/source", Path: segments}})
+	}
+
+	want := []string{"a.txt", "nested/a.txt", "nested/b.txt", "z.txt"}
+	// A map has no order, so a single render could match by chance.
+	for attempt := 0; attempt < 8; attempt++ {
+		report := getter()
+		if len(report.Jobs) != len(want) {
+			t.Fatalf("rows = %d, want %d", len(report.Jobs), len(want))
+		}
+		for index, key := range want {
+			if got := path.Join(report.Jobs[index].Path...); got != key {
+				t.Fatalf("row %d = %q, want %q (attempt %d)", index, got, key, attempt)
+			}
+		}
 	}
 }
 

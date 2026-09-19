@@ -466,14 +466,17 @@ acp -from-linear -to-linear example target/
 
 ## Report
 
-`-report` writes one `files` row per item plus a top-level `errors` array. Per-item and
-per-target failures stay inside the row's `fail_target` map, keyed by the target path, or by
-the empty key when ACP could not process the item itself: an unreadable source, an item
-abandoned by a stop, or a targetless item whose content read failed. The empty key is the one
-slot no requested target can occupy, so every item-level failure has the same shape, and a
-failed item still gets a terminal row. The top-level `errors` array carries pipeline problems
-only, so a single failure is recorded once. A row names its source the `af05f05c` way: `base`
-plus the source-relative `path` array, with `full_path` as the additive whole path.
+`-report` writes one `files` row per item plus, when the run recorded a pipeline problem, a
+top-level `errors` array; an empty `files` or `errors` array is omitted, so a run with no items and
+no problems writes `{}`. Rows are ordered by the joined relative path that keys them, so the same
+items always write the same document. Per-item and per-target failures stay inside the row's
+`fail_target` map, keyed by the target path, or by the empty key when ACP could not process the item
+itself: an unreadable source, an item abandoned by a stop, or a targetless item whose content read
+failed. The empty key is the one slot no requested target can occupy, so every item-level failure
+has the same shape, and a failed item still gets a terminal row. The top-level `errors` array
+carries pipeline problems only, so a single failure is recorded once. A row names its source the
+`af05f05c` way: `base` plus the source-relative `path` array, with `full_path` as the additive whole
+path.
 
 `-report-indent` writes the same document with a two-space indent (`cmd/acp-rewrite` indents its
 accumulated report with a tab). The report is plain JSON:

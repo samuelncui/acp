@@ -68,8 +68,9 @@ entry point is `NewStream` with `Submit`/`Close`/`Wait`; `Run` and `BatchSource`
 - A report row keeps the `af05f05c` shape: `Base` is the directory the source-relative `Path`
   segments are resolved against, so the JSON carries `path` as an array. `FullPath` and
   `SignatureCacheHit` are additive fields, `NewReportGetter` keys a row by the joined relative
-  path, and the push engine owns no report row at all — the shell fills the row from its own
-  compatibility item, which carries the base and the segments its walk knows.
+  path and emits the rows in that key's order, and the push engine owns no report row at all — the
+  shell fills the row from its own compatibility item, which carries the base and the segments its
+  walk knows.
 - The shell publishes one terminal report row per item, so a failed item still has a row, with
   the item-level failure under the empty target key.
 - `cmd/acp` uses the shell and exits non-zero when any item, target or pipeline failure
