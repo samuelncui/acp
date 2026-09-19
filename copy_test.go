@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"hash"
 	"io"
 	"math"
 	"os"
@@ -535,6 +536,50 @@ func TestWriteReportsTheFactsItReadWhenTheSourceChanged(t *testing.T) {
 			t.Fatalf("targets = %#v, want none", result.Targets)
 		}
 	})
+}
+
+// panickingHash panics on its first write, which is how a broken hash implementation dies inside
+// the pipeline.
+type panickingHash struct{ hash.Hash }
+
+var errPanickingHash = errors.New("hash fixture panicked")
+
+func (panickingHash) Write([]byte) (int, error) {
+	panic(errPanickingHash)
+}
+
+// TestRunReleasesTheCacheGateWhenTheHashPanics pins the fatal-panic guarantee for the cache gate.
+// The gate is released by a deferred close, so a hash consumer that dies cannot leave a target
+// writer blocked on it: a close at the end of the goroutine's body is skipped by the panic, and the
+// writer, the copy stage and therefore Close and Wait stay parked forever even though the panic was
+// already recovered and recorded as the run error.
+func TestRunReleasesTheCacheGateWhenTheHashPanics(t *testing.T) {
+	captureLogs(t)
+	requireSignatureXattrSupport(t)
+
+	root := t.TempDir()
+	content := bytes.Repeat([]byte{'c'}, 4096)
+	input := writeSourceFile(t, root, "source.txt", content)
+	target := filepath.Join(root, "target.txt")
+
+	previous := sha256Pool
+	sha256Pool = &sync.Pool{New: func() interface{} { return panickingHash{Hash: sha256.New()} }}
+	t.Cleanup(func() { sha256Pool = previous })
+
+	item := newFixtureItem(input, target)
+	done := make(chan error, 1)
+	go func() {
+		done <- runFixture(context.Background(), newStreamFixture(item), []Item{item}, WithHashPolicy(HashReadRefresh))
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, errPanickingHash) {
+			t.Fatalf("run error = %v, want the recovered panic %v", err, errPanickingHash)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run never returned: the hash consumer panicked and a target writer is still blocked on the cache gate")
+	}
 }
 
 func TestLinearTargetStopsWhenDiskUsageEstimateIsInsufficient(t *testing.T) {

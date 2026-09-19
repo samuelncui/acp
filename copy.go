@@ -358,6 +358,13 @@ func (c *StreamCopyer) write(ctx context.Context, job *writeJob, ch chan<- *base
 			defer wg.Done()
 			defer sha256Pool.Put(sha)
 
+			// The hash is complete, so the target writers may publish their cache entries. The
+			// release is deferred: a panic in the hasher must not leave a writer blocked on the
+			// gate, because Wait and Close would then never return after a recovered panic.
+			if cacheGate != nil {
+				defer close(cacheGate)
+			}
+
 			for chunk := range ch {
 				sha.Write(chunk.data)
 				chunk.release()
@@ -368,11 +375,6 @@ func (c *StreamCopyer) write(ctx context.Context, job *writeJob, ch chan<- *base
 				job.setHash(nil)
 			} else {
 				job.setHash(sha.Sum(nil))
-			}
-
-			// The hash is complete, so the target writers may publish their cache entries.
-			if cacheGate != nil {
-				close(cacheGate)
 			}
 		})
 	}

@@ -145,10 +145,11 @@ across a refresh:
 go test -run '^(TestMappingErrorIdentities|TestDiskUsageRefreshKeepsInflightReservations|TestDiskUsageAccountsLandedBytes)$' .
 ```
 
-Run the fatal-panic safety net test:
+Run the fatal-panic safety net tests, which pin that a panicking worker becomes the run error and
+that a panicking hash consumer still releases the cache gate the target writers wait on:
 
 ```sh
-go test -run '^TestWrapRecordsAFatalPanic$' .
+go test -run '^(TestWrapRecordsAFatalPanic|TestRunReleasesTheCacheGateWhenTheHashPanics)$' .
 ```
 
 Run the shell's file selection and enumeration tests, which pin the relative-path mapping, the
