@@ -17,8 +17,9 @@ type Item interface {
 	// Source returns the exact path to read.
 	Source() string
 
-	// Targets returns the destinations of a copy. An empty slice hashes the source without
-	// writing it anywhere.
+	// Targets returns the destinations of a copy. An empty slice writes nothing: the source is
+	// read and hashed only when the hash policy produces a hash, so the default HashOff reports
+	// neither a copy nor a hash.
 	Targets() []string
 }
 
@@ -33,7 +34,8 @@ type SimpleJob struct {
 // Source returns the path to read.
 func (j *SimpleJob) Source() string { return j.Path }
 
-// Targets returns the destinations; an empty slice hashes without writing.
+// Targets returns the destinations; an empty slice reads without writing, and it produces a
+// hash only when the run's hash policy does.
 func (j *SimpleJob) Targets() []string { return j.Dsts }
 
 // Result reports the content facts of one finished item, one outcome per requested target, and

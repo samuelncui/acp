@@ -196,14 +196,17 @@ deadlocks. It uses its own failing writer, so it runs on every platform:
 go test -race -run '^TestWriteFailureDrainsBuffersAndTargets$' .
 ```
 
-On Linux, add the `/dev/full` end-to-end paths, which exercise an actual `ENOSPC` write failure
-and its mapping onto `ErrTargetNoSpace`:
+On Linux, run the whole Linux-only file: it pins an `ENOSPC` write failure and its mapping onto
+`ErrTargetNoSpace`, a refusing device that drains its queued buffers, and the pre-allocation
+failure of a filled volume (that one mounts a small tmpfs and skips when the host refuses).
 
 ```sh
-go test -race -run '^(TestRunMapsDeviceFullToTargetNoSpace|TestDeviceFullWriteFailureDrainsQueuedBuffers)$' .
+go test -race -run '^(TestRunMapsDeviceFullToTargetNoSpace|TestDeviceFullWriteFailureDrainsQueuedBuffers|TestFullVolumePreallocationReportsNoSpace)$' .
 ```
 
-These two select no test on another platform: the file that defines them is Linux-only.
+These three select no test on another platform: the file that defines them is Linux-only. Note
+that `/dev/full` refuses `fallocate` with `ENODEV`, so the non-linear pre-allocation there reports
+`ErrTargetIO`; the `ErrTargetNoSpace` identity for that path comes from the filled-volume test.
 
 Run hash policy tests, which pin the reuse, read, and refresh matrix, and the no-op policy of
 a file system without the managed signature attribute:

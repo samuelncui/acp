@@ -17,7 +17,7 @@ and `AGENTS.md` describes what it is for.
 
 ## Platform verification still owed
 
-Linux-specific runtime paths (`/dev/full` ENOSPC, `O_NOATIME` and its permission fallback) are
-verified on the isolated Linux acceptance host; Windows and FreeBSD stay compile-verified only
-until a runtime is available (`mmap_other.go`, `signature_xattr_freebsd.go`, Windows path
-ordering).
+Linux-specific runtime paths run on the isolated Linux acceptance host (`go test` for the
+Linux-only file, including the `/dev/full` and filled-tmpfs `ENOSPC` cases, `O_NOATIME` and its
+permission fallback, `fallocate`, `madvise`). Windows and FreeBSD stay compile-verified only until
+a runtime is available (`mmap_other.go`, `signature_xattr_freebsd.go`, Windows path ordering).

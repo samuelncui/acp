@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -397,5 +398,70 @@ func TestACPCommandExitsNonZeroWhenACopyFails(t *testing.T) {
 	}
 	if string(content) != "existing" {
 		t.Fatalf("refused target content = %q, want %q", content, "existing")
+	}
+}
+
+// TestACPCommandRendersTheProgressBar pins the command's default progress bar: the bar and the
+// report collector are two event handlers, and a run keeps one, so the command composes them.
+// A run that only collects the report prints the bar's construction frame and nothing else.
+func TestACPCommandRendersTheProgressBar(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get working directory: %v", err)
+	}
+	tempDir := t.TempDir()
+	binary := filepath.Join(tempDir, "acp")
+	if runtime.GOOS == "windows" {
+		binary += ".exe"
+	}
+
+	build := exec.CommandContext(ctx, "go", "build", "-o", binary, "./cmd/acp")
+	build.Dir = repoRoot
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build the command: %v\n%s", err, output)
+	}
+
+	source := filepath.Join(tempDir, "source")
+	target := filepath.Join(tempDir, "target")
+	if err := os.MkdirAll(source, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A few megabytes keep the run long enough to produce progress frames as well as the final
+	// one, and every frame is written to stderr.
+	for index := 0; index < 4; index++ {
+		name := fmt.Sprintf("part-%d.bin", index)
+		if err := os.WriteFile(filepath.Join(source, name), bytes.Repeat([]byte{byte(index)}, 2<<20), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	command := exec.CommandContext(ctx, binary, "-report", filepath.Join(tempDir, "report.json"), source, target)
+	command.Dir = repoRoot
+	var stdout, stderr bytes.Buffer
+	command.Stdout, command.Stderr = &stdout, &stderr
+	if err := command.Run(); err != nil {
+		t.Fatalf("run the command: %v\nstdout:\n%s\nstderr:\n%s", err, stdout.String(), stderr.String())
+	}
+
+	// A bar that receives nothing prints its construction frame alone, which reads
+	// "[0/0] indexing... 0% ... ( 0/ 1 B)". The run's own frames carry the indexed item count and
+	// the byte totals, so both markers must appear. Later frames may be cleared once the bar is
+	// full, which is why this asserts on content rather than on the last line.
+	rendered := stderr.String()
+	if !strings.Contains(rendered, "[0/4] indexing...") {
+		t.Fatalf("the progress bar never received the indexed totals, stderr:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "MB") {
+		t.Fatalf("the progress bar never received a progress event, stderr:\n%s", rendered)
 	}
 }

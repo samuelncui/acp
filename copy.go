@@ -242,9 +242,17 @@ func (c *StreamCopyer) write(ctx context.Context, job *writeJob, ch chan<- *base
 		}
 		c.invalidateSignature(file, target)
 		if !job.copyer.toDevice.linear && job.size > 0 {
-			if err := truncate(file, job.size); err != nil {
+			// Pre-allocation fails like any other target I/O: it must keep its error identity
+			// (an exhausted device is ErrTargetNoSpace), abort the device when the identity
+			// says so, and end a linear target, exactly like the paths above and below.
+			if err := mappingError(truncate(file, job.size)); err != nil {
 				_ = file.Close()
 				_ = os.Remove(target)
+				if checkErrorAbort(err) {
+					noSpaceDevices.Add(dev)
+				}
+				c.endLinearTarget(err)
+
 				job.fail(target, fmt.Errorf("truncate dst file fail, %w", err))
 				continue
 			}

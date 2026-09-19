@@ -202,7 +202,8 @@ empty mapping immediately. Either way one descriptor serves the whole item.
 ## Events
 
 `WithEventHandler` receives the run's `Event` values; `WithProgressBar()` is one handler built
-from them. The whole set is:
+from them, and because a run keeps one handler, a command that wants a bar *and* its own
+collector composes them (which is what `cmd/acp` does). The whole set is:
 
 | Event | What it reports |
 | --- | --- |

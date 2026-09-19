@@ -79,10 +79,6 @@ func main() {
 	opts = append(opts, acp.WithHash(*reportPath != ""))
 	opts = append(opts, acp.Overwrite(!*notOverwrite))
 
-	if *withProgressBar {
-		opts = append(opts, acp.WithProgressBar())
-	}
-
 	if *fromLinear {
 		opts = append(opts, acp.SetFromDevice(acp.LinearDevice(true)))
 	}
@@ -90,7 +86,20 @@ func main() {
 		opts = append(opts, acp.SetToDevice(acp.LinearDevice(true)))
 	}
 
-	opts = append(opts, acp.WithEventHandler(report.handleEvent))
+	// ACP keeps one event handler per run: a later WithEventHandler replaces the earlier one, so
+	// the progress bar and the report collector are composed here instead of registered apart.
+	// Without this the bar would silently receive nothing, because the report registration comes
+	// last and wins.
+	handler := acp.EventHandler(report.handleEvent)
+	if *withProgressBar {
+		bar := acp.NewProgressBar()
+		collect := handler
+		handler = func(event acp.Event) {
+			bar(event)
+			collect(event)
+		}
+	}
+	opts = append(opts, acp.WithEventHandler(handler))
 
 	copyer, err := acp.New(ctx, opts...)
 	if err != nil {
