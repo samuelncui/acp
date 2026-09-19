@@ -268,13 +268,17 @@ entry is published through the descriptor that wrote it, while that descriptor i
 one path-based step runs before a target has a descriptor at all: an overwrite drops the target's
 stale entry before the file is truncated, so a crash cannot leave the old entry describing the new
 bytes.
-Writers publish the hashed version's size and mtime unchanged, so an entry whose file changed
-after hashing simply fails the reader's metadata comparison and is treated as stale. Missing,
-stale, corrupt, read-only, full, or unsupported xattrs are summarized as warnings and never
-become copy errors. A file system without the managed attribute namespace stores no cache at
-all, which is a no-op: reading it is a miss and writing or removing it records no failure.
-ACP's managed key is not copied as an ordinary source xattr. The run reports its aggregate
-summary as `EventSignatureCacheSummary`.
+Writers publish an entry only for the version whose bytes produced the hash, and they state that
+version's size and mtime. The evidence is the descriptor the item still owns: a source keeps its
+own metadata, so it must still show the facts the item observed, and a source that cannot be shown
+to be that version publishes nothing instead of binding its hash to metadata the run never saw. A
+target receives the item's metadata after the entry is published, so its length is what the
+descriptor has to show. An entry whose file changes after it was written fails the reader's
+metadata comparison and is treated as stale. Missing, stale, corrupt, read-only, full, or
+unsupported xattrs are summarized as warnings and never become copy errors. A file system without
+the managed attribute namespace stores no cache at all, which is a no-op: reading it is a miss and
+writing or removing it records no failure. ACP's managed key is not copied as an ordinary source
+xattr. The run reports its aggregate summary as `EventSignatureCacheSummary`.
 
 ## Platform behaviour
 

@@ -264,6 +264,102 @@ func TestRunRefreshWritesOnlyWhenStoredHashDiffers(t *testing.T) {
 	}
 }
 
+// TestRunPublishesNoEntryWhenTheSourceChangedAfterIndexing pins the facts a refreshed entry may
+// state. An entry's size and modification time are what a later lookup compares, so publishing one
+// for a version the run cannot show it hashed makes that lookup answer for bytes it never read. The
+// previous revision bound the bytes it read to the modification time it indexed, so restoring the
+// first version with its original metadata produced a cache hit reporting the second version's
+// hash.
+func TestRunPublishesNoEntryWhenTheSourceChangedAfterIndexing(t *testing.T) {
+	requireSignatureXattrSupport(t)
+
+	v1 := []byte("AAAAAAAAAAAAAAAA")
+	v2 := []byte("BBBBBBBBBBBBBBBB")
+	root := t.TempDir()
+	input := writeSourceFile(t, root, "source.txt", v1)
+
+	indexed := time.Unix(1000, 0)
+	replaced := time.Unix(2000, 0)
+	if err := os.Chtimes(input, indexed, indexed); err != nil {
+		t.Fatal(err)
+	}
+
+	// Indexing stats the path when the item is submitted, and the item opens its one descriptor
+	// during preparation, so this replacement lands after indexing and before the read.
+	previous := openSourceContent
+	openSourceContent = func(name string, mode ReadMode) (itemSource, error) {
+		source, err := previous(name, mode)
+		if err == nil && name == input {
+			if err := os.WriteFile(input, v2, 0o644); err != nil {
+				t.Errorf("replace the source: %v", err)
+			}
+			if err := os.Chtimes(input, replaced, replaced); err != nil {
+				t.Errorf("restamp the source: %v", err)
+			}
+		}
+		return source, err
+	}
+	t.Cleanup(func() { openSourceContent = previous })
+
+	item := newFixtureItem(input)
+	if err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, WithHashPolicy(HashReadRefresh)); err != nil {
+		t.Fatalf("run error = %v", err)
+	}
+	openSourceContent = previous
+
+	result, err := item.terminal(t)
+	if err != nil {
+		t.Fatalf("item failed: %v", err)
+	}
+	// The item still reports the bytes it read: a source that changed while a run is in progress
+	// is out of scope, and the run never fails the item for it.
+	want := sha256.Sum256(v2)
+	if !bytes.Equal(result.SHA256, want[:]) {
+		t.Fatalf("result SHA256 = %x, want the bytes it read %x", result.SHA256, want)
+	}
+	if stored, valid := readStoredSignature(t, input); valid {
+		t.Fatalf("published %#v for a source whose metadata moved after indexing", stored)
+	}
+
+	// A restore puts the first version back with its original metadata. That is exactly the version
+	// the poisoned entry used to describe, so it has to read as a miss instead.
+	if err := os.WriteFile(input, v1, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(input, indexed, indexed); err != nil {
+		t.Fatal(err)
+	}
+	restored := sha256.Sum256(v1)
+	reuse := newFixtureItem(input)
+	if err := runFixture(context.Background(), newStreamFixture(reuse), []Item{reuse}, WithHashPolicy(HashCachedOrRead)); err != nil {
+		t.Fatal(err)
+	}
+	reused, err := reuse.terminal(t)
+	if err != nil {
+		t.Fatalf("restored item failed: %v", err)
+	}
+	if reused.SignatureCacheHit || !bytes.Equal(reused.SHA256, restored[:]) {
+		t.Fatalf("restored item = hit=%t sha256=%x, want a read of the restored content %x", reused.SignatureCacheHit, reused.SHA256, restored)
+	}
+
+	// A consistent item still publishes, and the entry states the facts of the file it read.
+	item = newFixtureItem(input)
+	if err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, WithHashPolicy(HashReadRefresh)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := item.terminal(t); err != nil {
+		t.Fatalf("consistent item failed: %v", err)
+	}
+	info, err := os.Stat(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, valid := readStoredSignature(t, input)
+	if !valid || stored.Size != info.Size() || stored.MtimeNS != info.ModTime().UnixNano() || stored.SHA256 != restored {
+		t.Fatalf("consistent run stored %#v, valid=%t, want the facts of the file it read", stored, valid)
+	}
+}
+
 func TestRunTransferAlwaysReadsAndRefreshesTargets(t *testing.T) {
 	// Prepare an existing target so the transfer exercises overwrite invalidation.
 	content := []byte("transfer fixture")

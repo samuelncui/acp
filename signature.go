@@ -160,7 +160,9 @@ func readCachedSignatureFile(file *os.File) (CachedSignature, signatureReadStatu
 
 // signatureCache is the aggregate accounting of one run's cache activity. It owns no writer and
 // no queue: an item reads its stored hash and publishes its computed one through the descriptor it
-// already owns, so a cache operation never reopens a path and never outlives its item.
+// already owns, so a cache operation never reopens a path and never outlives its item. Dropping a
+// target's stale entry before that target is truncated is the one path-based cache step, and it
+// happens before the target has a descriptor at all.
 type signatureCache struct {
 	lock    sync.Mutex
 	summary SignatureCacheSummary
@@ -240,7 +242,22 @@ func (c *StreamCopyer) invalidateSignaturePath(path string) {
 // descriptor that owns one of that item's files. It publishes nothing when the item has no hash it
 // computed itself or the policy does not refresh the cache, and a nil descriptor is an item that
 // never opened the file it names rather than a failure.
-func (c *StreamCopyer) refreshCacheEntry(file *os.File, path string, job *baseJob) {
+//
+// An entry states the size and modification time a later lookup compares, so it may only be
+// published for the exact file version whose bytes produced the hash: an entry that binds that hash
+// to other facts makes a later run report a hash for content it never read. The descriptor the item
+// still owns is the evidence, and which evidence it can give depends on which of the item's files
+// it is:
+//
+//   - The source descriptor must still show the size the item read and the modification time it
+//     indexed. The run never wrote that file, so a source whose metadata moved after indexing cannot
+//     be shown to be the version the run hashed, and it publishes nothing instead of a guess.
+//   - A target descriptor is a file this run wrote with exactly the bytes that were hashed, and the
+//     run stamps the item's metadata onto it after this publication, so its length is the evidence
+//     available here.
+//
+// Every check runs through that descriptor, so a cache operation never reopens a path.
+func (c *StreamCopyer) refreshCacheEntry(file *os.File, path string, job *baseJob, target bool) {
 	if file == nil || c.signatures == nil || !c.hashPolicy.refreshesCache() {
 		return
 	}
@@ -252,6 +269,15 @@ func (c *StreamCopyer) refreshCacheEntry(file *os.File, path string, job *baseJo
 	signature, err := newCachedSignature(hash, job.stat)
 	if err != nil {
 		c.signatures.recordFailure(path, err)
+		return
+	}
+
+	info, err := file.Stat()
+	if err != nil {
+		c.signatures.recordFailure(path, fmt.Errorf("stat signature target failed, %w", err))
+		return
+	}
+	if info.Size() != signature.Size || (!target && info.ModTime().UnixNano() != signature.MtimeNS) {
 		return
 	}
 

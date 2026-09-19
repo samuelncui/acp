@@ -88,7 +88,12 @@ entry point is `NewStream` with `Submit`/`Close`/`Wait`; `Run` and `BatchSource`
   reads the content, and the computed hash is published through it, synchronously, after the hash
   is complete and before the descriptor closes. A target publishes its entry through the
   descriptor the writer wrote it with, while that descriptor is still open; no cache operation
-  reopens a path, and no cache write outlives its item.
+  reopens a path and no cache write outlives its item, except for dropping a stale target entry by
+  path before that target is truncated, which happens before the target has a descriptor at all.
+- A cache entry is published only for the file version whose bytes produced the hash: its size and
+  mtime are what a later lookup compares, so a source that cannot be shown, through the descriptor
+  the item still owns, to hold the facts that version had publishes nothing instead of binding the
+  computed hash to metadata it never saw.
 - Repeated value options are last-wins (`WithEventHandler` included), and the shell rejects a repeated
   relative path instead of copying one target twice.
 

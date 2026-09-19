@@ -132,8 +132,10 @@ func (c *StreamCopyer) write(ctx context.Context, job *writeJob, ch chan<- *base
 		wg.Wait()
 
 		// The item publishes its source's computed signature through the descriptor that read the
-		// content, before that descriptor closes and before the result is published.
-		c.refreshCacheEntry(job.source, job.path, job.baseJob)
+		// content, before that descriptor closes and before the result is published. The source is
+		// not a file this run wrote, so the descriptor has to still show the facts the item
+		// observed for the entry to describe the bytes that were hashed.
+		c.refreshCacheEntry(job.source, job.path, job.baseJob, false)
 
 		job.finishSource()
 		c.publish(ch, job.baseJob)
@@ -321,11 +323,13 @@ func (c *StreamCopyer) write(ctx context.Context, job *writeJob, ch chan<- *base
 
 			// This target's content is complete, but the item's hash is only complete once the
 			// whole source was read. The writer waits for it and publishes the target's cache
-			// entry while it still owns the descriptor it wrote through.
+			// entry while it still owns the descriptor it wrote through. The target holds exactly
+			// the bytes that produced the hash and is stamped with the item's metadata after this
+			// publication, so its length is what the descriptor has to show.
 			if cacheGate != nil {
 				<-cacheGate
 			}
-			c.refreshCacheEntry(file, target, job.baseJob)
+			c.refreshCacheEntry(file, target, job.baseJob, true)
 
 			if err := file.Close(); err != nil {
 				file = nil
