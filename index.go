@@ -1,138 +1,104 @@
 package acp
 
 import (
-	"context"
-	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-)
 
-const (
-	UnexpectFileMode = os.ModeType &^ os.ModeDir
+	"github.com/sirupsen/logrus"
 )
 
 type counter struct {
 	bytes, files int64
 }
 
-// index reads caller-owned items in batches and turns them into jobs. It stops asking the
-// batch source for work as soon as the pipeline stops, and reports the items of the batch
-// it already holds rather than dropping them.
-func (c *Copyer) index(ctx context.Context) (<-chan *baseJob, error) {
-	if c.batch == nil {
-		return nil, fmt.Errorf("batch source is nil")
-	}
-
-	// The channel capacity is the read buffer, so no separate prefetch stage is needed.
-	ch := make(chan *baseJob, c.readBuffer)
-	go wrap(ctx, func() {
-		defer close(ch)
-
-		var bytes, files int64
-		var order uint64
-		defer func() {
-			c.submit(&EventUpdateCount{Bytes: bytes, Files: files, Finished: true})
-		}()
-
-		for {
-			// A stop ends the feed without asking the caller for another batch.
-			if c.stopped(ctx) {
-				return
-			}
-
-			batch, err := c.batch.Next(ctx)
-			if err != nil {
-				if !errors.Is(err, io.EOF) {
-					err = fmt.Errorf("read batch source failed, %w", err)
-					c.reportError("", "", err)
-					c.setError(err)
-				}
-				return
-			}
-
-			for index, item := range batch {
-				if !c.accept(ch, item, order, &bytes, &files) {
-					c.abandonItems(ctx, batch[index:])
-					return
-				}
-				order++
-			}
-			c.submit(&EventUpdateCount{Bytes: bytes, Files: files})
-		}
-	})
-	return ch, nil
-}
-
-// accept turns one item into a job and hands it to the read buffer. It reports false when
-// the pipeline stopped before the job was handed over.
-func (c *Copyer) accept(ch chan<- *baseJob, item Item, order uint64, bytes, files *int64) bool {
-	if item == nil {
-		c.reportError("", "", fmt.Errorf("read batch source failed, item is nil"))
-		return false
-	}
-
-	job, err := c.newJob(item, order)
+// buildJob resolves one submitted item into a job. An item ACP cannot describe becomes a job
+// that reports the failure through its own result, not a pipeline failure.
+func (c *StreamCopyer) buildJob(item Item, order uint64) *baseJob {
+	targets, err := itemTargets(item)
 	if err != nil {
-		c.reportItemError(item.Source(), "", err)
-		job = &baseJob{copyer: c, item: item, order: order, targets: itemTargets(item)}
+		c.logf(logrus.ErrorLevel, "read item targets failed, err= %v", err)
+		job := c.namedFailureJob(item, order)
 		job.itemError = err
-	} else {
-		*files++
-		*bytes += job.stat.size
+		return job
 	}
 
-	select {
-	case ch <- job:
-		return true
-	case <-c.hardStop:
-		return false
+	job, err := c.newJob(item, targets, order)
+	if err == nil {
+		return job
 	}
+	c.logf(logrus.ErrorLevel, "read item failed, %v", err)
+	if job == nil {
+		job = c.namedFailureJob(item, order)
+	}
+	job.itemError = err
+	return job
 }
 
-// abandonItems reports accepted items that the pipeline stopped before processing.
-func (c *Copyer) abandonItems(ctx context.Context, items []Item) {
-	reason := c.abandonment(ctx)
-	for _, item := range items {
-		if item == nil {
-			continue
-		}
-		c.abandon(&baseJob{copyer: c, item: item, targets: itemTargets(item)}, reason)
+// namedFailureJob builds the job of an item ACP could not describe, so the failure still names
+// the item. A source the caller cannot report leaves the job unnamed.
+func (c *StreamCopyer) namedFailureJob(item Item, order uint64) *baseJob {
+	job := &baseJob{copyer: c, item: item, order: order}
+
+	var sourceName string
+	if err := protectCall("Item.Source", func() { sourceName = item.Source() }); err != nil {
+		return job
 	}
+
+	job.path = filepath.Clean(sourceName)
+	return job
 }
 
-// newJob resolves one item's source facts. A source that cannot be described is reported
-// as a failed item, not as a pipeline failure.
-func (c *Copyer) newJob(item Item, order uint64) (*baseJob, error) {
-	path := filepath.Clean(item.Source())
+// newJob resolves one item's source facts and validates the run options that apply to it. The
+// returned job carries the identity it resolved even when it reports an error, so the failure
+// still names the item.
+func (c *StreamCopyer) newJob(item Item, targets []string, order uint64) (*baseJob, error) {
+	var sourceName string
+	if err := protectCall("Item.Source", func() { sourceName = item.Source() }); err != nil {
+		return nil, err
+	}
+
+	path := filepath.Clean(sourceName)
+	job := &baseJob{
+		copyer:  c,
+		item:    item,
+		path:    path,
+		targets: targets,
+		order:   order,
+	}
+
+	// A transfer always reads its source, so a policy that trades a computed hash for a
+	// stored one cannot describe it. Reject it here instead of silently reading the source.
+	if len(targets) > 0 && !c.hashPolicy.appliesToTransfer() {
+		return job, fmt.Errorf(
+			"check hash policy failed, policy= %s, source= '%s': a copy always reads its source so it cannot reuse a stored hash",
+			c.hashPolicy, path,
+		)
+	}
+
 	info, err := os.Stat(path)
 	if err != nil {
-		return nil, fmt.Errorf("get source stat failed, source= '%s', %w", path, err)
+		return job, fmt.Errorf("get source stat failed, source= '%s', %w", path, err)
 	}
 	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("source is not a regular file, source= '%s', mode= %s", path, info.Mode())
+		return job, fmt.Errorf("source is not a regular file, source= '%s', mode= %s", path, info.Mode())
 	}
 
 	stat, err := newStat(path, info)
 	if err != nil {
-		return nil, fmt.Errorf("read source stat failed, source= '%s', %w", path, err)
+		return job, fmt.Errorf("read source stat failed, source= '%s', %w", path, err)
 	}
-
-	job := &baseJob{
-		copyer:  c,
-		item:    item,
-		src:     &source{base: filepath.Dir(path), path: filepath.Base(path)},
-		path:    path,
-		stat:    stat,
-		targets: itemTargets(item),
-		order:   order,
-	}
-	c.submit(&EventUpdateJob{job.report()})
+	job.stat = stat
 
 	return job, nil
 }
 
-func itemTargets(item Item) []string {
-	return append([]string(nil), item.Targets()...)
+// itemTargets copies the targets the caller requested, turning a panic in the caller's code
+// into an item failure.
+func itemTargets(item Item) ([]string, error) {
+	var targets []string
+	if err := protectCall("Item.Targets", func() { targets = item.Targets() }); err != nil {
+		return nil, err
+	}
+	return append([]string(nil), targets...), nil
 }

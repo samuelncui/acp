@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -15,78 +14,27 @@ import (
 	"github.com/samuelncui/acp"
 )
 
-// entryItem is the caller-owned item the library end-to-end test feeds to acp.Run.
-type entryItem struct {
-	entry acp.FileEntry
-
-	lock   sync.Mutex
-	result *acp.Result
-	err    error
-	count  int
+// streamRun is the results callback of the caller-owned variant: it records every result the
+// push engine delivers, so the test can assert the result contract instead of a report row.
+type streamRun struct {
+	lock    sync.Mutex
+	results []acp.Result
 }
 
-func (i *entryItem) Source() string { return i.entry.Source }
+func (r *streamRun) onResults(results []acp.Result) error {
+	r.lock.Lock()
+	defer r.lock.Unlock()
 
-func (i *entryItem) Targets() []string { return i.entry.Targets }
-
-func (i *entryItem) Completed(result *acp.Result) {
-	i.lock.Lock()
-	defer i.lock.Unlock()
-	i.result = result
-	i.count++
+	r.results = append(r.results, results...)
+	return nil
 }
 
-func (i *entryItem) Failed(err error) {
-	i.lock.Lock()
-	defer i.lock.Unlock()
-	i.err = err
-	i.count++
-}
+// delivered returns every result the run reported, in delivery order.
+func (r *streamRun) delivered() []acp.Result {
+	r.lock.Lock()
+	defer r.lock.Unlock()
 
-// outcome returns the item's single terminal outcome.
-func (i *entryItem) outcome(t *testing.T) (*acp.Result, error) {
-	t.Helper()
-
-	i.lock.Lock()
-	defer i.lock.Unlock()
-	if i.count != 1 {
-		t.Fatalf("item %q received %d terminal callbacks, want 1", i.entry.Source, i.count)
-	}
-	return i.result, i.err
-}
-
-// entrySource supplies the selected entries as one batch of caller-owned items.
-type entrySource struct {
-	entries []acp.FileEntry
-
-	lock  sync.Mutex
-	items []*entryItem
-}
-
-func (s *entrySource) Next(context.Context) ([]acp.Item, error) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-
-	if len(s.entries) == 0 {
-		return nil, io.EOF
-	}
-
-	entries := s.entries
-	s.entries = nil
-
-	items := make([]acp.Item, 0, len(entries))
-	for _, entry := range entries {
-		item := &entryItem{entry: entry}
-		s.items = append(s.items, item)
-		items = append(items, item)
-	}
-	return items, nil
-}
-
-func (s *entrySource) submitted() []*entryItem {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-	return append([]*entryItem(nil), s.items...)
+	return append([]acp.Result(nil), r.results...)
 }
 
 func TestACPLibraryE2E(t *testing.T) {
@@ -121,26 +69,22 @@ func TestACPLibraryE2E(t *testing.T) {
 		}
 	}
 
-	// Select the entries the public API copies, then submit them as caller-owned items.
-	entries, err := acp.SelectFiles([]string{source}, targets)
-	if err != nil {
-		t.Fatalf("select files: %v", err)
-	}
-	if len(entries) != len(files) {
-		t.Fatalf("selected entries = %d, want %d", len(entries), len(files))
-	}
-	items := &entrySource{entries: entries}
-
-	handler, getter := acp.NewReportGetter()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := acp.Run(
+
+	// The shell maps the source tree onto both targets and reports one terminal row per file.
+	handler, getter := acp.NewReportGetter()
+	copyer, err := acp.New(
 		ctx,
-		items,
+		acp.WildcardJob(acp.Source(source), acp.Target(targets...)),
 		acp.WithHashPolicy(acp.HashRead),
-		acp.SetToDevice(acp.Overwrite(true)),
+		acp.Overwrite(true),
 		acp.WithEventHandler(handler),
-	); err != nil {
+	)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if err := copyer.WaitErr(); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 
@@ -204,32 +148,87 @@ func TestACPLibraryE2E(t *testing.T) {
 		}
 	}
 
-	// Every submitted item owns one completion with one outcome per requested target.
-	submitted := items.submitted()
-	if len(submitted) != len(files) {
-		t.Fatalf("submitted items = %d, want %d", len(submitted), len(files))
-	}
-	for _, item := range submitted {
-		result, err := item.outcome(t)
-		if err != nil {
-			t.Fatalf("item %q failed: %v", item.entry.Source, err)
-		}
-		if result.Source != filepath.Clean(item.entry.Source) {
-			t.Fatalf("item %q result source = %q", item.entry.Source, result.Source)
-		}
-		if len(result.Targets) != len(targets) {
-			t.Fatalf("item %q targets = %v, want %d", item.entry.Source, result.Targets, len(targets))
-		}
-		for index, outcome := range result.Targets {
-			if outcome.Path != item.entry.Targets[index] || outcome.Err != nil {
-				t.Fatalf("item %q target %d = %#v", item.entry.Source, index, outcome)
-			}
+	// The caller-owned variant submits the same files as its own items, so every result has to
+	// name the exact item that was submitted instead of a copy the library made.
+	items := make([]acp.Item, 0, len(files))
+	submitted := make([]*acp.SimpleJob, 0, len(files))
+	for relativePath := range files {
+		dsts := make([]string, 0, len(targets))
+		for _, target := range targets {
+			dsts = append(dsts, filepath.Join(target, filepath.Base(source), relativePath))
 		}
 
-		data := files[item.entry.Source[len(source)+1:]]
+		job := &acp.SimpleJob{Path: filepath.Join(source, relativePath), Dsts: dsts}
+		items = append(items, job)
+		submitted = append(submitted, job)
+	}
+
+	run := new(streamRun)
+	stream, err := acp.NewStream(
+		ctx,
+		run.onResults,
+		acp.WithHashPolicy(acp.HashRead),
+		acp.Overwrite(true),
+	)
+	if err != nil {
+		t.Fatalf("new stream: %v", err)
+	}
+	if err := stream.Submit(items...); err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := stream.Wait(); err != nil {
+		t.Fatalf("wait: %v", err)
+	}
+
+	// Every submitted item owns exactly one result, and that result reports the item's own
+	// content facts plus one outcome per requested target, in request order.
+	results := run.delivered()
+	if len(results) != len(submitted) {
+		t.Fatalf("results = %d, want %d", len(results), len(submitted))
+	}
+	counted := make(map[*acp.SimpleJob]int, len(submitted))
+	for _, result := range results {
+		job, ok := result.Job.(*acp.SimpleJob)
+		if !ok {
+			t.Fatalf("result job = %#v, want the submitted *acp.SimpleJob", result.Job)
+		}
+		counted[job]++
+
+		relativePath, err := filepath.Rel(source, job.Path)
+		if err != nil {
+			t.Fatalf("relative path of %q: %v", job.Path, err)
+		}
+		data, ok := files[relativePath]
+		if !ok {
+			t.Fatalf("result for an unexpected source %q", job.Path)
+		}
+		if result.Err != nil {
+			t.Fatalf("job %q failed: %v", job.Path, result.Err)
+		}
+		if result.Size != int64(len(data)) {
+			t.Fatalf("job %q size = %d, want %d", job.Path, result.Size, len(data))
+		}
+
 		sum := sha256.Sum256(data)
 		if !bytes.Equal(result.SHA256, sum[:]) {
-			t.Fatalf("item %q SHA256 = %x, want %x", item.entry.Source, result.SHA256, sum)
+			t.Fatalf("job %q SHA256 = %x, want %x", job.Path, result.SHA256, sum)
+		}
+
+		if len(result.Targets) != len(job.Dsts) {
+			t.Fatalf("job %q targets = %v, want %d", job.Path, result.Targets, len(job.Dsts))
+		}
+		for index, outcome := range result.Targets {
+			if outcome.Path != job.Dsts[index] || outcome.Err != nil {
+				t.Fatalf("job %q target %d = %#v", job.Path, index, outcome)
+			}
+		}
+	}
+	for _, job := range submitted {
+		if counted[job] != 1 {
+			t.Fatalf("job %q received %d results, want exactly 1", job.Path, counted[job])
 		}
 	}
 }

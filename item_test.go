@@ -17,15 +17,18 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
-// fixtureItem is a caller-owned item that records every terminal callback, so a test can
-// assert the item contract without a report or a sink.
+// fixtureItem is a caller-owned item that records every terminal outcome, so a test can assert
+// the result contract without a report or a sink. The engine reports results through onResults,
+// and the fixture below dispatches each result to the item that produced it.
 type fixtureItem struct {
 	source  string
 	targets []string
 
-	// hook observes each terminal callback before it is recorded.
+	// hook observes each terminal outcome before it is recorded.
 	hook func(*Result, error)
 
 	lock     sync.Mutex
@@ -41,8 +44,10 @@ func (i *fixtureItem) Source() string { return i.source }
 
 func (i *fixtureItem) Targets() []string { return i.targets }
 
+// Completed records one completed item. It is a test helper, not part of Item.
 func (i *fixtureItem) Completed(result *Result) { i.record(result, nil) }
 
+// Failed records one item ACP could not process. It is a test helper, not part of Item.
 func (i *fixtureItem) Failed(err error) { i.record(nil, err) }
 
 func (i *fixtureItem) record(result *Result, err error) {
@@ -66,7 +71,7 @@ func (i *fixtureItem) terminal(t *testing.T) (*Result, error) {
 	i.lock.Lock()
 	defer i.lock.Unlock()
 	if total := len(i.results) + len(i.failures); total != 1 {
-		t.Fatalf("item %q received %d terminal callbacks, want exactly 1", i.source, total)
+		t.Fatalf("item %q received %d terminal outcomes, want exactly 1", i.source, total)
 	}
 	if len(i.failures) == 1 {
 		return nil, i.failures[0]
@@ -74,14 +79,14 @@ func (i *fixtureItem) terminal(t *testing.T) (*Result, error) {
 	return i.results[0], nil
 }
 
-// callbackCount returns how many terminal callbacks the item received.
+// callbackCount returns how many terminal outcomes the item received.
 func (i *fixtureItem) callbackCount() int {
 	i.lock.Lock()
 	defer i.lock.Unlock()
 	return len(i.results) + len(i.failures)
 }
 
-// callbackOrder records the terminal callback order of several items.
+// callbackOrder records the terminal outcome order of several items.
 type callbackOrder struct {
 	lock  sync.Mutex
 	items []*fixtureItem
@@ -99,137 +104,172 @@ func (o *callbackOrder) snapshot() []*fixtureItem {
 	return append([]*fixtureItem(nil), o.items...)
 }
 
-// sliceSource replays prepared batches and then ends the input.
-type sliceSource struct {
-	batches [][]Item
-	err     error
+// streamFixture is the results callback of one test run: it records every delivered batch and
+// dispatches each result to the fixture item that produced it, so a test keeps asserting an
+// item's single terminal outcome.
+type streamFixture struct {
+	lock    sync.Mutex
+	items   map[Item]*fixtureItem
+	batches [][]Result
 
-	lock  sync.Mutex
-	index int
-	nexts int
+	// hook observes every batch before it is dispatched; an error it returns is the run's stop.
+	hook func([]Result) error
 }
 
-func newSliceSource(items ...Item) *sliceSource {
-	return &sliceSource{batches: [][]Item{items}}
-}
-
-func (s *sliceSource) Next(context.Context) ([]Item, error) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-
-	s.nexts++
-	if s.index < len(s.batches) {
-		batch := s.batches[s.index]
-		s.index++
-		return batch, nil
+func newStreamFixture(items ...*fixtureItem) *streamFixture {
+	fixture := &streamFixture{items: make(map[Item]*fixtureItem, len(items))}
+	for _, item := range items {
+		fixture.items[item] = item
 	}
-	if s.err != nil {
-		return nil, s.err
-	}
-	return nil, io.EOF
+	return fixture
 }
 
-func (s *sliceSource) calls() int {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-	return s.nexts
-}
+func (f *streamFixture) onResults(results []Result) error {
+	f.lock.Lock()
+	f.batches = append(f.batches, append([]Result(nil), results...))
+	hook := f.hook
+	f.lock.Unlock()
 
-// blockingSource delivers one batch and then blocks until the context ends, which models a
-// caller that stops feeding items when it stops the pipeline.
-type blockingSource struct {
-	batch []Item
-	// endErr is returned once the context ends and defaults to the context error.
-	endErr error
-
-	lock  sync.Mutex
-	nexts int
-}
-
-func (s *blockingSource) Next(ctx context.Context) ([]Item, error) {
-	s.lock.Lock()
-	s.nexts++
-	first := s.nexts == 1
-	s.lock.Unlock()
-
-	if first {
-		return s.batch, nil
+	if hook != nil {
+		if err := hook(results); err != nil {
+			return err
+		}
 	}
 
-	<-ctx.Done()
-	if s.endErr != nil {
-		return nil, s.endErr
-	}
-	return nil, ctx.Err()
-}
+	for _, result := range results {
+		f.lock.Lock()
+		item := f.items[result.Job]
+		f.lock.Unlock()
 
-func (s *blockingSource) calls() int {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-	return s.nexts
-}
+		if item == nil {
+			continue
+		}
+		if result.Err != nil {
+			item.Failed(result.Err)
+			continue
+		}
 
-// recordingSource delivers prepared batches and records the items it produced, so a test
-// can assert the item contract for exactly the items that were accepted before a stop.
-type recordingSource struct {
-	batches [][]Item
-
-	lock     sync.Mutex
-	index    int
-	produced []*fixtureItem
-}
-
-func (s *recordingSource) Next(context.Context) ([]Item, error) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-
-	if s.index >= len(s.batches) {
-		return nil, io.EOF
+		completed := result
+		item.Completed(&completed)
 	}
 
-	batch := s.batches[s.index]
-	s.index++
-	for _, item := range batch {
-		s.produced = append(s.produced, item.(*fixtureItem))
+	return nil
+}
+
+// add registers more fixture items, which a producer that creates items while it feeds needs.
+func (f *streamFixture) add(items ...*fixtureItem) {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	for _, item := range items {
+		f.items[item] = item
 	}
-	return batch, nil
 }
 
-func (s *recordingSource) items() []*fixtureItem {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-	return append([]*fixtureItem(nil), s.produced...)
+// batchesDelivered returns how many times the run called the results callback.
+func (f *streamFixture) batchesDelivered() int {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	return len(f.batches)
 }
 
-// endlessSource produces one item per call until the caller cancels the context.
-type endlessSource struct {
-	input  string
-	target string
+// delivered returns every delivered result, in delivery order.
+func (f *streamFixture) delivered() []Result {
+	f.lock.Lock()
+	defer f.lock.Unlock()
 
-	lock     sync.Mutex
-	produced []*fixtureItem
+	all := make([]Result, 0, len(f.batches))
+	for _, batch := range f.batches {
+		all = append(all, batch...)
+	}
+	return all
 }
 
-func (s *endlessSource) Next(ctx context.Context) ([]Item, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
+// runStream submits one batch of items, closes the run and returns its terminal error.
+func runStream(ctx context.Context, onResults func([]Result) error, items []Item, opts ...Option) error {
+	stream, err := NewStream(ctx, onResults, opts...)
+	if err != nil {
+		return err
+	}
+	_ = stream.Submit(items...)
+	_ = stream.Close()
+
+	return stream.Wait()
+}
+
+// runFixture is runStream for a set of fixture items.
+func runFixture(ctx context.Context, fixture *streamFixture, items []Item, opts ...Option) error {
+	return runStream(ctx, fixture.onResults, items, opts...)
+}
+
+// runShell drives one af05f05c shell run and returns its terminal error.
+func runShell(ctx context.Context, opts ...Option) error {
+	copyer, err := New(ctx, opts...)
+	if err != nil {
+		return err
 	}
 
-	s.lock.Lock()
-	defer s.lock.Unlock()
-
-	index := len(s.produced) + 1
-	item := newFixtureItem(s.input, filepath.Join(s.target, fmt.Sprintf("%04d", index)))
-	s.produced = append(s.produced, item)
-	return []Item{item}, nil
+	return copyer.WaitErr()
 }
 
-func (s *endlessSource) items() []*fixtureItem {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-	return append([]*fixtureItem(nil), s.produced...)
+// feedBatches submits every batch in order and returns the first refusal, which is what a
+// caller-owned feed sees when the run stops accepting work.
+func feedBatches(stream *StreamCopyer, batches [][]Item) error {
+	for _, batch := range batches {
+		if err := stream.Submit(batch...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// newTestStream builds the pipeline state a stage-level test needs without starting it.
+func newTestStream(t *testing.T, opts ...Option) *StreamCopyer {
+	t.Helper()
+
+	option, err := buildOption(opts...)
+	if err != nil {
+		t.Fatalf("check options: %v", err)
+	}
+
+	device := t.TempDir()
+	return &StreamCopyer{
+		option:    option,
+		ctx:       context.Background(),
+		readCh:    make(chan *baseJob, option.readBuffer),
+		resultCh:  make(chan Result, option.resultBuffer),
+		eventCh:   make(chan Event, 256),
+		hardStop:  make(chan struct{}),
+		onResults: func([]Result) error { return nil },
+		getDevice: func(string) (string, error) { return device, nil },
+		getDiskUsageCache: func(string) *diskUsageCache {
+			return newDiskUsageCache(device, defaultDiskUsageFreshInterval)
+		},
+	}
+}
+
+// runResults drives the reporting stage and the delivery stage of a stage-level test the way the
+// pipeline does: the delivery stage drains the result buffer on its own goroutine until the
+// reporting stage closed it. It returns once the caller's callback saw everything.
+func runResults(copyer *StreamCopyer, copyed <-chan *baseJob) {
+	delivered := make(chan struct{})
+	go func() {
+		defer close(delivered)
+		copyer.deliver()
+	}()
+
+	copyer.report(copyed)
+	close(copyer.resultCh)
+	<-delivered
+}
+
+// cancelOnFirstResult stops the run from the results callback, which is where a caller observes
+// that the pipeline is working.
+func cancelOnFirstResult(cancel context.CancelFunc) func([]Result) error {
+	var once sync.Once
+	return func([]Result) error {
+		once.Do(cancel)
+		return nil
+	}
 }
 
 // writeSourceFile writes one source file below dir and returns its path.
@@ -246,85 +286,47 @@ func writeSourceFile(t *testing.T, dir, name string, content []byte) string {
 	return path
 }
 
-// newTestCopyer builds the pipeline state a stage-level test needs without starting it.
-func newTestCopyer(t *testing.T, opts ...Option) *Copyer {
-	t.Helper()
-
-	option := newOption()
-	for _, opt := range opts {
-		if opt == nil {
-			continue
-		}
-		option = opt(option)
-	}
-	if err := option.check(); err != nil {
-		t.Fatalf("check options: %v", err)
-	}
-
-	device := t.TempDir()
-	return &Copyer{
-		option:    option,
-		eventCh:   make(chan Event, 256),
-		hardStop:  make(chan struct{}),
-		abandoned: make(chan *baseJob, 16),
-		getDevice: func(string) string { return device },
-		getDiskUsageCache: func(string) *diskUsageCache {
-			return newDiskUsageCache(device, defaultDiskUsageFreshInterval)
-		},
-	}
-}
-
-// cancelOnFirstCopy stops the pipeline when the first item starts copying.
-func cancelOnFirstCopy(cancel context.CancelFunc) EventHandler {
-	var once sync.Once
-	return func(event Event) {
-		update, ok := event.(*EventUpdateJob)
-		if !ok || update.Job.Status != JobStatusCopying {
-			return
-		}
-		once.Do(cancel)
-	}
-}
-
 func TestRunCopiesItemsToLinearTarget(t *testing.T) {
 	// Build caller-owned items without constructing copy options per file.
 	root := t.TempDir()
 	order := new(callbackOrder)
 	items := make([]Item, 0, 3)
+	fixtures := make([]*fixtureItem, 0, 3)
 	for index, content := range []string{"first", "second", "third"} {
 		name := string(rune('a'+index)) + ".txt"
 		source := writeSourceFile(t, root, filepath.Join("source", name), []byte(content))
 		item := newFixtureItem(source, filepath.Join(root, "target", name))
 		item.hook = func(*Result, error) { order.record(item) }
 		items = append(items, item)
+		fixtures = append(fixtures, item)
 	}
 
 	// Keep the target serialized while allowing source preparation to complete in any order.
-	if err := Run(
+	if err := runFixture(
 		context.Background(),
-		newSliceSource(items...),
+		newStreamFixture(fixtures...),
+		items,
 		WithHashPolicy(HashRead),
 		SetToDevice(LinearDevice(true)),
 	); err != nil {
 		t.Fatal(err)
 	}
 
-	// A linear target reports items in request order.
-	reported := order.snapshot()
-	if len(reported) != len(items) {
+	// Result order is unspecified, so the test asserts every item's own outcome and that a
+	// serialized target still received them all.
+	if reported := order.snapshot(); len(reported) != len(items) {
 		t.Fatalf("received %d callbacks, want %d", len(reported), len(items))
 	}
-	for index, item := range reported {
-		if want := items[index].(*fixtureItem); item != want {
-			t.Fatalf("callback %d reported %q, want %q", index, item.source, want.source)
-		}
-
+	for _, item := range fixtures {
 		result, err := item.terminal(t)
 		if err != nil {
 			t.Fatalf("item %q failed: %v", item.source, err)
 		}
 		if len(result.Targets) != 1 || result.Targets[0].Err != nil || len(result.SHA256) == 0 {
 			t.Fatalf("unexpected result: %#v", result)
+		}
+		if result.Job != Item(item) {
+			t.Fatalf("result job = %#v, want the submitted item", result.Job)
 		}
 	}
 }
@@ -349,7 +351,7 @@ func TestForwardPreparedOrdersOnlyLinearTargets(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			// Deliver later preparation results first; a failed or skipped middle request has no write Job.
-			copyer := &Copyer{option: &option{
+			copyer := &StreamCopyer{option: &option{
 				fromDevice: &deviceOption{threads: 3},
 				toDevice:   &deviceOption{linear: test.linear},
 			}}
@@ -361,7 +363,7 @@ func TestForwardPreparedOrdersOnlyLinearTargets(t *testing.T) {
 			prepared := make(chan *writeJob, 3)
 
 			// Forwarding must reorder only the serialized target path.
-			copyer.forwardPrepared(context.Background(), completed, prepared)
+			copyer.forwardPrepared(completed, prepared)
 			close(prepared)
 			var ids []string
 			for job := range prepared {
@@ -387,7 +389,7 @@ func TestRunHashesWithoutTargets(t *testing.T) {
 	item := newFixtureItem(source)
 
 	// Verify ACP reads the source once and reports its SHA-256 without creating a target.
-	if err := Run(context.Background(), newSliceSource(item), WithHashPolicy(HashRead)); err != nil {
+	if err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, WithHashPolicy(HashRead)); err != nil {
 		t.Fatal(err)
 	}
 	result, err := item.terminal(t)
@@ -407,37 +409,114 @@ func TestRunHashesWithoutTargets(t *testing.T) {
 	}
 }
 
-func TestRunReturnsBatchSourceError(t *testing.T) {
-	// Verify that a batch source failure crosses the synchronous Run boundary.
-	sourceErr := errors.New("source failed")
-	err := Run(context.Background(), &sliceSource{err: sourceErr}, WithHashPolicy(HashOff))
-	if !errors.Is(err, sourceErr) {
-		t.Fatalf("Run() error = %v, want %v", err, sourceErr)
-	}
-
-	// Verify that items accepted before the failure still receive their outcome.
+func TestStreamReportsSubmissionFailureAsRunError(t *testing.T) {
+	// A submission the run no longer accepts is a run error, and the items it did accept keep
+	// their own outcomes.
 	root := t.TempDir()
 	input := writeSourceFile(t, root, "source.txt", []byte("fixture"))
-	items := []*fixtureItem{
-		newFixtureItem(input, filepath.Join(root, "target-1.txt")),
-		newFixtureItem(input, filepath.Join(root, "target-2.txt")),
+	accepted := newFixtureItem(input, filepath.Join(root, "target.txt"))
+	refused := newFixtureItem(input, filepath.Join(root, "other.txt"))
+
+	fixture := newStreamFixture(accepted)
+	stream, err := NewStream(context.Background(), fixture.onResults, Overwrite(true))
+	if err != nil {
+		t.Fatal(err)
 	}
-	err = Run(
-		context.Background(),
-		&sliceSource{batches: [][]Item{{items[0]}, {items[1]}}, err: sourceErr},
-		SetToDevice(Overwrite(true)),
-	)
-	if !errors.Is(err, sourceErr) {
-		t.Fatalf("Run() error = %v, want %v", err, sourceErr)
+	if err := stream.Submit(accepted); err != nil {
+		t.Fatalf("Submit() error = %v, want the first item accepted", err)
 	}
-	for _, item := range items {
-		result, terminalErr := item.terminal(t)
-		if terminalErr != nil {
-			t.Fatalf("item %q failed: %v", item.source, terminalErr)
-		}
-		if len(result.Targets) != 1 || result.Targets[0].Err != nil {
-			t.Fatalf("item %q targets = %v", item.source, result.Targets)
-		}
+
+	// Close ends the feed, so the run accepts no more work.
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := stream.Submit(refused); err == nil {
+		t.Fatal("Submit() error = nil after Close, want a refusal")
+	}
+
+	result, terminalErr := accepted.terminal(t)
+	if terminalErr != nil {
+		t.Fatalf("item %q failed: %v", accepted.source, terminalErr)
+	}
+	if len(result.Targets) != 1 || result.Targets[0].Err != nil {
+		t.Fatalf("item %q targets = %v", accepted.source, result.Targets)
+	}
+	if err := stream.Wait(); err == nil {
+		t.Fatal("Wait() error = nil, want the refused submission")
+	}
+	if refused.callbackCount() != 0 {
+		t.Fatalf("the refused item received %d outcomes, want none", refused.callbackCount())
+	}
+}
+
+func TestRunRejectsReuseOnlyPolicyForItemsWithTargets(t *testing.T) {
+	// A copy always reads its source and produces a computed hash, so a value that promises a
+	// stored hash cannot describe it. The policy is rejected as an option error for the item
+	// instead of silently reading.
+	for _, policy := range []HashPolicy{HashCachedOnly, HashCachedOrRead} {
+		t.Run(policy.String(), func(t *testing.T) {
+			root := t.TempDir()
+			input := writeSourceFile(t, root, "source.txt", []byte("fixture"))
+			target := filepath.Join(root, "target.txt")
+			item := newFixtureItem(input, target)
+
+			if err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, WithHashPolicy(policy)); err != nil {
+				t.Fatalf("run error = %v, want nil: a rejected item is an item outcome", err)
+			}
+			if result, err := item.terminal(t); err == nil {
+				t.Fatalf("item completed with %#v, want the rejected policy", result)
+			} else if !strings.Contains(err.Error(), "check hash policy failed") ||
+				!strings.Contains(err.Error(), policy.String()) {
+				t.Fatalf("item error = %v, want a rejected %s policy", err, policy)
+			}
+
+			// The rejected item must not have touched the target.
+			if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("stat target error = %v, want %v", err, os.ErrNotExist)
+			}
+		})
+	}
+}
+
+func TestRunKeepsEveryOtherPolicyForItemsWithTargets(t *testing.T) {
+	// The remaining values read content or need none, so a transfer can use all of them.
+	for _, policy := range []HashPolicy{HashOff, HashCachedOrReadRefresh, HashRead, HashReadRefresh} {
+		t.Run(policy.String(), func(t *testing.T) {
+			root := t.TempDir()
+			content := []byte("policy fixture")
+			input := writeSourceFile(t, root, "source.txt", content)
+			target := filepath.Join(root, "target.txt")
+			item := newFixtureItem(input, target)
+
+			if err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, WithHashPolicy(policy)); err != nil {
+				t.Fatalf("run error = %v", err)
+			}
+			result, err := item.terminal(t)
+			if err != nil {
+				t.Fatalf("item failed: %v", err)
+			}
+			if len(result.Targets) != 1 || result.Targets[0].Err != nil || result.Targets[0].Path != target {
+				t.Fatalf("targets = %#v, want %q written", result.Targets, target)
+			}
+
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, content) {
+				t.Fatalf("target content = %q, want %q", got, content)
+			}
+
+			// Only a reading policy produces the computed hash of the copied bytes.
+			wantHash := sha256.Sum256(content)
+			if policy.producesHash() {
+				if !bytes.Equal(result.SHA256, wantHash[:]) {
+					t.Fatalf("SHA256 = %x, want %x", result.SHA256, wantHash)
+				}
+			} else if len(result.SHA256) != 0 {
+				t.Fatalf("SHA256 = %x, want none", result.SHA256)
+			}
+		})
 	}
 }
 
@@ -448,9 +527,9 @@ func TestRunReportsTargetFailureAsItemOutcome(t *testing.T) {
 	target := writeSourceFile(t, root, "target.txt", []byte("existing"))
 	item := newFixtureItem(input, target)
 
-	// A failed target is an item outcome with its own error identity, not a Run error.
-	if err := Run(context.Background(), newSliceSource(item)); err != nil {
-		t.Fatalf("Run() error = %v, want nil", err)
+	// A failed target is an item outcome with its own error identity, not a run error.
+	if err := runFixture(context.Background(), newStreamFixture(item), []Item{item}); err != nil {
+		t.Fatalf("run error = %v, want nil", err)
 	}
 	result, err := item.terminal(t)
 	if err != nil {
@@ -481,8 +560,8 @@ func TestRunReportsOneOutcomePerRequestedTargetInOrder(t *testing.T) {
 	written := filepath.Join(root, "written.txt")
 	item := newFixtureItem(input, refused, written)
 
-	if err := Run(context.Background(), newSliceSource(item)); err != nil {
-		t.Fatalf("Run() error = %v, want nil", err)
+	if err := runFixture(context.Background(), newStreamFixture(item), []Item{item}); err != nil {
+		t.Fatalf("run error = %v, want nil", err)
 	}
 	result, err := item.terminal(t)
 	if err != nil {
@@ -505,6 +584,71 @@ func TestRunReportsOneOutcomePerRequestedTargetInOrder(t *testing.T) {
 	}
 	if !bytes.Equal(content, []byte("fixture")) {
 		t.Fatalf("written content = %q, want %q", content, "fixture")
+	}
+}
+
+// TestRunCopiesAChunkedSourceToEveryTarget pins a successful multi-target copy larger than one
+// read buffer: several chunks of the shared buffer pool travel to every target, and each target
+// must hold the whole source. The content is a fixed byte pattern instead of a random source, so
+// the test is reproducible, and every target hash is computed from the bytes read back from disk.
+func TestRunCopiesAChunkedSourceToEveryTarget(t *testing.T) {
+	// Three full chunks plus a short final one, so the read loop, the buffer handoff and the
+	// final partial write are all exercised.
+	content := make([]byte, 3*batchSize+12345)
+	if len(content) <= batchSize {
+		t.Fatalf("test content = %d bytes, want more than one %d-byte chunk", len(content), batchSize)
+	}
+	for index := range content {
+		content[index] = byte(index*7 + index/251)
+	}
+
+	// Track the shared pool as well: several buffers pass through it, and every reference must
+	// come back by the time the run ends.
+	trackChunkPool(t)
+
+	root := t.TempDir()
+	input := writeSourceFile(t, root, "source.bin", content)
+	targets := []string{
+		filepath.Join(root, "target-a.bin"),
+		filepath.Join(root, "target-b.bin"),
+		filepath.Join(root, "target-c.bin"),
+	}
+	item := newFixtureItem(input, targets...)
+
+	if err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, WithHashPolicy(HashRead)); err != nil {
+		t.Fatalf("run error = %v, want nil", err)
+	}
+	result, err := item.terminal(t)
+	if err != nil {
+		t.Fatalf("item failed: %v", err)
+	}
+
+	wantHash := sha256.Sum256(content)
+	if result.Size != int64(len(content)) {
+		t.Fatalf("result size = %d, want %d", result.Size, len(content))
+	}
+	if !bytes.Equal(result.SHA256, wantHash[:]) {
+		t.Fatalf("result SHA256 = %x, want %x", result.SHA256, wantHash)
+	}
+	if len(result.Targets) != len(targets) {
+		t.Fatalf("targets = %#v, want one outcome per requested target", result.Targets)
+	}
+	for index, target := range targets {
+		outcome := result.Targets[index]
+		if outcome.Path != target || outcome.Err != nil {
+			t.Fatalf("target %d = %#v, want %q written", index, outcome, target)
+		}
+
+		got, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatalf("read target %q: %v", target, err)
+		}
+		if !bytes.Equal(got, content) {
+			t.Fatalf("target %q holds %d bytes that differ from the source content, want %d matching bytes", target, len(got), len(content))
+		}
+		if hash := sha256.Sum256(got); !bytes.Equal(hash[:], wantHash[:]) {
+			t.Fatalf("target %q SHA256 = %x, want %x", target, hash, wantHash)
+		}
 	}
 }
 
@@ -531,8 +675,8 @@ func TestRunReportsUnprocessableItemsAsFailures(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			item := newFixtureItem(test.source, test.target...)
-			if err := Run(context.Background(), newSliceSource(item)); err != nil {
-				t.Fatalf("Run() error = %v, want nil", err)
+			if err := runFixture(context.Background(), newStreamFixture(item), []Item{item}); err != nil {
+				t.Fatalf("run error = %v, want nil", err)
 			}
 
 			result, err := item.terminal(t)
@@ -548,8 +692,8 @@ func TestRunReportsUnprocessableItemsAsFailures(t *testing.T) {
 			if err != nil {
 				t.Fatalf("item failed: %v", err)
 			}
-			if result.Source != filepath.Clean(test.source) {
-				t.Fatalf("result source = %q, want %q", result.Source, filepath.Clean(test.source))
+			if submitted, ok := result.Job.(*fixtureItem); !ok || submitted.source != filepath.Clean(test.source) {
+				t.Fatalf("result job = %#v, want the submitted item", result.Job)
 			}
 		})
 	}
@@ -576,14 +720,15 @@ func TestPrepareReportsUnstartedItemsWithoutReadingThem(t *testing.T) {
 			}
 			defer cancel()
 
-			copyer := newTestCopyer(t)
 			// The source does not exist, so only a pipeline that still starts a read can
 			// report anything other than the failure this stage owes the caller.
 			item := newFixtureItem(filepath.Join(t.TempDir(), "removed"), filepath.Join(t.TempDir(), "target"))
+			copyer := newTestStream(t)
+			fixture := newStreamFixture(item)
+			copyer.onResults = fixture.onResults
 			job := &baseJob{
 				copyer:    copyer,
 				item:      item,
-				src:       &source{base: filepath.Dir(item.source), path: filepath.Base(item.source)},
 				path:      item.source,
 				order:     0,
 				itemError: test.itemError,
@@ -593,29 +738,12 @@ func TestPrepareReportsUnstartedItemsWithoutReadingThem(t *testing.T) {
 			indexed <- job
 			close(indexed)
 
-			done := make(chan struct{})
-			go func() {
-				defer close(done)
-				for range copyer.prepare(ctx, indexed) {
-					t.Error("prepare handed out a reader for an item that never started")
-				}
-			}()
-
-			select {
-			case abandoned := <-copyer.abandoned:
-				if abandoned != job {
-					t.Fatalf("abandoned job = %p, want %p", abandoned, job)
-				}
-				// Cleanup owns terminal callbacks, so deliver the one this item is owed.
-				copyer.failedJob(abandoned)
-			case <-time.After(5 * time.Second):
-				t.Fatal("prepare did not report the unstarted item")
-			}
-
-			select {
-			case <-done:
-			case <-time.After(5 * time.Second):
-				t.Fatal("prepare did not finish after the stop")
+			// Preparation forwards an item it must not read to the results stage, and that
+			// stage reports it exactly once.
+			prepared := copyer.prepare(ctx, indexed)
+			copyed := copyer.copy(ctx, prepared)
+			runResults(copyer, copyed)
+			for range copyed {
 			}
 
 			if _, err := item.terminal(t); !errors.Is(err, test.want) {
@@ -625,29 +753,34 @@ func TestPrepareReportsUnstartedItemsWithoutReadingThem(t *testing.T) {
 	}
 }
 
-func TestPrepareCompletesWithoutOpeningTheSourceWhenPolicyNeedsNoContent(t *testing.T) {
+func TestPrepareReadsNoContentWhenThePolicyNeedsNone(t *testing.T) {
 	tests := []struct {
 		name   string
 		policy HashPolicy
+
+		// A policy that uses the cache reads its stored hash through the item's descriptor, so a
+		// source it cannot open is a cache miss with a warning instead of an item failure.
+		wantMisses   int64
+		wantFailures int64
 	}{
 		{name: "off", policy: HashOff},
-		{name: "cached only without entry", policy: HashCachedOnly},
+		{name: "cached only without entry", policy: HashCachedOnly, wantMisses: 1, wantFailures: 1},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			copyer := newTestCopyer(t, WithHashPolicy(test.policy))
+			copyer := newTestStream(t, WithHashPolicy(test.policy))
 			if test.policy.usesCache() {
-				copyer.signatures = newSignatureCache(1)
-				t.Cleanup(func() { copyer.signatures.closeAndWait() })
+				copyer.signatures = newSignatureCache()
 			}
 
-			// The source only has to be described: a policy that needs no content must not
-			// open it, so a missing path cannot turn the item into a failure.
+			// The source only has to be described: a policy that needs no content reads nothing
+			// from it, so a missing path cannot turn the item into a failure.
 			item := newFixtureItem(filepath.Join(t.TempDir(), "removed"))
+			fixture := newStreamFixture(item)
+			copyer.onResults = fixture.onResults
 			job := &baseJob{
 				copyer: copyer,
 				item:   item,
-				src:    &source{base: filepath.Dir(item.source), path: filepath.Base(item.source)},
 				path:   item.source,
 				stat:   &stat{size: 7, mode: 0o644},
 				order:  0,
@@ -659,7 +792,7 @@ func TestPrepareCompletesWithoutOpeningTheSourceWhenPolicyNeedsNoContent(t *test
 			var prepared []*writeJob
 			for write := range copyer.prepare(context.Background(), indexed) {
 				if !write.skipContent {
-					t.Fatal("prepare opened a source whose policy needs no content")
+					t.Fatal("prepare kept a content read for a policy that needs no content")
 				}
 				prepared = append(prepared, write)
 			}
@@ -680,6 +813,16 @@ func TestPrepareCompletesWithoutOpeningTheSourceWhenPolicyNeedsNoContent(t *test
 			if result.Size != 7 {
 				t.Fatalf("result size = %d, want the indexed size", result.Size)
 			}
+
+			// A cache read that cannot open its descriptor is a miss with a warning, and the item
+			// still completes without a hash.
+			if copyer.signatures == nil {
+				return
+			}
+			summary := copyer.signatures.snapshot()
+			if summary.Misses != test.wantMisses || summary.Failures != test.wantFailures {
+				t.Fatalf("cache summary = %#v, want misses=%d failures=%d", summary, test.wantMisses, test.wantFailures)
+			}
 		})
 	}
 }
@@ -693,12 +836,13 @@ func TestRunKeepsLinearOrderingPastAnUnprocessedItem(t *testing.T) {
 	goodTarget := filepath.Join(root, "target", "good.txt")
 	good := newFixtureItem(goodSource, goodTarget)
 
-	if err := Run(
+	if err := runFixture(
 		context.Background(),
-		newSliceSource(missing, good),
+		newStreamFixture(missing, good),
+		[]Item{missing, good},
 		SetToDevice(LinearDevice(true)),
 	); err != nil {
-		t.Fatalf("Run() error = %v, want nil", err)
+		t.Fatalf("run error = %v, want nil", err)
 	}
 
 	if _, err := missing.terminal(t); !errors.Is(err, fs.ErrNotExist) {
@@ -720,48 +864,55 @@ func TestRunReportsEveryAcceptedItemExactlyOnce(t *testing.T) {
 	}{
 		{name: "buffered target"},
 		{name: "linear target", opts: []Option{SetToDevice(LinearDevice(true))}},
+		// A linear source hands one reader to the copy stage at a time, so a stop that
+		// releases its wait instead of draining its input is where items used to disappear.
+		{name: "linear source", opts: []Option{SetFromDevice(LinearDevice(true))}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			root := t.TempDir()
-			const (
-				total     = 16
-				batchSize = 4
-			)
+			const total = 16
 
-			// Feed the items in several batches so the stop must also stop the feed.
-			batches := make([][]Item, 0, total/batchSize)
-			for first := 0; first < total; first += batchSize {
-				batch := make([]Item, 0, batchSize)
-				for index := first; index < first+batchSize; index++ {
-					name := fmt.Sprintf("%02d.txt", index)
-					source := writeSourceFile(t, root, name, []byte(strings.Repeat(name, 64)))
-					batch = append(batch, newFixtureItem(source, filepath.Join(root, "target", name)))
-				}
-				batches = append(batches, batch)
+			items := make([]Item, 0, total)
+			fixtures := make([]*fixtureItem, 0, total)
+			for index := 0; index < total; index++ {
+				name := fmt.Sprintf("%02d.txt", index)
+				source := writeSourceFile(t, root, name, []byte(strings.Repeat(name, 64)))
+				item := newFixtureItem(source, filepath.Join(root, "target", name))
+				items = append(items, item)
+				fixtures = append(fixtures, item)
 			}
-			source := &recordingSource{batches: batches}
 
+			fixture := newStreamFixture(fixtures...)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
-			opts := []Option{WithReadBuffer(batchSize), WithEventHandler(cancelOnFirstCopy(cancel))}
+			// The read buffer is much smaller than the batch in hand, so the stop lands while
+			// the pipeline is still working through accepted items.
+			opts := []Option{WithReadBuffer(4), WithResultBuffer(1), WithResultBatch(1)}
 			opts = append(opts, test.opts...)
-			err := Run(ctx, source, opts...)
-			if !errors.Is(err, context.Canceled) {
-				t.Fatalf("Run() error = %v, want %v", err, context.Canceled)
+			stream, err := NewStream(ctx, fixture.onResults, opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.hook = cancelOnFirstResult(cancel)
+
+			// One batch is submitted completely even though the callback stopped the feed, and
+			// the run reports what it can still start.
+			if err := stream.Submit(items...); err != nil {
+				t.Fatalf("Submit() error = %v, want the batch in hand accepted", err)
+			}
+			_ = stream.Close()
+			if err := stream.Wait(); !errors.Is(err, context.Canceled) {
+				t.Fatalf("Wait() error = %v, want %v", err, context.Canceled)
 			}
 
-			// Every accepted item owns exactly one terminal outcome, and a stop abandons
-			// the rest with the stopping error instead of dropping them.
-			produced := source.items()
-			if len(produced) == 0 {
-				t.Fatal("the source produced no items")
-			}
+			// Every accepted item owns exactly one outcome, and a stop abandons the rest with
+			// the stopping error instead of dropping them.
 			completed, abandoned := 0, 0
-			for _, item := range produced {
+			for _, item := range fixtures {
 				if got := item.callbackCount(); got != 1 {
-					t.Fatalf("item %q received %d callbacks, want 1", item.source, got)
+					t.Fatalf("item %q received %d outcomes, want 1", item.source, got)
 				}
 				result, itemErr := item.terminal(t)
 				if itemErr != nil {
@@ -786,9 +937,9 @@ func TestRunReportsEveryAcceptedItemExactlyOnce(t *testing.T) {
 	}
 }
 
-func TestRunDeliversTerminalCallbacksFromOneGoroutine(t *testing.T) {
-	// ACP delivers terminal callbacks one at a time and from a single goroutine, so a
-	// caller may perform its own I/O there without excluding the pipeline.
+func TestRunDeliversResultsFromOneGoroutine(t *testing.T) {
+	// ACP delivers results one batch at a time and from a single goroutine, so a caller may
+	// keep unguarded state in its callback.
 	root := t.TempDir()
 	const total = 32
 
@@ -801,49 +952,54 @@ func TestRunDeliversTerminalCallbacksFromOneGoroutine(t *testing.T) {
 	)
 
 	items := make([]Item, 0, total)
+	fixtures := make([]*fixtureItem, 0, total)
 	for index := 0; index < total; index++ {
 		name := fmt.Sprintf("%02d.txt", index)
 		content := []byte(strings.Repeat(name, 32))
 		source := writeSourceFile(t, root, name, content)
-		target := filepath.Join(root, "target", name)
-		item := newFixtureItem(source, target)
-		item.hook = func(result *Result, err error) {
-			if atomic.AddInt32(&inFlight, 1) != 1 {
-				atomic.AddInt32(&overlapped, 1)
-			}
-			id := currentGoroutineID()
-			lock.Lock()
-			goroutines[id] = struct{}{}
-			lock.Unlock()
-
-			// The callback owns its own I/O, and every target it sees is already final.
-			if result != nil {
-				for _, outcome := range result.Targets {
-					if outcome.Err != nil {
-						continue
-					}
-					got, readErr := os.ReadFile(outcome.Path)
-					if readErr != nil {
-						lock.Lock()
-						callbackErr = append(callbackErr, readErr)
-						lock.Unlock()
-						continue
-					}
-					if !bytes.Equal(got, content) {
-						lock.Lock()
-						callbackErr = append(callbackErr, fmt.Errorf("target %q content = %q, want %q", outcome.Path, got, content))
-						lock.Unlock()
-					}
-				}
-			}
-
-			runtime.Gosched()
-			atomic.AddInt32(&inFlight, -1)
-		}
+		item := newFixtureItem(source, filepath.Join(root, "target", name))
 		items = append(items, item)
+		fixtures = append(fixtures, item)
 	}
 
-	if err := Run(context.Background(), newSliceSource(items...), WithHashPolicy(HashRead)); err != nil {
+	fixture := newStreamFixture(fixtures...)
+	fixture.hook = func(results []Result) error {
+		if atomic.AddInt32(&inFlight, 1) != 1 {
+			atomic.AddInt32(&overlapped, 1)
+		}
+		id := currentGoroutineID()
+		lock.Lock()
+		goroutines[id] = struct{}{}
+		lock.Unlock()
+
+		// The callback runs after its item is final, so this test reads a small file to prove
+		// it. A callback that does I/O only slows the pipeline down.
+		for _, result := range results {
+			for _, outcome := range result.Targets {
+				if outcome.Err != nil {
+					continue
+				}
+				got, readErr := os.ReadFile(outcome.Path)
+				if readErr != nil {
+					lock.Lock()
+					callbackErr = append(callbackErr, readErr)
+					lock.Unlock()
+					continue
+				}
+				if !bytes.Equal(got, contentOfFixture(fixtures, result.Job)) {
+					lock.Lock()
+					callbackErr = append(callbackErr, fmt.Errorf("target %q content = %q", outcome.Path, got))
+					lock.Unlock()
+				}
+			}
+		}
+
+		runtime.Gosched()
+		atomic.AddInt32(&inFlight, -1)
+		return nil
+	}
+
+	if err := runFixture(context.Background(), fixture, items, WithHashPolicy(HashRead), WithResultBuffer(1), WithResultBatch(1)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -860,6 +1016,69 @@ func TestRunDeliversTerminalCallbacksFromOneGoroutine(t *testing.T) {
 	}
 }
 
+// contentOfFixture returns the source content one fixture item was built from.
+func contentOfFixture(fixtures []*fixtureItem, job Item) []byte {
+	for _, item := range fixtures {
+		if Item(item) == job {
+			return []byte(strings.Repeat(filepath.Base(item.source), 32))
+		}
+	}
+	return nil
+}
+
+// TestRunCallsOneEventGoroutineAtATime pins the contract a handler may rely on: one registered
+// handler receives events from one goroutine and never concurrently, which is what lets the
+// progress bar keep its total count without a lock.
+func TestRunCallsOneEventGoroutineAtATime(t *testing.T) {
+	// The contract a handler may rely on: one registered handler receives events from one
+	// goroutine and never concurrently, which is what lets the progress bar keep its total
+	// count without a lock.
+	root := t.TempDir()
+	const total = 8
+
+	items := make([]Item, 0, total)
+	fixtures := make([]*fixtureItem, 0, total)
+	for index := 0; index < total; index++ {
+		name := fmt.Sprintf("%02d.txt", index)
+		source := writeSourceFile(t, root, name, []byte(name))
+		item := newFixtureItem(source, filepath.Join(root, "target", name))
+		items = append(items, item)
+		fixtures = append(fixtures, item)
+	}
+
+	var (
+		inFlight  int32
+		seen      int
+		goroutine string
+	)
+	handler := func(Event) {
+		if !atomic.CompareAndSwapInt32(&inFlight, 0, 1) {
+			t.Error("the event handler was called concurrently")
+		}
+		// Unguarded handler state is the point: the contract is one event at a time.
+		seen++
+		if id := currentGoroutineID(); goroutine == "" {
+			goroutine = id
+		} else if id != goroutine {
+			t.Errorf("the event handler ran on goroutine %s, want %s", id, goroutine)
+		}
+		atomic.StoreInt32(&inFlight, 0)
+	}
+
+	if err := runFixture(
+		context.Background(),
+		newStreamFixture(fixtures...),
+		items,
+		WithHashPolicy(HashRead),
+		WithEventHandler(handler),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if seen == 0 {
+		t.Fatal("the event handler received no event")
+	}
+}
+
 func TestRunAppliesBoundedBackpressure(t *testing.T) {
 	root := t.TempDir()
 	input := writeSourceFile(t, root, "source.txt", nil)
@@ -869,160 +1088,178 @@ func TestRunAppliesBoundedBackpressure(t *testing.T) {
 		readBuffer  = 8
 		consumedMax = total / 2
 	)
-	var consumed int64
-	source := &boundedItemSource{
-		input: input, target: filepath.Join(root, "target"), total: total, consumed: &consumed,
+
+	var consumed, produced, maximum int64
+	items := make([]*fixtureItem, 0, total)
+	for index := int64(0); index < total; index++ {
+		item := newFixtureItem(input, filepath.Join(root, "target", fmt.Sprintf("%04d", index)))
+		item.hook = func(*Result, error) { atomic.AddInt64(&consumed, 1) }
+		items = append(items, item)
 	}
 
-	// A bounded read buffer must stop the source from producing the whole input up front.
-	if err := Run(
+	// A bounded read buffer must stop the producer from submitting the whole input up front.
+	stream, err := NewStream(
 		context.Background(),
-		source,
+		newStreamFixture(items...).onResults,
 		WithReadBuffer(readBuffer),
+		WithResultBuffer(1), WithResultBatch(1),
 		SetToDevice(LinearDevice(true)),
-	); err != nil {
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for _, item := range items {
+			if err := stream.Submit(item); err != nil {
+				break
+			}
+
+			id := atomic.AddInt64(&produced, 1)
+			outstanding := id - atomic.LoadInt64(&consumed)
+			for {
+				previous := atomic.LoadInt64(&maximum)
+				if outstanding <= previous || atomic.CompareAndSwapInt64(&maximum, previous, outstanding) {
+					break
+				}
+			}
+		}
+		_ = stream.Close()
+	}()
+
+	// The producer owns the feed, so it closes the stream before the run can be waited for.
+	<-done
+	if err := stream.Wait(); err != nil {
 		t.Fatal(err)
 	}
 	if got := atomic.LoadInt64(&consumed); got != total {
 		t.Fatalf("consumed %d items, want %d", got, total)
 	}
-	if maximum := atomic.LoadInt64(&source.maximum); maximum >= consumedMax {
-		t.Fatalf("maximum outstanding items = %d, want less than %d", maximum, consumedMax)
+	if got := atomic.LoadInt64(&maximum); got >= consumedMax {
+		t.Fatalf("maximum outstanding items = %d, want less than %d", got, consumedMax)
 	}
-}
-
-// boundedItemSource produces one item per call and records how far production ran ahead of
-// the terminal callbacks.
-type boundedItemSource struct {
-	input    string
-	target   string
-	total    int64
-	consumed *int64
-	maximum  int64
-	produced int64
-}
-
-func (s *boundedItemSource) Next(context.Context) ([]Item, error) {
-	id := atomic.AddInt64(&s.produced, 1)
-	if id > s.total {
-		return nil, io.EOF
-	}
-
-	outstanding := id - atomic.LoadInt64(s.consumed)
-	for {
-		maximum := atomic.LoadInt64(&s.maximum)
-		if outstanding <= maximum || atomic.CompareAndSwapInt64(&s.maximum, maximum, outstanding) {
-			break
-		}
-	}
-
-	item := newFixtureItem(s.input, filepath.Join(s.target, fmt.Sprintf("%04d", id)))
-	item.hook = func(*Result, error) { atomic.AddInt64(s.consumed, 1) }
-	return []Item{item}, nil
 }
 
 func TestRunStopsFeedingItemsAfterGracefulStop(t *testing.T) {
-	// Let the source block on its next batch after producing one copy item.
+	// The first delivered result stops the caller's feed, and the feed learns it from Submit.
 	root := t.TempDir()
 	input := writeSourceFile(t, root, "source.txt", []byte("fixture"))
 	item := newFixtureItem(input, filepath.Join(root, "target.txt"))
-	source := &blockingSource{batch: []Item{item}}
+	fixture := newStreamFixture(item)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// The first completed item stops the pipeline while the source waits for work.
-	item.hook = func(*Result, error) { cancel() }
+
+	stream, err := NewStream(ctx, fixture.onResults, WithResultBuffer(1), WithResultBatch(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.hook = cancelOnFirstResult(cancel)
 
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(ctx, source)
+		if err := stream.Submit(item); err != nil {
+			done <- err
+			return
+		}
+
+		<-ctx.Done()
+		done <- stream.Submit(newFixtureItem(input, filepath.Join(root, "other.txt")))
 	}()
 	select {
 	case err := <-done:
 		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("Run() error = %v, want %v", err, context.Canceled)
+			t.Fatalf("Submit() error = %v, want %v", err, context.Canceled)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not release the batch source after the caller cancelled")
+		t.Fatal("the run did not release the feed after the caller cancelled")
 	}
-	if calls := source.calls(); calls != 2 {
-		t.Fatalf("source calls = %d, want 2", calls)
+
+	_ = stream.Close()
+	if err := stream.Wait(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait() error = %v, want %v", err, context.Canceled)
 	}
 	if _, err := item.terminal(t); err != nil {
 		t.Fatalf("item failed: %v", err)
 	}
 }
 
-func TestRunReturnsStoppingErrorWhenBatchSourceEndsFirst(t *testing.T) {
-	// A source that ends its input after the caller cancels must not hide the stop.
+func TestRunDoesNotReportAStopAfterACompleteRun(t *testing.T) {
+	// A context canceled after the feed ended and the pipeline drained is not a run error: the
+	// stop must be something the run actually observed.
 	root := t.TempDir()
 	input := writeSourceFile(t, root, "source.txt", []byte("fixture"))
 	item := newFixtureItem(input, filepath.Join(root, "target.txt"))
-	source := &blockingSource{batch: []Item{item}, endErr: io.EOF}
+	fixture := newStreamFixture(item)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	done := make(chan error, 1)
-	go func() {
-		done <- Run(ctx, source, WithEventHandler(cancelOnFirstCopy(cancel)))
-	}()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("Run() error = %v, want %v", err, context.Canceled)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not stop after the caller cancelled")
+	fixture.hook = func([]Result) error {
+		cancel()
+		return nil
 	}
-	if calls := source.calls(); calls != 2 {
-		t.Fatalf("source calls = %d, want 2", calls)
+
+	if err := runFixture(ctx, fixture, []Item{item}, WithResultBuffer(1), WithResultBatch(1)); err != nil {
+		t.Fatalf("run error = %v, want nil after a complete run", err)
+	}
+	if _, err := item.terminal(t); err != nil {
+		t.Fatalf("item failed: %v", err)
 	}
 }
 
 func TestRunCancellationDrainsPrefetchedItems(t *testing.T) {
-	// Feed work until preparation starts so cancellation occurs with an active pipeline.
+	// Feed work until the pipeline is busy, so cancellation occurs with an active pipeline.
 	root := t.TempDir()
 	input := writeSourceFile(t, root, "source.txt", []byte("fixture"))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	source := &endlessSource{input: input, target: filepath.Join(root, "target")}
-	cancelWhenPreparing := func(event Event) {
-		update, ok := event.(*EventUpdateJob)
-		if !ok || update.Job.Status != JobStatusPreparing {
-			return
-		}
-		cancel()
+	var (
+		lock     sync.Mutex
+		produced []*fixtureItem
+	)
+	fixture := newStreamFixture()
+	stream, err := NewStream(ctx, fixture.onResults, SetToDevice(LinearDevice(true)), WithResultBuffer(1), WithResultBatch(1))
+	if err != nil {
+		t.Fatal(err)
 	}
+	fixture.hook = cancelOnFirstResult(cancel)
 
-	// The canceled pipeline must drain its queues and return the context error.
-	done := make(chan error, 1)
+	// The producer stops at the feed checkpoint, exactly like a caller that watches the run.
+	done := make(chan struct{})
 	go func() {
-		done <- Run(
-			ctx,
-			source,
-			SetToDevice(LinearDevice(true)),
-			WithEventHandler(cancelWhenPreparing),
-		)
+		defer close(done)
+		for index := 0; ; index++ {
+			item := newFixtureItem(input, filepath.Join(root, "target", fmt.Sprintf("%04d", index)))
+			if err := stream.Submit(item); err != nil {
+				return
+			}
+
+			lock.Lock()
+			produced = append(produced, item)
+			lock.Unlock()
+			fixture.add(item)
+		}
 	}()
 	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("Run() error = %v, want %v", err, context.Canceled)
-		}
+	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return after cancellation")
+		t.Fatal("the feed did not stop after cancellation")
 	}
+	_ = stream.Close()
 
-	// Every produced item must still report exactly one terminal outcome.
-	items := source.items()
+	// Every produced item must report exactly one outcome.
+	lock.Lock()
+	items := append([]*fixtureItem(nil), produced...)
+	lock.Unlock()
 	if len(items) == 0 {
-		t.Fatal("the source produced no items")
+		t.Fatal("the feed produced no items")
 	}
 	for _, item := range items {
 		if got := item.callbackCount(); got != 1 {
-			t.Fatalf("item %q received %d callbacks, want 1", item.source, got)
+			t.Fatalf("item %q received %d outcomes, want 1", item.source, got)
 		}
 	}
 }
@@ -1037,4 +1274,142 @@ func currentGoroutineID() string {
 		return ""
 	}
 	return fields[1]
+}
+
+// lockedBuffer collects log output from several goroutines.
+type lockedBuffer struct {
+	lock sync.Mutex
+	buf  bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(data []byte) (int, error) {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	return b.buf.Write(data)
+}
+
+func (b *lockedBuffer) String() string {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	return b.buf.String()
+}
+
+// captureLogs redirects the standard logger into the returned buffer.
+func captureLogs(t *testing.T) *lockedBuffer {
+	t.Helper()
+
+	logs := new(lockedBuffer)
+	previous := logrus.StandardLogger().Out
+	logrus.SetOutput(logs)
+	t.Cleanup(func() { logrus.SetOutput(previous) })
+	return logs
+}
+
+func TestRunReturnsErrorWhenTheResultsCallbackPanics(t *testing.T) {
+	// A panic in caller-owned callback code must become a run error instead of unwinding the
+	// reporting goroutine, which would silently drop the accounting of every other item.
+	tests := []struct {
+		name string
+		// broken marks the panicking item as one ACP cannot process, so its failure is the
+		// result that panics.
+		broken bool
+	}{
+		{name: "completed item"},
+		{name: "failed item", broken: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			logs := captureLogs(t)
+			root := t.TempDir()
+			const total = 4
+
+			items := make([]Item, 0, total)
+			all := make([]*fixtureItem, 0, total)
+			fixtures := make([]*fixtureItem, 0, total)
+			var panicking *fixtureItem
+			for index := 0; index < total; index++ {
+				name := fmt.Sprintf("%02d.txt", index)
+				source := writeSourceFile(t, root, name, []byte(name))
+				if test.broken && index == 1 {
+					source = filepath.Join(root, "removed.txt")
+				}
+				item := newFixtureItem(source, filepath.Join(root, "target", name))
+				if index == 1 {
+					panicking = item
+				} else {
+					fixtures = append(fixtures, item)
+				}
+				all = append(all, item)
+				items = append(items, item)
+			}
+
+			fixture := newStreamFixture(all...)
+			fixture.hook = func(results []Result) error {
+				for _, result := range results {
+					if result.Job == Item(panicking) {
+						panic("callback fixture")
+					}
+				}
+				return nil
+			}
+
+			// One result per batch, so a panicking callback only loses the item it panicked on.
+			err := runFixture(context.Background(), fixture, items, WithResultBuffer(1), WithResultBatch(1))
+			if err == nil {
+				t.Fatal("run error = nil, want the callback panic reported")
+			}
+			if !strings.Contains(err.Error(), "callback fixture") {
+				t.Fatalf("run error = %v, want the panicking callback", err)
+			}
+
+			// The panic must not take the accounting of the other items with it.
+			for _, item := range fixtures {
+				item.terminal(t)
+			}
+			if panicking.callbackCount() != 0 {
+				t.Fatalf("panicking item recorded %d outcomes, want none", panicking.callbackCount())
+			}
+			if strings.Contains(logs.String(), "send on closed channel") {
+				t.Fatalf("the pipeline published on a closed channel:\n%s", logs.String())
+			}
+		})
+	}
+}
+
+func TestRunReturnsErrorWhenAnEventHandlerPanics(t *testing.T) {
+	logs := captureLogs(t)
+	root := t.TempDir()
+	const total = 4
+
+	items := make([]Item, 0, total)
+	fixtures := make([]*fixtureItem, 0, total)
+	for index := 0; index < total; index++ {
+		name := fmt.Sprintf("%02d.txt", index)
+		source := writeSourceFile(t, root, name, []byte(name))
+		item := newFixtureItem(source, filepath.Join(root, "target", name))
+		items = append(items, item)
+		fixtures = append(fixtures, item)
+	}
+
+	// A broken handler must fail the run and must not stop the remaining items.
+	handler := func(event Event) {
+		if _, ok := event.(*EventUpdateCount); ok {
+			panic("handler fixture")
+		}
+	}
+	err := runFixture(context.Background(), newStreamFixture(fixtures...), items, WithEventHandler(handler))
+	if err == nil {
+		t.Fatal("run error = nil, want the handler panic reported")
+	}
+	if !strings.Contains(err.Error(), "handler fixture") {
+		t.Fatalf("run error = %v, want the panicking handler", err)
+	}
+
+	// Every item still reports exactly one outcome.
+	for _, item := range fixtures {
+		item.terminal(t)
+	}
+	if strings.Contains(logs.String(), "send on closed channel") {
+		t.Fatalf("the pipeline published on a closed channel:\n%s", logs.String())
+	}
 }

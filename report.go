@@ -1,12 +1,9 @@
 package acp
 
 import (
-	"errors"
+	"encoding/json"
+	"path"
 	"sync"
-	"unsafe"
-
-	jsoniter "github.com/json-iterator/go"
-	"github.com/modern-go/reflect2"
 )
 
 type ReportGetter func() *Report
@@ -22,7 +19,7 @@ func NewReportGetter() (EventHandler, ReportGetter) {
 			lock.Lock()
 			defer lock.Unlock()
 
-			key := e.Job.Path
+			key := path.Join(e.Job.Path...)
 			jobs[key] = e.Job
 		case *EventReportError:
 			lock.Lock()
@@ -40,7 +37,7 @@ func NewReportGetter() (EventHandler, ReportGetter) {
 			jobsCopyed = append(jobsCopyed, j)
 		}
 
-		errorsCopyed := make([]*Error, 0, len(jobs))
+		errorsCopyed := make([]*Error, 0, len(errors))
 		errorsCopyed = append(errorsCopyed, errors...)
 
 		return &Report{
@@ -51,77 +48,22 @@ func NewReportGetter() (EventHandler, ReportGetter) {
 	return handler, getter
 }
 
+// Report is the JSON document of one run: one row per accepted item plus the pipeline-level
+// errors. The standard library encodes and decodes it as-is, so a consumer needs no ACP coder
+// to read what ACP wrote.
 type Report struct {
 	Jobs   []*Job   `json:"files,omitempty"`
 	Errors []*Error `json:"errors,omitempty"`
 }
 
+// ToJSONString renders the report. Indentation is two spaces, because a JSON encoder accepts
+// nothing else and a report writer must never panic while it is producing a document.
 func (r *Report) ToJSONString(indent bool) string {
 	if indent {
-		buf, _ := reportJSON.MarshalIndent(r, "", "\t")
+		buf, _ := json.MarshalIndent(r, "", "  ")
 		return string(buf)
 	}
 
-	buf, _ := reportJSON.Marshal(r)
+	buf, _ := json.Marshal(r)
 	return string(buf)
-}
-
-var (
-	reportJSON jsoniter.API
-)
-
-type errValCoder struct{}
-
-func (*errValCoder) IsEmpty(ptr unsafe.Pointer) bool {
-	val := (*error)(ptr)
-	return val == nil || *val == nil || reflect2.IsNil(*val)
-}
-
-func (*errValCoder) Encode(ptr unsafe.Pointer, stream *jsoniter.Stream) {
-	val := (*error)(ptr)
-	if val == nil || *val == nil || reflect2.IsNil(*val) {
-		stream.WriteNil()
-		return
-	}
-
-	stream.WriteString((*val).Error())
-}
-
-func (*errValCoder) Decode(ptr unsafe.Pointer, iter *jsoniter.Iterator) {
-	val := (*error)(ptr)
-	*val = errors.New(iter.ReadString())
-}
-
-var (
-	errorType2 reflect2.Type
-)
-
-type reportJSONExtension struct {
-	jsoniter.DummyExtension
-}
-
-func (*reportJSONExtension) CreateDecoder(typ reflect2.Type) jsoniter.ValDecoder {
-	if typ == errorType2 {
-		return &errValCoder{}
-	}
-	return nil
-}
-
-func (*reportJSONExtension) CreateEncoder(typ reflect2.Type) jsoniter.ValEncoder {
-	if typ == errorType2 {
-		return &errValCoder{}
-	}
-	return nil
-}
-
-func init() {
-	reportJSON = jsoniter.Config{
-		EscapeHTML:             true,
-		SortMapKeys:            true,
-		ValidateJsonRawMessage: true,
-	}.Froze()
-
-	var emptyErr error
-	errorType2 = reflect2.TypeOfPtr(&emptyErr).Elem()
-	reportJSON.RegisterExtension(&reportJSONExtension{})
 }

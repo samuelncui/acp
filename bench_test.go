@@ -2,35 +2,46 @@ package acp
 
 import (
 	"context"
-	"io"
 	"os"
 	"path/filepath"
 	"testing"
 )
 
-// benchSource supplies one targetless item, which is the shape a hash-only run uses.
-type benchSource struct {
-	path string
-	done bool
-}
-
-func (s *benchSource) Next(context.Context) ([]Item, error) {
-	if s.done {
-		return nil, io.EOF
-	}
-	s.done = true
-	return []Item{&benchItem{source: s}}, nil
-}
-
+// benchItem is the benchmark's caller-owned item: one source and no target, which is the shape a
+// hash-only run uses. The push engine reads it once per submission.
 type benchItem struct {
-	source   *benchSource
+	path     string
 	failures int
 }
 
-func (i *benchItem) Source() string    { return i.source.path }
+func (i *benchItem) Source() string    { return i.path }
 func (i *benchItem) Targets() []string { return nil }
-func (i *benchItem) Completed(*Result) {}
-func (i *benchItem) Failed(error)      { i.failures++ }
+
+// Failed records one item the run could not process. It is a benchmark helper, not part of Item.
+func (i *benchItem) Failed(error) { i.failures++ }
+
+// benchHash hashes one source through a push run and fails the benchmark when the run reported a
+// failure, so a broken measurement never looks like a fast one.
+func benchHash(b *testing.B, path string, opts ...Option) {
+	b.Helper()
+
+	item := &benchItem{path: path}
+	onResults := func(results []Result) error {
+		for _, result := range results {
+			if result.Err != nil {
+				item.Failed(result.Err)
+			}
+		}
+		return nil
+	}
+
+	if err := runStream(context.Background(), onResults, []Item{item}, opts...); err != nil {
+		b.Fatal(err)
+	}
+	if item.failures != 0 {
+		b.Fatalf("hash-only run failed %d items", item.failures)
+	}
+}
 
 func benchFile(b *testing.B, size int64) string {
 	b.Helper()
@@ -65,10 +76,7 @@ func BenchmarkReadBuffered(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		source := &benchSource{path: path}
-		if err := Run(context.Background(), source, WithHashPolicy(HashRead), SetFromDevice(WithReadMode(ReadBuffered))); err != nil {
-			b.Fatal(err)
-		}
+		benchHash(b, path, WithHashPolicy(HashRead), SetFromDevice(WithReadMode(ReadBuffered)))
 	}
 }
 
@@ -78,10 +86,7 @@ func BenchmarkReadMapped(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		source := &benchSource{path: path}
-		if err := Run(context.Background(), source, WithHashPolicy(HashRead), SetFromDevice(WithReadMode(ReadMapped))); err != nil {
-			b.Fatal(err)
-		}
+		benchHash(b, path, WithHashPolicy(HashRead), SetFromDevice(WithReadMode(ReadMapped)))
 	}
 }
 
@@ -92,15 +97,11 @@ func BenchmarkReadMapped(b *testing.B) {
 func BenchmarkRefreshSignatureUnchanged(b *testing.B) {
 	path := benchFile(b, 4096)
 	// Seed the cache once so the measured runs compare against a stored value.
-	if err := Run(context.Background(), &benchSource{path: path}, WithHashPolicy(HashReadRefresh)); err != nil {
-		b.Fatal(err)
-	}
+	benchHash(b, path, WithHashPolicy(HashReadRefresh))
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		if err := Run(context.Background(), &benchSource{path: path}, WithHashPolicy(HashReadRefresh)); err != nil {
-			b.Fatal(err)
-		}
+		benchHash(b, path, WithHashPolicy(HashReadRefresh))
 	}
 }
 
@@ -117,8 +118,6 @@ func BenchmarkRefreshSignatureChanged(b *testing.B) {
 		if err := os.Chtimes(path, info.ModTime(), info.ModTime().Add(1)); err != nil {
 			b.Fatal(err)
 		}
-		if err := Run(context.Background(), &benchSource{path: path}, WithHashPolicy(HashReadRefresh)); err != nil {
-			b.Fatal(err)
-		}
+		benchHash(b, path, WithHashPolicy(HashReadRefresh))
 	}
 }

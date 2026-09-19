@@ -32,24 +32,32 @@ const debug = false
 // not safe to call Close and reading methods concurrently.
 type ReaderAt struct {
 	data []byte
+	file *os.File
 }
 
-// Close closes the reader.
+// Close releases the mapping and then the descriptor it was created from. It is idempotent: a
+// second call releases nothing, and an empty mapping still closes the descriptor it retains.
 func (r *ReaderAt) Close() error {
-	if r.data == nil {
-		return nil
-	}
 	data := r.data
+	file := r.file
 	r.data = nil
-	if debug {
-		var p *byte
-		if len(data) != 0 {
-			p = &data[0]
-		}
-		println("munmap", r, p)
-	}
+	r.file = nil
+
+	// Take the finalizer out of the picture before releasing either resource, so a later
+	// collection can only ever repeat this no-op.
 	runtime.SetFinalizer(r, nil)
-	return syscall.Munmap(data)
+
+	var unmapErr error
+	if len(data) != 0 {
+		if debug {
+			println("munmap", r, &data[0])
+		}
+		unmapErr = syscall.Munmap(data)
+	}
+	if file == nil {
+		return unmapErr
+	}
+	return errors.Join(unmapErr, file.Close())
 }
 
 // Len returns the length of the underlying memory-mapped file.
@@ -88,42 +96,49 @@ func (r *ReaderAt) Slice(off, limit int64) ([]byte, error) {
 		return nil, fmt.Errorf("mmap: invalid ReadAt offset %d", off)
 	}
 
-	if off+limit > l {
+	// Compare against the remaining length instead of off+limit: a large limit would wrap
+	// around and turn this bounds check into a slice-out-of-range panic.
+	if limit > l-off {
 		return r.data[off:], nil
 	}
 
 	return r.data[off : off+limit], nil
 }
 
-// Open memory-maps the named file for reading.
+// Open memory-maps the named file for reading. The reader owns the descriptor it opened: Close
+// removes the mapping and then closes that descriptor.
 func Open(filename string) (*ReaderAt, error) {
 	f, err := os.Open(filename)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil {
+		_ = f.Close()
 		return nil, err
 	}
 
 	size := fi.Size()
-	if size == 0 {
-		return &ReaderAt{}, nil
-	}
 	if size < 0 {
+		_ = f.Close()
 		return nil, fmt.Errorf("mmap: file %q has negative size", filename)
 	}
 	if size != int64(int(size)) {
+		_ = f.Close()
 		return nil, fmt.Errorf("mmap: file %q is too large", filename)
 	}
 
-	data, err := syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
-	if err != nil {
-		return nil, fmt.Errorf("create mmap fail, %q, %w", filename, err)
+	// An empty file has no mapping, but it still has the descriptor this reader owns.
+	var data []byte
+	if size != 0 {
+		data, err = syscall.Mmap(int(f.Fd()), 0, int(size), syscall.PROT_READ, syscall.MAP_SHARED)
+		if err != nil {
+			_ = f.Close()
+			return nil, fmt.Errorf("create mmap fail, %q, %w", filename, err)
+		}
 	}
 
-	r := &ReaderAt{data}
+	r := &ReaderAt{data: data, file: f}
 	if debug {
 		var p *byte
 		if len(data) != 0 {

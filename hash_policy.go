@@ -2,21 +2,30 @@ package acp
 
 import "fmt"
 
-// HashPolicy selects how an item's content hash is produced and how the stored hash
-// cache is used. Hashing and the cache are one policy, because refreshing the cache
-// requires a computed hash: a miss under a refresh-enabled value must read.
+// HashPolicy selects how an item's content hash is produced and how the stored hash cache is
+// used. Hashing and the cache are one policy, because refreshing the cache requires a
+// computed hash: a miss under a refresh-enabled value must read.
+//
+// A targetless item may reuse a stored hash, because it records content facts without writing
+// the content anywhere. A transfer always reads its source and produces a computed hash, so
+// the two reuse-only values are rejected for an item that requests targets.
 type HashPolicy uint8
 
 const (
 	// HashOff produces no hash and leaves the cache untouched.
 	HashOff HashPolicy = iota
-	// HashCachedOnly reuses a stored hash; a miss leaves the item without one.
+	// HashCachedOnly reuses a stored hash for a targetless item; a miss leaves the item
+	// without a hash. Rejected for an item with targets.
 	HashCachedOnly
-	// HashCachedOrRead reuses a stored hash; a miss reads and hashes without refreshing.
+	// HashCachedOrRead reuses a stored hash for a targetless item; a miss reads and hashes
+	// without refreshing. Rejected for an item with targets, because a copy always reads and
+	// a reused hash would then describe content the transfer never computed.
 	HashCachedOrRead
-	// HashCachedOrReadRefresh reuses a stored hash; a miss reads, hashes and refreshes.
+	// HashCachedOrReadRefresh reuses a stored hash for a targetless item; a miss reads,
+	// hashes and refreshes. A transfer always reads, hashes and refreshes.
 	HashCachedOrReadRefresh
-	// HashRead always reads and hashes; the cache is not refreshed.
+	// HashRead always reads and hashes; the cache is not refreshed. A targetless item
+	// ignores its stored hash, and a transfer hashes the content it copies.
 	HashRead
 	// HashReadRefresh always reads and hashes, and refreshes the cache.
 	HashReadRefresh
@@ -43,6 +52,17 @@ func (p HashPolicy) String() string {
 // valid reports whether the value is one of the defined policies.
 func (p HashPolicy) valid() bool {
 	return p <= HashReadRefresh
+}
+
+// appliesToTransfer reports whether the policy can describe an item that requests a target. A
+// transfer always reads its source and produces a computed hash, so a value that promises a
+// stored hash where a transfer cannot use one is rejected instead of silently reading.
+func (p HashPolicy) appliesToTransfer() bool {
+	switch p {
+	case HashCachedOnly, HashCachedOrRead:
+		return false
+	}
+	return true
 }
 
 // readsContent reports whether the policy needs the source content.

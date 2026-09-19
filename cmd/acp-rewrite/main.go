@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"io/fs"
 	"math/rand"
 	"os"
@@ -88,7 +87,12 @@ func main() {
 		state = &rewriteState{Root: rootAbs}
 	}
 
-	reportJobs, reportErrors := loadReport(*reportPath)
+	reportJobs, reportErrors, err := loadReport(*reportPath)
+	if err != nil {
+		// A report that cannot be read must never be replaced by an empty one: the accumulated
+		// history of previous runs would be lost silently.
+		logrus.Fatalf("load report fail, %s", err)
+	}
 
 	if len(state.TmpFiles) > 0 {
 		if err := cleanupTmpFiles(state); err != nil {
@@ -360,36 +364,6 @@ func newTmpPath(path string, rnd *rand.Rand) (string, error) {
 	return "", fmt.Errorf("tmp path collide")
 }
 
-// rewriteSource supplies one file as the only item of a rewrite run.
-type rewriteSource struct {
-	source string
-	target string
-
-	done bool
-}
-
-func (s *rewriteSource) Next(ctx context.Context) ([]acp.Item, error) {
-	if s.done {
-		return nil, io.EOF
-	}
-	s.done = true
-
-	return []acp.Item{&rewriteItem{source: s.source, target: s.target}}, nil
-}
-
-// rewriteItem carries one file through the copy pipeline. The rewrite state and the
-// report come from events and the rewritten file, so the terminal callbacks record
-// nothing here.
-type rewriteItem struct {
-	source string
-	target string
-}
-
-func (i *rewriteItem) Source() string        { return i.source }
-func (i *rewriteItem) Targets() []string     { return []string{i.target} }
-func (i *rewriteItem) Completed(*acp.Result) {}
-func (i *rewriteItem) Failed(error)          {}
-
 func rewriteFile(ctx context.Context, entry rewriteEntry, tmpPath string) (*acp.Report, error) {
 	stat, err := os.Stat(entry.Path)
 	if err != nil {
@@ -399,16 +373,19 @@ func rewriteFile(ctx context.Context, entry rewriteEntry, tmpPath string) (*acp.
 		return nil, nil
 	}
 
+	handler, getter := acp.NewReportGetter()
 	opts := []acp.Option{
+		acp.AccurateJob(entry.Path, []string{tmpPath}),
 		acp.WithHashPolicy(acp.HashRead),
-		acp.SetToDevice(acp.Overwrite(true)),
+		acp.Overwrite(true),
+		acp.WithEventHandler(handler),
 	}
 
-	handler, getter := acp.NewReportGetter()
-	opts = append(opts, acp.WithEventHandler(handler))
-
-	items := &rewriteSource{source: entry.Path, target: tmpPath}
-	if err := acp.Run(ctx, items, opts...); err != nil {
+	copyer, err := acp.New(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if err := copyer.WaitErr(); err != nil {
 		return nil, err
 	}
 
@@ -440,7 +417,25 @@ func rewriteFile(ctx context.Context, entry rewriteEntry, tmpPath string) (*acp.
 		}
 	}
 
+	// The scratch file is gone once the rewrite is committed, so the row reports the final
+	// path: a report names the file the run produced, not the temporary it was built in.
+	reportFinalTarget(job, tmpPath, entry.Path)
+
 	return report, nil
+}
+
+// reportFinalTarget replaces the scratch path of one rewrite report row with the final path.
+func reportFinalTarget(job *acp.Job, tmpPath, finalPath string) {
+	for index, target := range job.SuccessTargets {
+		if target != tmpPath {
+			continue
+		}
+
+		targets := append([]string(nil), job.SuccessTargets...)
+		targets[index] = finalPath
+		job.SuccessTargets = targets
+		return
+	}
 }
 
 func relink(entry rewriteEntry) error {
@@ -562,29 +557,35 @@ func findJob(report *acp.Report, filePath string) (*acp.Job, bool) {
 	return nil, false
 }
 
-func loadReport(path string) (map[string]*acp.Job, []*acp.Error) {
+// loadReport reads the report accumulated by previous runs. A report that exists but cannot
+// be decoded is an error: starting over with an empty history would drop every row the
+// earlier runs recorded.
+func loadReport(path string) (map[string]*acp.Job, []*acp.Error, error) {
 	jobs := make(map[string]*acp.Job, 128)
 	errors := make([]*acp.Error, 0)
 	if path == "" {
-		return jobs, errors
+		return jobs, errors, nil
 	}
 	if _, err := os.Stat(path); err != nil {
-		return jobs, errors
+		if os.IsNotExist(err) {
+			return jobs, errors, nil
+		}
+		return nil, nil, err
 	}
 
 	f, err := os.Open(path)
 	if err != nil {
-		return jobs, errors
+		return nil, nil, err
 	}
 	defer f.Close()
 
 	var report acp.Report
 	if err := json.NewDecoder(f).Decode(&report); err != nil {
-		return jobs, errors
+		return nil, nil, fmt.Errorf("decode report fail, path= %q, %w", path, err)
 	}
 
 	mergeReport(jobs, &errors, &report)
-	return jobs, errors
+	return jobs, errors, nil
 }
 
 func mergeReport(jobs map[string]*acp.Job, errors *[]*acp.Error, report *acp.Report) {
@@ -599,32 +600,50 @@ func mergeReport(jobs map[string]*acp.Job, errors *[]*acp.Error, report *acp.Rep
 	}
 }
 
+// saveReport writes the accumulated report. Rows are ordered by path, so two runs of the same
+// work produce the same document, and the file is replaced atomically: a crash mid-write leaves
+// the previous report readable instead of a document the next run refuses to decode.
 func saveReport(path string, indent bool, jobs map[string]*acp.Job, errors []*acp.Error) error {
 	if path == "" {
 		return nil
 	}
+
+	names := make([]string, 0, len(jobs))
+	for name := range jobs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
 	report := &acp.Report{
 		Jobs:   make([]*acp.Job, 0, len(jobs)),
 		Errors: errors,
 	}
-	for _, job := range jobs {
-		report.Jobs = append(report.Jobs, job)
+	for _, name := range names {
+		report.Jobs = append(report.Jobs, jobs[name])
 	}
 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	f, err := os.Create(path)
+
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 
 	enc := json.NewEncoder(f)
 	if indent {
 		enc.SetIndent("", "\t")
 	}
-	return enc.Encode(report)
+	if err := enc.Encode(report); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func printDuplicates(jobs map[string]*acp.Job) {

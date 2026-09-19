@@ -14,7 +14,7 @@ import (
 
 	mapset "github.com/deckarep/golang-set/v2"
 	sha256 "github.com/minio/sha256-simd"
-	"github.com/samber/lo"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -61,14 +61,18 @@ func (c *chunkBuffer) release() {
 	}
 }
 
-func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *baseJob {
+func (c *StreamCopyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *baseJob {
+	// Every wait and handoff in this stage runs on a context that never cancels, so a stop
+	// can never interrupt an item in flight.
+	drained := context.WithoutCancel(ctx)
+
 	ch := make(chan *baseJob, 128)
 
 	var copying sync.WaitGroup
 	done := make(chan struct{})
 	var reporting sync.WaitGroup
 	defer func() {
-		go wrap(ctx, func() {
+		go c.wrap(drained, func() {
 			copying.Wait()
 			close(done)
 			reporting.Wait()
@@ -78,7 +82,7 @@ func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *ba
 
 	cntr := new(counter)
 	reporting.Add(1)
-	go wrap(ctx, func() {
+	go c.wrap(drained, func() {
 		defer reporting.Done()
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
@@ -96,23 +100,23 @@ func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *ba
 	noSpaceDevices := mapset.NewSet[string]()
 	for idx := 0; idx < c.toDevice.threads; idx++ {
 		copying.Add(1)
-		go wrap(ctx, func() {
+		go c.wrap(drained, func() {
 			defer copying.Done()
 
-			// Consume prepared readers until the stage closes, so a stopped pipeline
-			// still reports the items it holds instead of dropping them. One worker
-			// writes one item at a time: that bounds target concurrency by the device
-			// thread count and keeps a linear target in request order.
+			// Consume prepared readers until the stage closes, so a stopped pipeline still
+			// reports the items it holds instead of dropping them. One worker writes one
+			// item at a time: that bounds target concurrency by the device thread count and
+			// keeps a linear target in request order.
 			for job := range prepared {
-				if c.stopped(ctx) {
+				// An item this stage cannot start is marked and forwarded: the reporting
+				// stage fails it, which keeps exactly one terminal callback per item.
+				if c.markUnstarted(ctx, job.baseJob) {
 					job.finishSource()
-					if !c.abandon(job.baseJob, c.abandonment(ctx)) {
-						return
-					}
+					c.publish(ch, job.baseJob)
 					continue
 				}
 
-				c.write(ctx, job, ch, cntr, noSpaceDevices)
+				c.write(drained, job, ch, cntr, noSpaceDevices)
 			}
 		})
 	}
@@ -120,29 +124,27 @@ func (c *Copyer) copy(ctx context.Context, prepared <-chan *writeJob) <-chan *ba
 	return ch
 }
 
-func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, cntr *counter, noSpaceDevices mapset.Set[string]) {
+func (c *StreamCopyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, cntr *counter, noSpaceDevices mapset.Set[string]) {
 	// Release the source and publish ownership only after every consumer stops. A
 	// graceful stop still reports the item this stage finished.
 	var wg sync.WaitGroup
 	defer func() {
 		wg.Wait()
+
+		// The item publishes its source's computed signature through the descriptor that read the
+		// content, before that descriptor closes and before the result is published.
+		c.refreshCacheEntry(job.source, job.path, job.baseJob)
+
 		job.finishSource()
-		job.setStatus(jobStatusFinishing)
-		select {
-		case ch <- job.baseJob:
-		case <-c.hardStop:
-		}
+		c.publish(ch, job.baseJob)
 	}()
 
-	// Reject source changes before creating any targets. Every requested target is
-	// reported failed, so the item stays a completion with failed outcomes.
-	job.setStatus(jobStatusCopying)
+	// Entering the copy stage records the write time and reports the source facts. A source
+	// that changed since it was indexed is out of scope: this run copies what it reads and
+	// never fails the item for it.
+	job.startWrite()
 	if job.skipContent {
 		atomic.AddInt64(&cntr.files, 1)
-		return
-	}
-	if job.size != job.stat.size {
-		job.failAll(fmt.Errorf("source size changed, indexed=%d current=%d", job.stat.size, job.size))
 		return
 	}
 	if job.cacheHit {
@@ -151,11 +153,21 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 		return
 	}
 
-	// Report every target failed when every requested target device is exhausted.
-	targetDevices := lo.Map(job.targets, func(target string, _ int) string { return c.getDevice(target) })
-	if len(targetDevices) > 0 && noSpaceDevices.Contains(targetDevices...) {
-		job.failAll(ErrTargetNoSpace)
-		return
+	// Report every target failed when every requested target device is exhausted. A target
+	// whose device cannot be resolved is not exhausted; it fails on its own below.
+	if len(job.targets) > 0 {
+		exhausted := true
+		for _, target := range job.targets {
+			dev, err := c.getDevice(target)
+			if err != nil || !noSpaceDevices.Contains(dev) {
+				exhausted = false
+				break
+			}
+		}
+		if exhausted {
+			job.failAll(ErrTargetNoSpace)
+			return
+		}
 	}
 
 	// Track progress and close every consumer after the source reader finishes.
@@ -167,13 +179,27 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 		}
 	}()
 
+	// cacheGate releases the target writers once the item's content hash is complete, so a target
+	// publishes its cache entry through its own descriptor before it finalises. It stays nil when
+	// the policy produces no hash, because then no target has an entry to publish.
+	var cacheGate chan struct{}
+	if c.signatures != nil && c.hashPolicy.refreshesCache() {
+		cacheGate = make(chan struct{})
+	}
+
 	// Open each viable target before reading the source once.
 	var readErr error
 	for _, target := range job.targets {
 		target := target
 
+		// Resolve the device before reserving capacity on it.
+		dev, err := c.getDevice(target)
+		if err != nil {
+			job.fail(target, fmt.Errorf("get target device fail, %w", err))
+			continue
+		}
+
 		// Reject exhausted targets before reserving capacity.
-		dev := c.getDevice(target)
 		if noSpaceDevices.Contains(dev) {
 			job.fail(target, ErrTargetNoSpace)
 			continue
@@ -229,7 +255,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 		chans = append(chans, ch)
 
 		wg.Add(1)
-		go wrap(ctx, func() {
+		go c.wrap(ctx, func() {
 			defer wg.Done()
 
 			// Settle target status and discard any incomplete file before exiting.
@@ -284,6 +310,15 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 					return
 				}
 			}
+
+			// This target's content is complete, but the item's hash is only complete once the
+			// whole source was read. The writer waits for it and publishes the target's cache
+			// entry while it still owns the descriptor it wrote through.
+			if cacheGate != nil {
+				<-cacheGate
+			}
+			c.refreshCacheEntry(file, target, job.baseJob)
+
 			if err := file.Close(); err != nil {
 				file = nil
 				rerr = fmt.Errorf("close dst file fail, %w", err)
@@ -307,7 +342,7 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 		chans = append(chans, ch)
 
 		wg.Add(1)
-		go wrap(ctx, func() {
+		go c.wrap(ctx, func() {
 			defer wg.Done()
 			defer sha256Pool.Put(sha)
 
@@ -319,9 +354,14 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 			// A stopped read describes only part of the source, so it has no content hash.
 			if readErr != nil {
 				job.setHash(nil)
-				return
+			} else {
+				job.setHash(sha.Sum(nil))
 			}
-			job.setHash(sha.Sum(nil))
+
+			// The hash is complete, so the target writers may publish their cache entries.
+			if cacheGate != nil {
+				close(cacheGate)
+			}
 		})
 	}
 
@@ -331,22 +371,24 @@ func (c *Copyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, c
 	}
 	var copied int64
 	copied, readErr = c.streamCopy(chans, job.reader, &cntr.bytes)
-	if readErr == nil && copied != job.size {
-		readErr = fmt.Errorf("source size changed while copying, expected=%d copied=%d", job.size, copied)
+	if readErr == nil {
+		// The item reports what the read produced. A source that changes while a run is in
+		// progress is out of scope, so the read facts replace the indexed ones.
+		job.setSize(copied)
 	}
 	if readErr == nil && c.hashPolicy.producesHash() {
 		job.validateHash()
 	}
 	if readErr != nil && targetWriters == 0 {
 		// An item with no target outcome to report against could not be processed at all.
-		c.reportItemError(job.path, "", readErr)
+		c.logf(logrus.ErrorLevel, "copy failed, source= %q, %v", job.path, readErr)
 		job.itemError = readErr
 	}
 }
 
 // streamCopy reads the source once and hands every chunk to each consumer. A graceful
 // stop finishes the item in flight; only a pipeline failure ends the read early.
-func (c *Copyer) streamCopy(dsts []chan *chunkBuffer, src io.ReadCloser, bytes *int64) (int64, error) {
+func (c *StreamCopyer) streamCopy(dsts []chan *chunkBuffer, src io.ReadCloser, bytes *int64) (int64, error) {
 	var copied int64
 	for {
 		chunk := acquireChunk()
@@ -360,14 +402,29 @@ func (c *Copyer) streamCopy(dsts []chan *chunkBuffer, src io.ReadCloser, bytes *
 		}
 
 		// Every consumer releases its own reference; the producer releases the last one
-		// after the size is captured, because the buffer may be reused immediately.
+		// after the size is captured, because the buffer may be reused immediately. A stage
+		// that stopped consuming after a fatal failure must not leave this handoff blocked,
+		// so the reference the send would have handed over is released instead.
 		chunk.data = chunk.data[:n]
+		stopped := false
 		for _, ch := range dsts {
-			ch <- chunk.retain()
+			receipt := chunk.retain()
+			select {
+			case ch <- receipt:
+			case <-c.hardStop:
+				receipt.release()
+				stopped = true
+			}
+			if stopped {
+				break
+			}
 		}
 		copied += int64(n)
 		atomic.AddInt64(bytes, int64(n))
 		chunk.release()
+		if stopped {
+			return copied, fmt.Errorf("copy stopped by pipeline failure")
+		}
 		if n < batchSize {
 			return copied, nil
 		}

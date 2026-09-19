@@ -22,13 +22,15 @@ func TestRunMapsDeviceFullToTargetNoSpace(t *testing.T) {
 	item := newFixtureItem(input, target)
 
 	// A target failure is an item outcome that keeps the portable no-space sentinel.
-	err := Run(
+	err := runFixture(
 		context.Background(),
-		newSliceSource(item),
-		SetToDevice(Overwrite(true), LinearDevice(true)),
+		newStreamFixture(item),
+		[]Item{item},
+		Overwrite(true),
+		SetToDevice(LinearDevice(true)),
 	)
 	if err != nil {
-		t.Fatalf("Run() error = %v, want nil", err)
+		t.Fatalf("runFixture() error = %v, want nil", err)
 	}
 	result, terminalErr := item.terminal(t)
 	if terminalErr != nil {
@@ -53,11 +55,14 @@ func TestDeviceFullWriteFailureDrainsQueuedBuffers(t *testing.T) {
 	size := int64(batchSize) * 4
 	readErr := errors.New("read failed")
 	item := newFixtureItem(filepath.Join(root, "source"), target)
-	copyer := newTestCopyer(t, SetToDevice(Overwrite(true)))
+	copyer := newTestStream(t, Overwrite(true))
+	// The push engine reports every outcome through the results callback, so the fixture is the
+	// observer of this stage-level run.
+	fixture := newStreamFixture(item)
+	copyer.onResults = fixture.onResults
 	job := newWriteJob(&baseJob{
 		copyer:  copyer,
 		item:    item,
-		src:     &source{base: root, path: "source"},
 		path:    filepath.Join(root, "source"),
 		stat:    &stat{size: size, mode: 0o644},
 		targets: []string{target},

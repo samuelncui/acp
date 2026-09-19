@@ -1,5 +1,8 @@
 package acp
 
+// EventHandler observes the events of one run. ACP calls it from one goroutine per
+// registration and never concurrently, so a handler may keep unguarded state between events;
+// registering the same handler twice gives it two goroutines and is not supported.
 type EventHandler func(Event)
 
 type Event interface {

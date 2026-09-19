@@ -1,13 +1,14 @@
 package acp
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"sync"
 
 	"github.com/samuelncui/acp/mmap"
+	"github.com/sirupsen/logrus"
 )
 
 type prepareResult struct {
@@ -16,7 +17,123 @@ type prepareResult struct {
 	release chan struct{}
 }
 
-func (c *Copyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-chan *writeJob {
+// itemSource is the one descriptor an item owns for its whole lifecycle, together with the reader
+// that delivers its content. The reader is what closes the descriptor: an ordinary file is the
+// reader itself, and a mapping is released before its descriptor closes.
+type itemSource struct {
+	file   *os.File
+	reader io.ReadCloser
+	size   int64
+}
+
+// openSourceContent opens the single descriptor an item owns, together with the reader that
+// delivers its content. It is a variable so a test can observe which descriptor an item's cache
+// read and cache write use.
+var openSourceContent = func(path string, mode ReadMode) (itemSource, error) {
+	// Only a caller that asks for it reads through a mapping, which retains its descriptor.
+	if mode == ReadMapped {
+		readerAt, err := mmap.Open(path)
+		if err != nil {
+			return itemSource{}, fmt.Errorf("open src file by mmap fail, %w", err)
+		}
+
+		return itemSource{
+			file:   readerAt.File(),
+			reader: mmap.NewReader(readerAt),
+			size:   int64(readerAt.Len()),
+		}, nil
+	}
+
+	// Every other source is read buffered, without updating its access time.
+	file, err := openSource(path)
+	if err != nil {
+		return itemSource{}, fmt.Errorf("open src file fail, %w", err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return itemSource{}, fmt.Errorf("get src file stat fail, %w", err)
+	}
+	return itemSource{file: file, reader: file, size: info.Size()}, nil
+}
+
+// prepareItem opens the one descriptor an item owns and reads its stored hash through it. That
+// descriptor serves the whole item: the stored hash is read through it, the content is read
+// through it, and the computed hash is published through it before it closes.
+func (c *StreamCopyer) prepareItem(job *baseJob) *writeJob {
+	// An item needs its source when it writes somewhere or hashes content, and a targetless item
+	// reads its stored hash only where the policy reuses one.
+	needsContent := len(job.targets) > 0 || c.hashPolicy.readsContent()
+	reuses := c.signatures != nil && len(job.targets) == 0 && c.hashPolicy.reusesCache()
+
+	// A policy that neither reads content nor uses the cache completes without a source.
+	if !needsContent && !reuses {
+		return c.noContentJob(job)
+	}
+
+	// Only an item that reads content opens a mapping: a reuse-only item reads a stored hash.
+	mode := c.fromDevice.readMode
+	if !needsContent {
+		mode = ReadBuffered
+	}
+	source, err := openSourceContent(job.path, mode)
+	if err != nil {
+		// A reuse-only item owns its descriptor for the stored hash alone, so a source it cannot
+		// open is a cache miss with a warning instead of an item failure.
+		if reuses {
+			c.signatures.recordFailure(job.path, err)
+			c.signatures.incrementMiss()
+			if !needsContent {
+				return c.noContentJob(job)
+			}
+		}
+
+		// A source that cannot be opened is an item outcome. The marked job travels to the
+		// reporting stage instead of a side channel.
+		c.logf(logrus.ErrorLevel, "prepare source failed, source= %q, %v", job.path, err)
+		job.itemError = err
+		return newWriteJob(job, nil, 0, false)
+	}
+
+	// Enter preparation through the descriptor the item already owns: a stored hash is reused only
+	// where the policy allows it.
+	reused := false
+	if reuses {
+		if hash, ok := c.signatures.lookup(source.file, job.path, job.stat); ok {
+			job.setCachedHash(hash)
+			source.size = job.stat.size
+			reused = true
+		}
+	}
+
+	wj := newWriteJob(job, source.reader, source.size, c.fromDevice.linear)
+	wj.source = source.file
+	if !needsContent && !reused {
+		// An item that reused no stored hash has no hash at all and is not a cache hit. Its
+		// descriptor still closes with the item, which owns it for its whole lifecycle.
+		job.setHash(nil)
+		wj.skipContent = true
+	}
+	return wj
+}
+
+// noContentJob settles an item whose policy needs no source content: the copy stage reports it
+// without reading anything, and it is neither a cache hit nor a hash this run computed.
+func (c *StreamCopyer) noContentJob(job *baseJob) *writeJob {
+	job.setHash(nil)
+	wj := newWriteJob(job, nil, 0, c.fromDevice.linear)
+	wj.skipContent = true
+	return wj
+}
+
+// prepare opens the sources of indexed jobs. It never acts on a stop itself: a job the stop
+// reached before its source opened is marked and forwarded, so the reporting stage fails it
+// instead of dropping it.
+func (c *StreamCopyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-chan *writeJob {
+	// Everything this stage waits on runs on a context that never cancels, so a stop can
+	// never release a reader before its consumer owns it.
+	drained := context.WithoutCancel(ctx)
+
 	// Disable read-ahead when a linear source must wait for each consumer.
 	chanLen := 32
 	if c.fromDevice.linear {
@@ -31,26 +148,15 @@ func (c *Copyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-chan *w
 	// Prepare source readers with the configured source-device concurrency.
 	for idx := 0; idx < c.fromDevice.threads; idx++ {
 		workers.Add(1)
-		go wrap(ctx, func() {
+		go c.wrap(drained, func() {
 			defer workers.Done()
 
-			// Consume indexed jobs until source exhaustion. A stopped pipeline drains
-			// its input without reading it, so no accepted item is dropped.
-			for {
-				job, ok := <-indexed
-				if !ok {
-					return
-				}
-
+			// Consume indexed jobs until source exhaustion. A stopped pipeline drains its
+			// input, so no accepted item is dropped.
+			for job := range indexed {
 				// An item that was already rejected while indexing needs no source.
-				if job.itemError != nil {
-					if !c.abandonUnprepared(ctx, completed, job, job.itemError) {
-						return
-					}
-					continue
-				}
-				if c.stopped(ctx) {
-					if !c.abandonUnprepared(ctx, completed, job, c.abandonment(ctx)) {
+				if c.markUnstarted(ctx, job) {
+					if !c.sendPrepareResult(completed, prepareResult{order: job.order, job: newWriteJob(job, nil, 0, false)}) {
 						return
 					}
 					continue
@@ -61,86 +167,13 @@ func (c *Copyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-chan *w
 					result.release = make(chan struct{})
 				}
 
-				// Enter preparation. A stored hash is read whenever the policy uses the
-				// cache and is reused only where the policy allows it.
-				job.setStatus(jobStatusPreparing)
-				var file io.ReadCloser
-				var size int64
-				reuseEligible := len(job.targets) == 0 && c.hashPolicy.reusesCache()
-				if c.signatures != nil && reuseEligible {
-					if hash, ok := c.signatures.lookup(job.path, job.stat); ok {
-						job.setCachedHash(hash)
-						file = io.NopCloser(bytes.NewReader(nil))
-						size = job.stat.size
-					}
-				}
-
-				// A policy that never reads content completes without opening the source.
-				if file == nil && len(job.targets) == 0 && !c.hashPolicy.readsContent() {
-					// No stored hash was reused here, so the item has no hash and is not
-					// reported as a cache hit.
-					job.setHash(nil)
-					wj := newWriteJob(job, nil, 0, c.fromDevice.linear)
-					wj.skipContent = true
-					result.job = wj
-					if !c.sendPrepareResult(completed, result) {
-						return
-					}
-					if !wj.waitConsumed(ctx) {
-						return
-					}
-					continue
-				}
-
-				// Cache misses and every transfer open the real source content.
-				if file == nil {
-					var err error
-					file, size, err = func(path string) (io.ReadCloser, int64, error) {
-						// Only a caller that asks for it reads through a mapping, with an
-						// empty-file fallback.
-						if c.fromDevice.readMode == ReadMapped {
-							readerAt, err := mmap.Open(path)
-							if err != nil {
-								return nil, 0, fmt.Errorf("open src file by mmap fail, %w", err)
-							}
-							if readerAt.Len() == 0 {
-								if err := readerAt.Close(); err != nil {
-									return nil, 0, fmt.Errorf("close empty src file by mmap fail, %w", err)
-								}
-								return io.NopCloser(bytes.NewReader(nil)), 0, nil
-							}
-
-							return mmap.NewReader(readerAt), int64(readerAt.Len()), nil
-						}
-
-						// Every other source is read buffered, without updating its access time.
-						file, err := openSource(path)
-						if err != nil {
-							return nil, 0, fmt.Errorf("open src file fail, %w", err)
-						}
-						fileInfo, err := file.Stat()
-						if err != nil {
-							_ = file.Close()
-							return nil, 0, fmt.Errorf("get src file stat fail, %w", err)
-						}
-						return file, fileInfo.Size(), nil
-					}(job.path)
-					if err != nil {
-						c.reportItemError(job.path, "", err)
-						if !c.abandonUnprepared(ctx, completed, job, err) {
-							return
-						}
-						continue
-					}
-				}
-
-				// Transfer the prepared reader to the ordering stage before waiting on a linear source.
-				wj := newWriteJob(job, file, size, c.fromDevice.linear)
-				result.job = wj
+				// Transfer the prepared item to the ordering stage before waiting on a linear
+				// source.
+				result.job = c.prepareItem(job)
 				if !c.sendPrepareResult(completed, result) {
 					return
 				}
-				if !wj.waitConsumed(ctx) {
+				if !result.job.waitConsumed() {
 					return
 				}
 			}
@@ -148,39 +181,20 @@ func (c *Copyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-chan *w
 	}
 
 	// Close preparation outcomes only after every source worker relinquishes ownership.
-	go wrap(ctx, func() {
+	go c.wrap(drained, func() {
 		workers.Wait()
 		close(completed)
 	})
 
 	// Preserve request order only where one linear writer requires it.
-	go wrap(ctx, func() {
+	go c.wrap(drained, func() {
 		defer close(prepared)
-		c.forwardPrepared(ctx, completed, prepared)
+		c.forwardPrepared(completed, prepared)
 	})
 	return prepared
 }
 
-// abandonUnprepared reports an accepted item that preparation will never read and keeps
-// request ordering intact by publishing an empty preparation result for it.
-func (c *Copyer) abandonUnprepared(
-	ctx context.Context,
-	completed chan<- prepareResult,
-	job *baseJob,
-	reason error,
-) bool {
-	if !c.abandon(job, reason) {
-		return false
-	}
-
-	result := prepareResult{order: job.order}
-	if c.toDevice.linear {
-		result.release = make(chan struct{})
-	}
-	return c.sendPrepareResult(completed, result)
-}
-
-func (c *Copyer) sendPrepareResult(completed chan<- prepareResult, result prepareResult) bool {
+func (c *StreamCopyer) sendPrepareResult(completed chan<- prepareResult, result prepareResult) bool {
 	select {
 	case completed <- result:
 	case <-c.hardStop:
@@ -212,9 +226,8 @@ func (result prepareResult) finish() {
 }
 
 // forwardPrepared hands prepared readers to the copy stage. A graceful stop keeps
-// forwarding so the copy stage can report the items it holds.
-func (c *Copyer) forwardPrepared(
-	ctx context.Context,
+// forwarding, so the copy stage reports every item this stage holds.
+func (c *StreamCopyer) forwardPrepared(
 	completed <-chan prepareResult,
 	prepared chan<- *writeJob,
 ) {

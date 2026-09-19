@@ -1,50 +1,65 @@
 package acp
 
 import (
-	"context"
-	"fmt"
 	"io/fs"
 	"time"
 )
 
 // Item is one unit of work owned by the caller.
 //
-// The caller implements Item over whatever state it owns, so the item is the handle for
-// its own result and no id lookup or payload plumbing is needed.
+// The caller implements Item over whatever state it owns, so the item is the handle that ties a
+// result back to that state: Result.Job is the exact instance that was submitted, and no id
+// lookup or payload plumbing is needed. ACP calls Source and Targets under panic protection: the
+// first call describes the item, and an item whose first call failed is described once more when
+// it is reported, so a failure path may call them twice. ACP never keeps the item afterwards.
 type Item interface {
 	// Source returns the exact path to read.
 	Source() string
 
-	// Targets returns the destinations of a copy. An empty slice hashes the source
-	// without writing it anywhere.
+	// Targets returns the destinations of a copy. An empty slice hashes the source without
+	// writing it anywhere.
 	Targets() []string
-
-	// Completed reports the item's terminal outcome. ACP calls it exactly once for
-	// every accepted item, from a single goroutine, and never waits for I/O on it.
-	Completed(*Result)
-
-	// Failed reports an item ACP could not process at all. It also reports items that
-	// were accepted but abandoned by a graceful stop, with the stopping error.
-	Failed(error)
 }
 
-// BatchSource supplies items serially. Next returns io.EOF when the input ends, and
-// must be cheap: ACP calls it from the loop that feeds the read buffer.
-type BatchSource interface {
-	Next(context.Context) ([]Item, error)
+// SimpleJob is an Item that carries no state of its own: Path is the source and Dsts are the
+// destinations. A caller that submits a SimpleJob finds its result by matching Result.Job
+// against the pointer it submitted, because SimpleJob has no callback of its own.
+type SimpleJob struct {
+	Path string
+	Dsts []string
 }
 
-// Result reports the content facts of one completed item and one outcome per requested
-// target. An item whose every target failed is still a completed item, which is how
-// "not written" is distinguished from "could not be processed".
+// Source returns the path to read.
+func (j *SimpleJob) Source() string { return j.Path }
+
+// Targets returns the destinations; an empty slice hashes without writing.
+func (j *SimpleJob) Targets() []string { return j.Dsts }
+
+// Result reports the content facts of one finished item, one outcome per requested target, and
+// the item's own error.
+//
+// A result that carries an error is delivered as soon as it is produced; results without an
+// error are buffered. Result order is unspecified: results arrive in completion order, and a
+// failure may therefore arrive before a success of the same submission batch. A linear target
+// still writes in request order, because one writer consumes items in that order.
 type Result struct {
-	Source string
+	// Job is the exact Item instance that was submitted.
+	Job Item
 
+	// Err is the item-level error. A nil Err means the item completed, even when every
+	// requested target failed: an item that could not be processed at all is what fails,
+	// and its target outcomes are still reported.
+	Err error
+
+	// Size, Mode and ModTime describe the source facts the item observed, and WriteTime is
+	// when its copy stage started.
 	Size      int64
 	Mode      fs.FileMode
 	ModTime   time.Time
 	WriteTime time.Time
 
+	// SHA256 is the hash of the bytes actually read; it is nil when the hash policy produces
+	// no hash. SignatureCacheHit reports that a stored hash was reused instead of computed.
 	SHA256            []byte
 	SignatureCacheHit bool
 
@@ -58,34 +73,7 @@ type TargetResult struct {
 	Size      int64
 	WriteTime time.Time
 
-	// Err is nil when the target was written and verified. Target failures keep their
-	// error identity, so errors.Is(err, ErrTargetNoSpace) identifies an exhausted
-	// medium.
+	// Err is nil when the target was written. Target failures keep their error identity, so
+	// errors.Is(err, ErrTargetNoSpace) identifies an exhausted medium.
 	Err error
-}
-
-// Run copies caller-owned items until the batch source ends or the pipeline fails.
-//
-// A graceful stop (the caller cancels the context) stops feeding items, finishes the
-// items already in flight, reports every accepted item through its terminal callback,
-// and returns the stopping error.
-func Run(ctx context.Context, source BatchSource, opts ...Option) error {
-	if source == nil {
-		return fmt.Errorf("run failed, batch source is nil")
-	}
-
-	copyer, err := New(ctx, append(opts, withBatchSource(source))...)
-	if err != nil {
-		return fmt.Errorf("run failed, %w", err)
-	}
-	if err := copyer.WaitErr(); err != nil {
-		return fmt.Errorf("run failed, %w", err)
-	}
-
-	// The pipeline drained, so a cancelled caller learns why it stopped even when the
-	// batch source ended its input instead of reporting the cancelation itself.
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("run stopped, %w", err)
-	}
-	return nil
 }

@@ -6,8 +6,11 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash"
+	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -62,7 +65,7 @@ func TestSignatureCacheWritePreservesACPSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Enqueueing must preserve that immutable snapshot even when the path differs.
+	// The path holds a version whose metadata differs from the snapshot's.
 	path := filepath.Join(t.TempDir(), "changed.bin")
 	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), len(content)), 0o644); err != nil {
 		t.Fatal(err)
@@ -71,38 +74,28 @@ func TestSignatureCacheWritePreservesACPSnapshot(t *testing.T) {
 	if err := os.Chtimes(path, changed, changed); err != nil {
 		t.Fatal(err)
 	}
-	cache := &signatureCache{queue: make(chan signatureWrite, 1)}
-	cache.enqueue(path, want)
-	write := <-cache.queue
-	if write.signature != want {
-		t.Fatalf("queued signature = %#v, want %#v", write.signature, want)
-	}
 
-	// Seed a decoy so the assertion below proves the writer replaced it, and
-	// skip on filesystems that cannot store the managed attribute at all.
-	seed, err := os.Open(path)
+	// Open the descriptor the item would own, seed a decoy so the assertion below proves the
+	// writer replaced it, and skip on filesystems that cannot store the attribute at all.
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	seedErr := writeSignatureXattr(seed, encodeCachedSignature(CachedSignature{Size: 7, MtimeNS: 7}))
-	_ = seed.Close()
-	if seedErr != nil {
-		t.Skipf("temporary filesystem does not support signature xattrs: %v", seedErr)
+	defer file.Close()
+	if err := writeSignatureXattr(file, encodeCachedSignature(CachedSignature{Size: 7, MtimeNS: 7})); err != nil {
+		t.Skipf("temporary filesystem does not support signature xattrs: %v", err)
 	}
 
-	// The writer publishes the queued snapshot as-is. Re-deriving it from live
-	// metadata instead would bind this hash to an unrelated version of the file.
-	cache.write(write)
+	// The writer publishes the snapshot it is given, through the descriptor it is given.
+	// Re-deriving it from live metadata instead would bind this hash to an unrelated version of
+	// the file.
+	cache := newSignatureCache()
+	cache.write(file, path, want)
 	if cache.summary.Writes != 1 || cache.summary.Failures != 0 {
 		t.Fatalf("signature summary = %#v", cache.summary)
 	}
 
 	// Inspect the raw attribute to confirm ACP's snapshot landed unchanged.
-	file, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
 	encoded, err := readSignatureXattr(file)
 	if err != nil {
 		t.Fatal(err)
@@ -290,11 +283,12 @@ func TestRunTransferAlwaysReadsAndRefreshesTargets(t *testing.T) {
 			summary = update.Summary
 		}
 	}
-	if err := Run(
+	if err := runFixture(
 		context.Background(),
-		newSliceSource(item),
+		newStreamFixture(item),
+		[]Item{item},
 		WithHashPolicy(HashCachedOrReadRefresh),
-		SetToDevice(Overwrite(true)),
+		Overwrite(true),
 		WithEventHandler(handler),
 	); err != nil {
 		t.Fatal(err)
@@ -354,7 +348,12 @@ func TestOverwriteInvalidatesSignatureWithoutCache(t *testing.T) {
 
 	// A run without a hash policy must still drop the stale stored signature.
 	item := newFixtureItem(source, target)
-	if err := Run(context.Background(), newSliceSource(item), SetToDevice(Overwrite(true))); err != nil {
+	if err := runFixture(
+		context.Background(),
+		newStreamFixture(item),
+		[]Item{item},
+		Overwrite(true),
+	); err != nil {
 		t.Fatal(err)
 	}
 	if signature, valid, err := ReadCachedSignature(target); err != nil {
@@ -395,7 +394,8 @@ func TestRunSignatureCacheZeroLength(t *testing.T) {
 	// Populate the valid SHA-256 signature of an empty file.
 	input := writeSourceFile(t, t.TempDir(), "empty", nil)
 
-	// Hash the empty content and require the asynchronous cache write to drain.
+	// Hash the empty content; the item publishes its entry through its own descriptor, so the
+	// write has already happened when the run returns.
 	first, summary := runSignatureHash(t, input, HashCachedOrReadRefresh)
 	if want := sha256.Sum256(nil); !bytes.Equal(first.SHA256, want[:]) {
 		t.Fatalf("empty SHA256 = %x, want %x", first.SHA256, want)
@@ -416,11 +416,11 @@ func TestRunSignatureCacheZeroLength(t *testing.T) {
 
 func TestSignatureCacheWarningSamplesAreBounded(t *testing.T) {
 	// Inject more failures than the diagnostic sample limit.
-	cache := newSignatureCache(1)
+	cache := newSignatureCache()
 	for idx := 0; idx < signatureSampleLimit+3; idx++ {
 		cache.recordFailure(fmt.Sprintf("path-%d", idx), errors.New("injected failure"))
 	}
-	summary := cache.closeAndWait()
+	summary := cache.snapshot()
 
 	// Preserve the aggregate count while bounding retained paths.
 	if summary.Failures != signatureSampleLimit+3 {
@@ -431,14 +431,17 @@ func TestSignatureCacheWarningSamplesAreBounded(t *testing.T) {
 	}
 }
 
-func TestRunSignatureCacheDrainsConcurrentWrites(t *testing.T) {
-	// Build more sources than the writer pool can process at once.
+func TestRunWritesEveryItemCacheEntry(t *testing.T) {
+	// Build more sources than one item at a time, so every item publishes its own entry.
 	root := t.TempDir()
 	items := make([]Item, 0, 32)
+	fixtures := make([]*fixtureItem, 0, 32)
 	want := make(map[string][32]byte)
 	for idx := 0; idx < 32; idx++ {
 		path := writeSourceFile(t, root, fmt.Sprintf("%02d.bin", idx), []byte(fmt.Sprintf("concurrent signature %d", idx)))
-		items = append(items, newFixtureItem(path))
+		item := newFixtureItem(path)
+		items = append(items, item)
+		fixtures = append(fixtures, item)
 		content, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
@@ -446,17 +449,18 @@ func TestRunSignatureCacheDrainsConcurrentWrites(t *testing.T) {
 		want[path] = sha256.Sum256(content)
 	}
 
-	// Run concurrent hashing and require every asynchronous xattr write to drain.
-	if err := Run(
+	// Run concurrent hashing and require every item to have published its own entry.
+	if err := runFixture(
 		context.Background(),
-		newSliceSource(items...),
+		newStreamFixture(fixtures...),
+		items,
 		WithHashPolicy(HashReadRefresh),
 		SetFromDevice(DeviceThreads(4)),
 	); err != nil {
 		t.Fatal(err)
 	}
 
-	// Confirm all cache writes are visible after Run returns.
+	// Confirm every item published before the run returned: no write outlives its item.
 	for path, expected := range want {
 		signature, valid := readStoredSignature(t, path)
 		if !valid {
@@ -468,8 +472,9 @@ func TestRunSignatureCacheDrainsConcurrentWrites(t *testing.T) {
 	}
 }
 
-func TestRunSignatureCacheDrainsAfterCancellation(t *testing.T) {
-	// Cancel only after the first completed item has left the pipeline.
+func TestRunSignatureCacheSurvivesCancellation(t *testing.T) {
+	// Cancel only after the first completed item has left the pipeline, which is where a caller
+	// observes that the run is working.
 	content := []byte("cancellation fixture")
 	path := writeSourceFile(t, t.TempDir(), "cancellation.bin", content)
 
@@ -477,15 +482,44 @@ func TestRunSignatureCacheDrainsAfterCancellation(t *testing.T) {
 	defer cancel()
 
 	item := newFixtureItem(path)
-	item.hook = func(*Result, error) { cancel() }
-	source := &blockingSource{batch: []Item{item}, endErr: nil}
+	fixture := newStreamFixture(item)
 
-	err := Run(ctx, source, WithHashPolicy(HashReadRefresh))
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("Run() error = %v, want context cancellation", err)
+	// A result buffer of one delivers the completed item immediately, so the callback stops the
+	// run while the pipeline is still open instead of at Close.
+	cancelled := make(chan struct{}, 1)
+	fixture.hook = func([]Result) error {
+		cancel()
+		select {
+		case cancelled <- struct{}{}:
+		default:
+		}
+		return nil
 	}
 
-	// The completed item's cache write must drain despite caller cancellation.
+	stream, err := NewStream(ctx, fixture.onResults, WithHashPolicy(HashReadRefresh), WithResultBuffer(1), WithResultBatch(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Submit(item); err != nil {
+		t.Fatal(err)
+	}
+
+	// Submit is the run's single cancellation checkpoint, so the batch after the callback
+	// observes the stop and is refused.
+	select {
+	case <-cancelled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run never delivered the completed item")
+	}
+	if err := stream.Submit(newFixtureItem(path)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Submit() after cancellation error = %v, want context cancellation", err)
+	}
+	if err := stream.Wait(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait() error = %v, want context cancellation", err)
+	}
+
+	// The completed item published its entry before its result, so caller cancellation cannot
+	// lose it.
 	result, terminalErr := item.terminal(t)
 	if terminalErr != nil {
 		t.Fatalf("item failed: %v", terminalErr)
@@ -526,6 +560,550 @@ func TestRunSignatureCacheIsBestEffortForReadOnlyFile(t *testing.T) {
 	}
 }
 
+// TestRunIgnoresUnsupportedSignatureXattr pins the no-op policy for a file system without the
+// managed attribute namespace: the cache is simply absent, so a run neither fails nor records a
+// cache failure. A real xattr failure is still reported.
+func TestRunIgnoresUnsupportedSignatureXattr(t *testing.T) {
+	previousRead, previousWrite, previousRemove := readManagedXattr, writeManagedXattr, removeManagedXattr
+	t.Cleanup(func() {
+		readManagedXattr, writeManagedXattr, removeManagedXattr = previousRead, previousWrite, previousRemove
+	})
+	readManagedXattr = func(*os.File) ([]byte, error) { return nil, errSignatureXattrUnsupported }
+	writeManagedXattr = func(*os.File, []byte) error { return errSignatureXattrUnsupported }
+	removeManagedXattr = func(*os.File) error { return errSignatureXattrUnsupported }
+
+	root := t.TempDir()
+	content := []byte("unsupported xattr fixture")
+	input := writeSourceFile(t, root, "source.txt", content)
+	target := writeSourceFile(t, root, "target.txt", []byte("old"))
+
+	// A transfer refreshes both the source and the target, which exercises reading, removing
+	// and writing the managed attribute.
+	run := func() (*fixtureItem, SignatureCacheSummary) {
+		t.Helper()
+
+		item := newFixtureItem(input, target)
+		var summary SignatureCacheSummary
+		handler := func(event Event) {
+			if update, ok := event.(*EventSignatureCacheSummary); ok {
+				summary = update.Summary
+			}
+		}
+		if err := runFixture(
+			context.Background(),
+			newStreamFixture(item),
+			[]Item{item},
+			WithHashPolicy(HashCachedOrReadRefresh),
+			Overwrite(true),
+			WithEventHandler(handler),
+		); err != nil {
+			t.Fatalf("runFixture() error = %v, want nil: an unsupported xattr is not a failure", err)
+		}
+		return item, summary
+	}
+
+	item, summary := run()
+	result, err := item.terminal(t)
+	if err != nil {
+		t.Fatalf("item failed: %v", err)
+	}
+	if want := sha256.Sum256(content); !bytes.Equal(result.SHA256, want[:]) {
+		t.Fatalf("SHA256 = %x, want %x", result.SHA256, want)
+	}
+	if summary.Failures != 0 || summary.Writes != 0 {
+		t.Fatalf("summary = %#v, want no recorded failure and no write", summary)
+	}
+
+	// A broken attribute is still a failure, so the no-op policy cannot swallow real ones.
+	writeManagedXattr = func(*os.File, []byte) error { return errors.New("xattr is broken") }
+	if _, summary := run(); summary.Failures == 0 {
+		t.Fatalf("summary = %#v, want the broken attribute recorded", summary)
+	}
+}
+
+// TestRunReadsTheStoredHashThroughTheItemDescriptor pins where a stored hash is read: through the
+// descriptor the item opened for its content, never by reopening the path. The path is swapped for
+// an unrelated file as soon as the item holds its descriptor, so only a descriptor-based read can
+// still find the stored entry.
+func TestRunReadsTheStoredHashThroughTheItemDescriptor(t *testing.T) {
+	for _, mode := range []ReadMode{ReadBuffered, ReadMapped} {
+		t.Run(mode.String(), func(t *testing.T) {
+			requireSignatureXattrSupport(t)
+
+			content := []byte("descriptor cache read fixture")
+			input := writeSourceFile(t, t.TempDir(), "source.txt", content)
+			seeded := seedStaleSignature(t, input, []byte("stored value"))
+			swapOpenedSourcePath(t, input, []byte("a replacement the item must never read"))
+
+			var summary SignatureCacheSummary
+			handler := func(event Event) {
+				if update, ok := event.(*EventSignatureCacheSummary); ok {
+					summary = update.Summary
+				}
+			}
+
+			item := newFixtureItem(input)
+			if err := runFixture(
+				context.Background(),
+				newStreamFixture(item),
+				[]Item{item},
+				WithHashPolicy(HashCachedOrRead),
+				SetFromDevice(WithReadMode(mode)),
+				WithEventHandler(handler),
+			); err != nil {
+				t.Fatal(err)
+			}
+
+			result, err := item.terminal(t)
+			if err != nil {
+				t.Fatalf("item failed: %v", err)
+			}
+			if !result.SignatureCacheHit || !bytes.Equal(result.SHA256, seeded.SHA256[:]) {
+				t.Fatalf("result = %#v, want the stored hash %x of the file the item opened", result, seeded.SHA256)
+			}
+			if summary.Hits != 1 || summary.Misses != 0 || summary.Failures != 0 {
+				t.Fatalf("summary = %#v, want one hit read through the item's descriptor", summary)
+			}
+		})
+	}
+}
+
+// TestRunWritesTheComputedHashThroughTheItemDescriptor pins where a computed hash is published:
+// through the descriptor that read the content, so the entry always describes the bytes this item
+// read. The path names an unrelated file by then, and that file must stay untouched.
+func TestRunWritesTheComputedHashThroughTheItemDescriptor(t *testing.T) {
+	for _, mode := range []ReadMode{ReadBuffered, ReadMapped} {
+		t.Run(mode.String(), func(t *testing.T) {
+			requireSignatureXattrSupport(t)
+
+			content := []byte("descriptor cache write fixture")
+			input := writeSourceFile(t, t.TempDir(), "source.txt", content)
+
+			// A stored entry that differs from the computed one is what makes the run publish.
+			seedStaleSignature(t, input, []byte("stale stored value"))
+			moved := swapOpenedSourcePath(t, input, []byte("a replacement the item must never read nor describe"))
+
+			var summary SignatureCacheSummary
+			handler := func(event Event) {
+				if update, ok := event.(*EventSignatureCacheSummary); ok {
+					summary = update.Summary
+				}
+			}
+
+			item := newFixtureItem(input)
+			if err := runFixture(
+				context.Background(),
+				newStreamFixture(item),
+				[]Item{item},
+				WithHashPolicy(HashReadRefresh),
+				SetFromDevice(WithReadMode(mode)),
+				WithEventHandler(handler),
+			); err != nil {
+				t.Fatal(err)
+			}
+
+			result, err := item.terminal(t)
+			if err != nil {
+				t.Fatalf("item failed: %v", err)
+			}
+			want := sha256.Sum256(content)
+			if !bytes.Equal(result.SHA256, want[:]) {
+				t.Fatalf("SHA256 = %x, want %x: the item hashes the content it opened", result.SHA256, want)
+			}
+			if summary.Hits != 0 || summary.Misses != 0 || summary.Writes != 1 || summary.Failures != 0 {
+				t.Fatalf("summary = %#v, want one write and no lookup", summary)
+			}
+
+			// The entry landed on the file the item opened, and the file the path names now was
+			// left alone: a cache write never reopens the path.
+			stored, valid := readStoredSignature(t, moved)
+			if !valid || stored.SHA256 != want {
+				t.Fatalf("stored signature for the item's file = %#v, valid=%t, want %x", stored, valid, want)
+			}
+			if signature, valid := readStoredSignature(t, input); valid {
+				t.Fatalf("the run described the file the path names now: %#v", signature)
+			}
+		})
+	}
+}
+
+// TestRunPublishesTargetCacheThroughTheOpenTargetDescriptor pins where a target's cache entry is
+// published: through the descriptor the writer wrote that target with, after the item's content
+// hash is complete and while the descriptor is still open. A descriptor reopened by path would sit
+// at offset zero and would know nothing about the item's hash.
+func TestRunPublishesTargetCacheThroughTheOpenTargetDescriptor(t *testing.T) {
+	requireSignatureXattrSupport(t)
+
+	content := []byte("target descriptor fixture")
+	root := t.TempDir()
+	input := writeSourceFile(t, root, "source.txt", content)
+	targets := []string{filepath.Join(root, "target-1.txt"), filepath.Join(root, "target-2.txt")}
+
+	info, err := os.Stat(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantHash := sha256.Sum256(content)
+	want, err := newCachedSignature(wantHash[:], &stat{size: int64(len(content)), modTime: info.ModTime()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Record the descriptor the item reads its source through, so every published entry can be
+	// attributed to the file that owns it.
+	previousOpen := openSourceContent
+	var sourceFile *os.File
+	openSourceContent = func(path string, mode ReadMode) (itemSource, error) {
+		source, err := previousOpen(path, mode)
+		if err == nil && path == input {
+			sourceFile = source.file
+		}
+		return source, err
+	}
+	t.Cleanup(func() { openSourceContent = previousOpen })
+
+	type publication struct {
+		source    bool
+		offset    int64
+		open      bool
+		signature CachedSignature
+	}
+	previousWrite := writeManagedXattr
+	var (
+		lock         sync.Mutex
+		publications []publication
+	)
+	writeManagedXattr = func(file *os.File, value []byte) error {
+		signature, err := DecodeCachedSignature(value)
+		if err != nil {
+			t.Errorf("published an undecodable signature: %v", err)
+			return previousWrite(file, value)
+		}
+
+		// The descriptor that read or wrote the whole content stands at its end; a descriptor
+		// reopened by path would start at offset zero.
+		offset, offsetErr := file.Seek(0, io.SeekCurrent)
+		if offsetErr != nil {
+			t.Errorf("read the publishing descriptor offset: %v", offsetErr)
+		}
+		_, statErr := file.Stat()
+
+		lock.Lock()
+		publications = append(publications, publication{
+			source:    file == sourceFile,
+			offset:    offset,
+			open:      statErr == nil,
+			signature: signature,
+		})
+		lock.Unlock()
+
+		return previousWrite(file, value)
+	}
+	t.Cleanup(func() { writeManagedXattr = previousWrite })
+
+	item := newFixtureItem(input, targets...)
+	if err := runFixture(
+		context.Background(),
+		newStreamFixture(item),
+		[]Item{item},
+		WithHashPolicy(HashReadRefresh),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := item.terminal(t); err != nil {
+		t.Fatalf("item failed: %v", err)
+	}
+
+	// Every file publishes its own entry, through its own open descriptor, carrying the hash this
+	// item computed from the whole source.
+	lock.Lock()
+	defer lock.Unlock()
+	if len(publications) != len(targets)+1 {
+		t.Fatalf("published %d cache entries, want one per file: %#v", len(publications), publications)
+	}
+	var sourcePublished, targetsPublished int
+	for _, published := range publications {
+		if !published.open {
+			t.Fatalf("published %#v through a closed descriptor", published)
+		}
+		if published.signature != want {
+			t.Fatalf("published signature = %#v, want the computed %#v", published.signature, want)
+		}
+		if published.offset != int64(len(content)) {
+			t.Fatalf(
+				"published through a descriptor at offset %d, want %d: the entry must travel through the descriptor that handled the whole content",
+				published.offset, len(content),
+			)
+		}
+		if published.source {
+			sourcePublished++
+			continue
+		}
+		targetsPublished++
+	}
+	if sourcePublished != 1 || targetsPublished != len(targets) {
+		t.Fatalf("publications = %#v, want one source entry and one per target", publications)
+	}
+
+	// Every entry describes its own file afterwards, which is the whole point of publishing it.
+	for _, path := range append([]string{input}, targets...) {
+		stored, valid := readStoredSignature(t, path)
+		if !valid || stored != want {
+			t.Fatalf("stored signature for %q = %#v, valid=%t, want %#v", path, stored, valid, want)
+		}
+	}
+}
+
+// blockingHash keeps the first content hash of an item incomplete until the test releases it, so a
+// test can observe what an item does while its hash is still unknown.
+type blockingHash struct {
+	hash.Hash
+
+	started chan struct{}
+	release chan struct{}
+
+	startOnce   sync.Once
+	releaseOnce sync.Once
+}
+
+func (h *blockingHash) Write(p []byte) (int, error) {
+	h.startOnce.Do(func() { close(h.started) })
+	<-h.release
+
+	return h.Hash.Write(p)
+}
+
+// holdContentHash makes the run's hash consumer wait on the returned release function before it
+// hashes its first chunk. It reports when the consumer has started, so a test knows the item's hash
+// is being held back, and it restores the pool when the test ends.
+func holdContentHash(t *testing.T) (started <-chan struct{}, released <-chan struct{}, release func()) {
+	t.Helper()
+
+	// Empty the shared pool, so the next hash consumer must take the blocked one.
+	previous := sha256Pool
+	previousNew := previous.New
+	previous.New = nil
+	for previous.Get() != nil {
+	}
+	previous.New = previousNew
+
+	blocked := &blockingHash{
+		Hash:    sha256.New(),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	sha256Pool = &sync.Pool{New: func() interface{} { return blocked }}
+
+	unblock := func() { blocked.releaseOnce.Do(func() { close(blocked.release) }) }
+	t.Cleanup(func() {
+		unblock()
+		sha256Pool = previous
+	})
+
+	return blocked.started, blocked.release, unblock
+}
+
+// TestRunHoldsTargetCacheUntilTheHashIsComplete pins the ordering a target's cache entry depends
+// on: the writer keeps its descriptor open until the item's hash is complete, so the entry always
+// describes the whole content. The run is held back at the hash, and an item that completed anyway
+// would have published an entry it could not describe.
+func TestRunHoldsTargetCacheUntilTheHashIsComplete(t *testing.T) {
+	requireSignatureXattrSupport(t)
+
+	content := bytes.Repeat([]byte{'c'}, 4096)
+	root := t.TempDir()
+	input := writeSourceFile(t, root, "source.txt", content)
+	target := filepath.Join(root, "target.txt")
+	started, released, release := holdContentHash(t)
+
+	// A linear target skips the durability sync, so its writer has nothing left to do but publish
+	// by the time the hash is held back.
+	item := newFixtureItem(input, target)
+	done := make(chan error, 1)
+	go func() {
+		done <- runFixture(
+			context.Background(),
+			newStreamFixture(item),
+			[]Item{item},
+			WithHashPolicy(HashReadRefresh),
+			SetToDevice(LinearDevice(true)),
+		)
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the hash consumer never took the held hash")
+	}
+
+	// The item cannot finish while its hash is unknown, and the writer must be waiting instead of
+	// publishing the entry it cannot describe yet.
+	select {
+	case err := <-done:
+		t.Fatalf("the run finished while the item's hash was held back: %v", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+	select {
+	case <-released:
+		t.Fatal("the held hash was released early")
+	default:
+	}
+
+	// Releasing the hash lets the item finish and publish the entry of every file it handled.
+	release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run error = %v, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run never finished after the hash was released")
+	}
+
+	if _, err := item.terminal(t); err != nil {
+		t.Fatalf("item failed: %v", err)
+	}
+	for _, path := range []string{input, target} {
+		signature, valid := readStoredSignature(t, path)
+		if !valid || signature.SHA256 != sha256.Sum256(content) {
+			t.Fatalf("stored signature for %q = %#v, valid=%t, want %x", path, signature, valid, sha256.Sum256(content))
+		}
+	}
+}
+
+// TestRunRefreshKeepsLinearTargetsWorking pins the cache refresh against a linear target: the
+// writer waits for the item's hash before it closes, so a linear run still completes every item and
+// publishes the entry of every file it wrote.
+func TestRunRefreshKeepsLinearTargetsWorking(t *testing.T) {
+	requireSignatureXattrSupport(t)
+
+	root := t.TempDir()
+	const total = 4
+	items := make([]Item, 0, total)
+	fixtures := make([]*fixtureItem, 0, total)
+	want := make(map[string][32]byte, total)
+	for idx := 0; idx < total; idx++ {
+		content := []byte(fmt.Sprintf("linear cache fixture %d", idx))
+		source := writeSourceFile(t, root, fmt.Sprintf("source-%02d.bin", idx), content)
+		target := filepath.Join(root, "target", fmt.Sprintf("%02d.bin", idx))
+		item := newFixtureItem(source, target)
+		items = append(items, item)
+		fixtures = append(fixtures, item)
+		want[target] = sha256.Sum256(content)
+	}
+
+	if err := runFixture(
+		context.Background(),
+		newStreamFixture(fixtures...),
+		items,
+		WithHashPolicy(HashReadRefresh),
+		SetToDevice(LinearDevice(true)),
+	); err != nil {
+		t.Fatalf("run error = %v, want nil", err)
+	}
+
+	for _, item := range fixtures {
+		result, err := item.terminal(t)
+		if err != nil {
+			t.Fatalf("item %q failed: %v", item.source, err)
+		}
+		if len(result.Targets) != 1 || result.Targets[0].Err != nil {
+			t.Fatalf("targets of %q = %#v, want one written target", item.source, result.Targets)
+		}
+		target := result.Targets[0].Path
+		stored, valid := readStoredSignature(t, target)
+		if !valid || stored.SHA256 != want[target] {
+			t.Fatalf("target %q signature = %x, valid=%t, want %x", target, stored.SHA256, valid, want[target])
+		}
+	}
+}
+
+// TestRunPublishesTheCacheEntryBeforeTheResult pins that nothing about cache writing survives the
+// item: by the time an item's result reaches the caller, the entry it computed is already stored.
+func TestRunPublishesTheCacheEntryBeforeTheResult(t *testing.T) {
+	requireSignatureXattrSupport(t)
+
+	content := []byte("publication order fixture")
+	input := writeSourceFile(t, t.TempDir(), "source.txt", content)
+	want := sha256.Sum256(content)
+
+	var (
+		lock      sync.Mutex
+		delivered []Result
+		observed  []CachedSignature
+		valid     []bool
+	)
+	onResults := func(results []Result) error {
+		for _, result := range results {
+			// The callback is the caller's first view of the item, and the entry is already
+			// there: the item published it before it completed.
+			signature, ok, err := ReadCachedSignature(input)
+			lock.Lock()
+			delivered = append(delivered, result)
+			observed = append(observed, signature)
+			valid = append(valid, ok && err == nil)
+			lock.Unlock()
+		}
+		return nil
+	}
+
+	// A result buffer of one delivers the item as soon as it is finished, instead of when the run
+	// closes, so the observation happens while the pipeline is still open.
+	item := newFixtureItem(input)
+	stream, err := NewStream(context.Background(), onResults, WithHashPolicy(HashReadRefresh), WithResultBuffer(1), WithResultBatch(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Submit(item); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := stream.Wait(); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+
+	lock.Lock()
+	defer lock.Unlock()
+	if len(delivered) != 1 || delivered[0].Err != nil {
+		t.Fatalf("delivered %#v, want one completed result", delivered)
+	}
+	if len(valid) != 1 || !valid[0] || observed[0].SHA256 != want {
+		t.Fatalf("the entry observed with the result = %#v, valid=%v, want %x", observed, valid, want)
+	}
+}
+
+// swapOpenedSourcePath makes the path an item opens name a different file as soon as the item holds
+// its descriptor. The item keeps reading the file it opened, while anything that reopens the path
+// finds an unrelated file, so a test can tell the two apart. It returns the path the opened file
+// moved to.
+func swapOpenedSourcePath(t *testing.T, path string, replacement []byte) string {
+	t.Helper()
+
+	moved := path + ".moved"
+	previous := openSourceContent
+	var once sync.Once
+	openSourceContent = func(name string, mode ReadMode) (itemSource, error) {
+		source, err := previous(name, mode)
+		if err == nil && name == path {
+			once.Do(func() {
+				if err := os.Rename(name, moved); err != nil {
+					t.Errorf("move the opened source: %v", err)
+					return
+				}
+				if err := os.WriteFile(name, replacement, 0o644); err != nil {
+					t.Errorf("replace the opened source: %v", err)
+				}
+			})
+		}
+		return source, err
+	}
+	t.Cleanup(func() { openSourceContent = previous })
+
+	return moved
+}
+
 // runSignatureHash runs one targetless item with the requested policy and returns its
 // result together with the aggregate cache summary.
 func runSignatureHash(t *testing.T, input string, policy HashPolicy) (*Result, SignatureCacheSummary) {
@@ -539,9 +1117,10 @@ func runSignatureHash(t *testing.T, input string, policy HashPolicy) (*Result, S
 	}
 
 	item := newFixtureItem(input)
-	if err := Run(
+	if err := runFixture(
 		context.Background(),
-		newSliceSource(item),
+		newStreamFixture(item),
+		[]Item{item},
 		WithHashPolicy(policy),
 		WithEventHandler(handler),
 	); err != nil {

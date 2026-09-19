@@ -2,12 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/hex"
 	"flag"
-	"io"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -67,35 +64,20 @@ func main() {
 		}
 	}()
 
-	// Select the entries to copy: one exact target path, or every file under the sources
-	// mapped onto the target directories.
-	var entries []acp.FileEntry
-	if !*noTarget && accurateTarget(sources, targetPaths) {
-		src := filepath.Clean(sources[0])
-		base, name := filepath.Split(src)
-		entries = []acp.FileEntry{{
-			Base:    base,
-			Path:    name,
-			Source:  src,
-			Targets: []string{filepath.Clean(targetPaths[0])},
-		}}
-	} else {
-		selected, err := acp.SelectFiles(sources, targetPaths)
-		if err != nil {
-			logrus.Fatalf("unexpected exit: %s", err)
-		}
-		entries = selected
-	}
-
 	report := newReport()
 	opts := make([]acp.Option, 0, 8)
-	// The command line reports hashes only when it is asked for a report.
-	hashPolicy := acp.HashOff
-	if *reportPath != "" {
-		hashPolicy = acp.HashRead
+
+	// One exact target path copies one file to exactly that path; every other run maps the
+	// source trees onto the target directories.
+	if !*noTarget && accurateTarget(sources, targetPaths) {
+		opts = append(opts, acp.AccurateJob(sources[0], []string{targetPaths[0]}))
+	} else {
+		opts = append(opts, acp.WildcardJob(acp.Source(sources...), acp.Target(targetPaths...)))
 	}
-	opts = append(opts, acp.WithHashPolicy(hashPolicy))
-	opts = append(opts, acp.SetToDevice(acp.Overwrite(!*notOverwrite)))
+
+	// The command line reports hashes only when it is asked for a report.
+	opts = append(opts, acp.WithHash(*reportPath != ""))
+	opts = append(opts, acp.Overwrite(!*notOverwrite))
 
 	if *withProgressBar {
 		opts = append(opts, acp.WithProgressBar())
@@ -109,35 +91,55 @@ func main() {
 	}
 
 	opts = append(opts, acp.WithEventHandler(report.handleEvent))
-	defer func() {
-		if *reportPath == "" {
-			return
-		}
 
-		r, err := os.Create(*reportPath)
-		if err != nil {
-			logrus.Warnf("open report fail, path= '%s', err= %s", *reportPath, err)
-			logrus.Infof("report= %q", report.getter().ToJSONString(false))
-			return
-		}
-		defer r.Close()
-
-		r.Write([]byte(report.getter().ToJSONString(*reportIndent)))
-	}()
-
-	if err := acp.Run(ctx, &fileSource{entries: entries, report: report}, opts...); err != nil {
-		logrus.Errorf("copy failed, %s", err)
+	copyer, err := acp.New(ctx, opts...)
+	if err != nil {
+		logrus.Fatalf("unexpected exit: %s", err)
 	}
+	runErr := copyer.WaitErr()
+	if runErr != nil {
+		logrus.Errorf("copy failed, %s", runErr)
+	}
+
+	// The report is stored even when the run failed, so a batch can be inspected after the
+	// command told its caller that something went wrong.
+	if err := storeReport(report, *reportPath, *reportIndent); err != nil {
+		logrus.Warnf("open report fail, path= '%s', err= %s", *reportPath, err)
+		logrus.Infof("report= %q", report.getter().ToJSONString(false))
+	}
+
+	// A copy that did not finish is not a success: an item ACP could not process, a target
+	// that was not written, or a pipeline failure all make the command exit non-zero.
+	if runErr != nil || report.hasFailure() {
+		os.Exit(1)
+	}
+}
+
+// storeReport writes the JSON report when the caller asked for one.
+func storeReport(collector *report, path string, indent bool) error {
+	if path == "" {
+		return nil
+	}
+
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	if _, err := file.WriteString(collector.getter().ToJSONString(indent)); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 // accurateTarget reports whether one source path copies to one exact target path instead
 // of mapping a source tree onto a target directory.
 func accurateTarget(sources, targets []string) bool {
-	if len(sources) > 1 || len(targets) > 1 {
+	if len(sources) != 1 || len(targets) != 1 {
 		return false
 	}
 
-	dst, src := targetPaths[0], sources[0]
+	dst, src := targets[0], sources[0]
 	if strings.HasSuffix(dst, "/") {
 		return false
 	}
@@ -159,48 +161,9 @@ func accurateTarget(sources, targets []string) bool {
 	return false
 }
 
-// fileSource supplies the selected entries as caller-owned items.
-type fileSource struct {
-	entries []acp.FileEntry
-	report  *report
-}
-
-func (s *fileSource) Next(ctx context.Context) ([]acp.Item, error) {
-	if len(s.entries) == 0 {
-		return nil, io.EOF
-	}
-
-	entries := s.entries
-	s.entries = nil
-
-	items := make([]acp.Item, 0, len(entries))
-	for _, entry := range entries {
-		items = append(items, &fileItem{entry: entry, report: s.report})
-	}
-	return items, nil
-}
-
-// fileItem carries one file entry through the copy pipeline.
-type fileItem struct {
-	entry  acp.FileEntry
-	report *report
-}
-
-func (i *fileItem) Source() string { return i.entry.Source }
-
-func (i *fileItem) Targets() []string { return i.entry.Targets }
-
-// Completed records the item's outcome for the JSON report. The pipeline reports events
-// as the item advances, so the callback itself performs no I/O.
-func (i *fileItem) Completed(result *acp.Result) {
-	i.report.completed(i.entry, result)
-}
-
-func (i *fileItem) Failed(err error) {
-	i.report.failed(i.entry, err)
-}
-
-// report collects job rows and errors for the JSON report.
+// report collects the terminal row of every item and the pipeline-level errors for the JSON
+// report. Item and target failures travel inside the item's own row, so a single failure is
+// never counted twice.
 type report struct {
 	lock   sync.Mutex
 	jobs   []*acp.Job
@@ -212,53 +175,32 @@ func newReport() *report {
 }
 
 func (r *report) handleEvent(event acp.Event) {
-	failure, ok := event.(*acp.EventReportError)
-	if !ok {
-		return
-	}
-
 	r.lock.Lock()
 	defer r.lock.Unlock()
-	r.errors = append(r.errors, failure.Error)
+
+	switch e := event.(type) {
+	case *acp.EventUpdateJob:
+		r.jobs = append(r.jobs, e.Job)
+	case *acp.EventReportError:
+		r.errors = append(r.errors, e.Error)
+	}
 }
 
-func (r *report) completed(entry acp.FileEntry, result *acp.Result) {
+// hasFailure reports whether the run left a failure behind: a pipeline problem, an item ACP
+// could not process, or a target that was not written.
+func (r *report) hasFailure() bool {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 
-	job := &acp.Job{
-		FullPath: entry.Source,
-		Base:     entry.Base,
-		Path:     entry.Path,
-
-		Status:    acp.JobStatusFinished,
-		Size:      result.Size,
-		Mode:      result.Mode,
-		ModTime:   result.ModTime,
-		WriteTime: result.WriteTime,
-		SHA256:    hex.EncodeToString(result.SHA256),
-
-		SignatureCacheHit: result.SignatureCacheHit,
+	if len(r.errors) > 0 {
+		return true
 	}
-	for _, target := range result.Targets {
-		if target.Err == nil {
-			job.SuccessTargets = append(job.SuccessTargets, target.Path)
-			continue
+	for _, job := range r.jobs {
+		if len(job.FailTargets) > 0 {
+			return true
 		}
-		if job.FailTargets == nil {
-			job.FailTargets = make(map[string]error, len(result.Targets))
-		}
-		job.FailTargets[target.Path] = target.Err
 	}
-
-	r.jobs = append(r.jobs, job)
-}
-
-func (r *report) failed(entry acp.FileEntry, err error) {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-
-	r.errors = append(r.errors, &acp.Error{Src: entry.Source, Err: err})
+	return false
 }
 
 func (r *report) getter() *acp.Report {

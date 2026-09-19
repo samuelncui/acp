@@ -23,10 +23,9 @@ func (m ReadMode) String() string {
 }
 
 type deviceOption struct {
-	linear    bool
-	threads   int
-	overwrite bool
-	readMode  ReadMode
+	linear   bool
+	threads  int
+	readMode ReadMode
 }
 
 func (do *deviceOption) check() error {
@@ -38,6 +37,9 @@ func (do *deviceOption) check() error {
 	}
 	if do.linear {
 		do.threads = 1
+	}
+	if do.readMode != ReadBuffered && do.readMode != ReadMapped {
+		return fmt.Errorf("unknown read mode, mode= %s", do.readMode)
 	}
 	return nil
 }

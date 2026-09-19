@@ -1,7 +1,6 @@
 package acp
 
 import (
-	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -25,13 +24,14 @@ func TestCleanupRemovesTargetAfterMetadataFailure(t *testing.T) {
 		t.Skipf("create test symlink: %v", err)
 	}
 
-	// Cleanup must discard the failed target before publishing its final result.
-	copyer := newTestCopyer(t)
+	// The results stage must discard the failed target before publishing its final result.
+	copyer := newTestStream(t)
 	item := newFixtureItem(sourcePath, target)
+	fixture := newStreamFixture(item)
+	copyer.onResults = fixture.onResults
 	job := &baseJob{
 		copyer:         copyer,
 		item:           item,
-		src:            &source{base: root, path: "source"},
 		path:           sourcePath,
 		stat:           stat,
 		targets:        []string{target},
@@ -40,7 +40,7 @@ func TestCleanupRemovesTargetAfterMetadataFailure(t *testing.T) {
 	copyed := make(chan *baseJob, 1)
 	copyed <- job
 	close(copyed)
-	copyer.cleanup(context.Background(), copyed)
+	runResults(copyer, copyed)
 
 	if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stat failed target error = %v, want %v", err, os.ErrNotExist)

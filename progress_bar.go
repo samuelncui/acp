@@ -24,6 +24,9 @@ func NewProgressBar() EventHandler {
 		progressbar.OptionSetRenderBlankState(true),
 	)
 
+	// totalFiles is handler state without a lock. ACP calls one registered handler from one
+	// goroutine at a time and never concurrently, so the count event and the progress events
+	// below cannot race; see EventHandler for the contract this relies on.
 	var totalFiles int64
 	return func(ev Event) {
 		switch e := ev.(type) {
