@@ -37,10 +37,10 @@ func panicError(what string, value any) error {
 	return fmt.Errorf("%s panicked, value= %v", what, value)
 }
 
-// protectCall runs one call into caller-implemented code, such as an item callback, a batch
-// source, or an event handler. A panic becomes an error instead of unwinding a pipeline
-// goroutine, because an unwound goroutine keeps publishing on channels it no longer owns and
-// leaves the caller without a terminal outcome.
+// protectCall runs one call into caller-implemented code: the results callback, an event handler,
+// or Item.Source/Item.Targets. A panic becomes an error instead of unwinding a pipeline goroutine,
+// because an unwound goroutine keeps publishing on channels it no longer owns and leaves the caller
+// without a terminal outcome.
 func protectCall(what string, f func()) (err error) {
 	defer func() {
 		e := recover()

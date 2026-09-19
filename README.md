@@ -191,8 +191,9 @@ the only one that receives events, and `WithEventHandler(nil)` clears the regist
 replaces the bar. The job options and `SetFromDevice`/`SetToDevice` accumulate by design: a
 second `WildcardJob` adds another walk, and a second device option adjusts the same device
 description. An event handler is called from one goroutine per registration and never
-concurrently, so it may keep unguarded state; registering the same handler twice is not
-supported. The results callback is called from one goroutine as well, never concurrently.
+concurrently, so it may keep unguarded state; registering the same handler twice replaces the first
+registration, so it is still called once. The results callback is called from one goroutine as
+well, never concurrently.
 
 `WithReadMode` applies to the source device only. Buffered reads are the default and avoid
 updating the source access time where the platform allows it (`O_NOATIME`, with a fallback when
@@ -203,7 +204,10 @@ empty mapping immediately. Either way one descriptor serves the whole item.
 
 `WithEventHandler` receives the run's `Event` values; `WithProgressBar()` is one handler built
 from them, and because a run keeps one handler, a command that wants a bar *and* its own
-collector composes them (which is what `cmd/acp` does). The whole set is:
+collector composes them (which is what `cmd/acp` does). A run can emit this set, and not every run
+emits all of it: `EventUpdateJob` only comes from the `af05f05c` shell, `EventSignatureCacheSummary`
+only from a run that manages the signature cache, which the default `HashOff` policy does not, and
+`EventReportError` only when the run recorded a pipeline-level error:
 
 | Event | What it reports |
 | --- | --- |
@@ -317,9 +321,9 @@ preallocated, what metadata can be restored, and how a mapped read is implemente
 
 ## af05f05c compatibility shell
 
-The package also exposes the public surface of `af05f05c`, the commit before the streaming API,
-so existing callers and both commands keep working. It is a shell over the push engine, not a
-second implementation:
+The shell restores the public surface of `af05f05c`, the commit before the streaming API, so
+existing callers and both commands keep working, and it carries today's additive options and errors
+beside that surface. It is a shell over the push engine, not a second implementation:
 
 ```go
 c, err := acp.New(ctx, acp.WildcardJob(acp.Source("example"), acp.Target("target")), acp.WithHash(true))
@@ -348,8 +352,8 @@ c.Wait()
   `DecodeCachedSignature`, `ErrTargetNoSpace`, `ErrTargetDropToReadonly`, `ErrTargetIO`,
   `CopyAttrs`, `UnexpectFileMode`.
 - `WithHash(true)` maps to `HashReadRefresh` and `WithHash(false)` to `HashOff`; a repeated hash
-  option is last-wins. The shell also carries today's additive options and errors
-  (`WithReadMode`, the result options, `WithHashPolicy`, `ErrTargetIO` and so on): every
+  option is last-wins. Every symbol added since (`WithReadMode`, the result options,
+  `WithHashPolicy`, `ErrTargetIO` and so on) is additive: every
   `af05f05c` symbol keeps working, and `compat_af05f05c_test.go` fails the build if one is renamed
   or retyped.
 - Each item is translated into one terminal `EventUpdateJob` row, so `Report`, `NewReportGetter`
