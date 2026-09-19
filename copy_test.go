@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -75,9 +76,14 @@ func trackChunkPool(t *testing.T) {
 		buffers []*chunkBuffer
 	)
 
-	// Empty the shared pool first so every buffer this test uses is tracked here.
+	// Empty the shared pool first so every buffer this test uses is tracked here. Two
+	// collections drop the buffers cached in every processor's private slot, which a drain loop
+	// on this goroutine cannot reach: without them the pipeline may reuse an untracked buffer and
+	// the assertions below become vacuous.
 	previousNew := chunkPool.New
 	chunkPool.New = nil
+	runtime.GC()
+	runtime.GC()
 	for chunkPool.Get() != nil {
 	}
 	t.Cleanup(func() {

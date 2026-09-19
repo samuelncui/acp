@@ -10,8 +10,9 @@ import (
 // The caller implements Item over whatever state it owns, so the item is the handle that ties a
 // result back to that state: Result.Job is the exact instance that was submitted, and no id
 // lookup or payload plumbing is needed. ACP calls Source and Targets under panic protection: the
-// first call describes the item, and an item whose first call failed is described once more when
-// it is reported, so a failure path may call them twice. ACP never keeps the item afterwards.
+// first call describes the item, and an item whose description failed is asked for its Source once
+// more when it is reported, so a failure path may read Source twice. ACP never keeps the item
+// afterwards.
 type Item interface {
 	// Source returns the exact path to read.
 	Source() string
@@ -63,13 +64,16 @@ type Result struct {
 	SHA256            []byte
 	SignatureCacheHit bool
 
-	// Targets holds one outcome per requested target, in request order.
+	// Targets holds one outcome per requested target, in request order. A target that was
+	// not written still has an outcome.
 	Targets []TargetResult
 }
 
 // TargetResult is the outcome of one requested target.
 type TargetResult struct {
-	Path      string
+	Path string
+	// Size is the item's size as read, so a failed or partially written target reports that
+	// size rather than a count of the bytes that landed there.
 	Size      int64
 	WriteTime time.Time
 

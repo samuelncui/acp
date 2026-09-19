@@ -121,8 +121,10 @@ func (o *option) check() error {
 	return nil
 }
 
-// Option configures one run. An option applied twice is last-wins, so a later value replaces an
-// earlier one instead of combining with it.
+// Option configures one run. A repeated value option is last-wins, so a later value replaces an
+// earlier one instead of combining with it; the job options and SetFromDevice/SetToDevice
+// accumulate, so a second WildcardJob adds another walk and a second device option adjusts the
+// same device description.
 type Option func(*option) *option
 
 func SetFromDevice(opts ...DeviceOption) Option {

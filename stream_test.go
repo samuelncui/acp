@@ -615,3 +615,171 @@ func TestItemPanicBecomesThatItemsResultError(t *testing.T) {
 		t.Fatalf("result error = %v, want the wrapped item panic", got[0][0].Err)
 	}
 }
+
+// TestSubmitRacingCloseKeepsTheFeedCountersSafe pins the concurrency contract of the feed: a
+// caller that closes the run while another goroutine is still submitting must not race the
+// pipeline's final count event, and a submission the closed run refuses is that caller's error.
+func TestSubmitRacingCloseKeepsTheFeedCountersSafe(t *testing.T) {
+	root := t.TempDir()
+	const total = 200
+
+	items := make([]Item, 0, total)
+	for index := 0; index < total; index++ {
+		name := fmt.Sprintf("%04d.txt", index)
+		source := writeSourceFile(t, root, name, []byte(name))
+		items = append(items, newFixtureItem(source, filepath.Join(root, "target", name)))
+	}
+
+	var (
+		lock    sync.Mutex
+		results []Result
+	)
+	stream, err := NewStream(context.Background(), func(batch []Result) error {
+		lock.Lock()
+		defer lock.Unlock()
+		results = append(results, batch...)
+		return nil
+	}, WithReadBuffer(1), WithResultBatch(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The feeder loops until the run refuses it, so Close lands while it is inside Submit.
+	refused := make(chan error, 1)
+	go func() {
+		for _, item := range items {
+			if err := stream.Submit(item); err != nil {
+				refused <- err
+				return
+			}
+			time.Sleep(time.Microsecond)
+		}
+		refused <- nil
+	}()
+
+	time.Sleep(5 * time.Millisecond)
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	waitErr := stream.Wait()
+
+	// A refusal is a submission error and therefore the run's error; a feeder that finished
+	// before Close leaves the run successful.
+	if err := <-refused; err == nil {
+		if waitErr != nil {
+			t.Fatalf("Wait() error = %v, want nil after a complete feed", waitErr)
+		}
+	} else {
+		if !errors.Is(err, errStreamClosed) {
+			t.Fatalf("Submit() error = %v, want the closed refusal", err)
+		}
+		if !errors.Is(waitErr, errStreamClosed) {
+			t.Fatalf("Wait() error = %v, want the submission refusal", waitErr)
+		}
+	}
+
+	lock.Lock()
+	defer lock.Unlock()
+	seen := make(map[Item]int, len(results))
+	for _, result := range results {
+		seen[result.Job]++
+	}
+	if len(results) == 0 {
+		t.Fatal("the run delivered no result at all")
+	}
+	for item, count := range seen {
+		if count != 1 {
+			t.Fatalf("item %#v was delivered %d times, want exactly 1", item, count)
+		}
+	}
+}
+
+// TestItemTargetsPanicBecomesThatItemsResultError pins the second half of the item-panic outlet:
+// a panic in Item.Targets is that item's error, exactly like a panic in Item.Source.
+func TestItemTargetsPanicBecomesThatItemsResultError(t *testing.T) {
+	callback, batches := collectResults()
+	stream, err := NewStream(context.Background(), callback, WithResultFlushInterval(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := &panickingTargetsItem{}
+	if err := stream.Submit(item); err != nil {
+		t.Fatalf("Submit() error = %v, want the item accepted", err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := stream.Wait(); err != nil {
+		t.Fatalf("Wait() error = %v, want nil: a panicking item is an item outcome", err)
+	}
+
+	got := batches()
+	if len(got) != 1 || len(got[0]) != 1 {
+		t.Fatalf("delivered %#v, want one batch of one result", got)
+	}
+	if got[0][0].Err == nil || !strings.Contains(got[0][0].Err.Error(), "Item.Targets panicked") {
+		t.Fatalf("result error = %v, want the wrapped targets panic", got[0][0].Err)
+	}
+}
+
+// panickingTargetsItem describes itself successfully and fails when its targets are read.
+type panickingTargetsItem struct{ source string }
+
+func (i *panickingTargetsItem) Source() string  { return i.source }
+func (*panickingTargetsItem) Targets() []string { panic("item targets fixture") }
+
+// TestSuccessIsDeliveredByTheFlushInterval pins the timer branch of the delivery stage: a success
+// below the batch size still reaches the caller once the interval elapses, without Close.
+func TestSuccessIsDeliveredByTheFlushInterval(t *testing.T) {
+	root := t.TempDir()
+	item := newFixtureItem(
+		writeSourceFile(t, root, "source.txt", []byte("fixture")),
+		filepath.Join(root, "target.txt"),
+	)
+
+	delivered := make(chan []Result, 1)
+	stream, err := NewStream(context.Background(), func(results []Result) error {
+		delivered <- append([]Result(nil), results...)
+		return nil
+	}, WithResultBuffer(4), WithResultBatch(4), WithResultFlushInterval(100*time.Millisecond), Overwrite(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Submit(item); err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+
+	select {
+	case results := <-delivered:
+		if len(results) != 1 || results[0].Job != Item(item) || results[0].Err != nil {
+			t.Fatalf("delivered %#v, want the successful item", results)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the flush interval never delivered the successful result")
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+}
+
+// TestPublishResultEscapesAHardStop pins the result handoff's fatal-failure escape: a full result
+// buffer cannot leave the reporting stage blocked after the pipeline hard-stopped.
+func TestPublishResultEscapesAHardStop(t *testing.T) {
+	copyer := newTestStream(t)
+	// A full result buffer with no delivery stage: only the hard stop can release this send.
+	copyer.resultCh = make(chan Result, 1)
+	copyer.resultCh <- Result{}
+	copyer.stopHard()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		copyer.publishResult(Result{})
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("publishResult stayed blocked on the result handoff after a hard stop")
+	}
+}

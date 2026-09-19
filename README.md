@@ -57,7 +57,8 @@ An item is pure data. It has no callback, so the caller finds its own state by a
 ```go
 type Item interface {
 	Source() string
-	Targets() []string // an empty slice hashes the source without writing it anywhere
+	Targets() []string // an empty slice writes nothing: it reads and hashes only when the
+	                   // hash policy produces a hash, so the default HashOff records no hash
 }
 
 type SimpleJob struct {
@@ -262,7 +263,10 @@ descriptor serves the whole item: the stored hash is read through the descriptor
 the content, and the computed hash is published through it before it closes, so a cache
 operation never reopens a path and nothing about cache writing outlives its item. A target
 carries its own descriptor and keeps it open until the item's hash is known, so the target's
-entry is published through the descriptor that wrote it, while that descriptor is still open.
+entry is published through the descriptor that wrote it, while that descriptor is still open. The
+one path-based step runs before a target has a descriptor at all: an overwrite drops the target's
+stale entry before the file is truncated, so a crash cannot leave the old entry describing the new
+bytes.
 Writers publish the hashed version's size and mtime unchanged, so an entry whose file changed
 after hashing simply fails the reader's metadata comparison and is treated as stale. Missing,
 stale, corrupt, read-only, full, or unsupported xattrs are summarized as warnings and never
@@ -324,9 +328,9 @@ c.Wait()
   `Wait`/`WaitErr` close the stream and report how the run ended.
 - `AccurateJob(src, dsts)` copies one exact source to exact target paths; `WildcardJob(Source(...),
   Target(...))`, `AccurateSource(base, paths...)`, `WildcardJobOption` walk sources, keep regular
-  files, map each source-relative path onto every target directory, sort them in the platform's
-  path order, and dedupe. The walking, the mapping, the ordering and the dedupe are unexported
-  helpers now: `SelectFiles` and `FileEntry` are gone.
+  files, map each source-relative path onto every target directory, and sort them in the
+  platform's path order. The walking, the mapping and the ordering are unexported helpers now:
+  the intermediate revision's `SelectFiles` and `FileEntry` are gone.
 - A repeated relative path inside one `WildcardJob` is an enumeration error that **ends the
   run**: `WaitErr` returns it and nothing is copied, instead of logging it and keeping the
   first file.
@@ -339,20 +343,29 @@ c.Wait()
   `DecodeCachedSignature`, `ErrTargetNoSpace`, `ErrTargetDropToReadonly`, `ErrTargetIO`,
   `CopyAttrs`, `UnexpectFileMode`.
 - `WithHash(true)` maps to `HashReadRefresh` and `WithHash(false)` to `HashOff`; a repeated hash
-  option is last-wins.
-- Each item is translated into exactly one terminal `EventUpdateJob` row, so `Report`,
-  `NewReportGetter` and the JSON report keep their shape, including a row for an item ACP could
-  not process: its failure travels under the empty `fail_target` key.
+  option is last-wins. The shell also carries today's additive options and errors
+  (`WithReadMode`, the result options, `WithHashPolicy`, `ErrTargetIO` and so on): every
+  `af05f05c` symbol keeps working, and `compat_af05f05c_test.go` fails the build if one is renamed
+  or retyped.
+- Each item is translated into one terminal `EventUpdateJob` row, so `Report`, `NewReportGetter`
+  and the JSON report keep their shape, including a row for an item ACP could not process: its
+  failure travels under the empty `fail_target` key. The row is keyed by the joined relative path,
+  exactly as `af05f05c` keyed it, so two items that resolve to one relative path share a row; a
+  repeated relative path inside one job option already ends the run, and a library caller that
+  submits overlapping job options should treat the shared row as a known limit of the report
+  surface.
 - A row keeps the `af05f05c` fields: `base` is the directory the source-relative `path` segments
   are resolved against, and `path` is an array. `full_path` names the source as one whole path
   and `signature_cache_hit` reports where the hash came from; both are additive fields, so a row
   written without them is the document `af05f05c` wrote. `NewReportGetter` still keys a row by
   the joined relative path.
-- One behaviour differs from `af05f05c` and is deliberate: an error the pipeline reports for a
-  path — a walk that could not read a directory, a target that could not be removed after its
-  metadata failed — is a run error, so `WaitErr` returns it and `cmd/acp` exits non-zero.
+- Two behaviours differ from `af05f05c` and are deliberate. First, an error the pipeline reports
+  for a path — a walk that could not read a directory, a target that could not be removed after
+  its metadata failed — is a run error, so `WaitErr` returns it and `cmd/acp` exits non-zero;
   `af05f05c` only logged such an error and published its event, and finished with a success
-  status.
+  status. Second, `WithHash(true)` manages the content-signature cache on the source and on every
+  target, which `af05f05c` had no code for: a computed hash is published as a disposable
+  size-and-mtime entry, and an overwritten target drops its stale entry before it is truncated.
 
 ## Withdrawn versions and how to migrate
 
@@ -369,12 +382,21 @@ the intermediate names of this development branch, migrates like this:
 | `StreamSink` (`Write(ctx, *StreamResult) error`, `Flush(ctx) error`) | the `onResults func([]Result) error` callback; ACP owns the flush and the batch |
 | `StreamRequest{ID, Source, Targets}` | the caller's own `Item` (`Source()`, `Targets()`); the ID becomes a field of that item |
 | `StreamResult{ID, Job *Job}` | `Result`: `Result.Job` is the submitted `Item`, so the caller recovers its own state by assertion |
-| `WithSignatureCache(bool)` (v0.2.0) | `WithHashPolicy(HashReadRefresh)`, or `WithHashPolicy(HashOff)` to disable the cache |
-| `ForceRehash(bool)` (v0.2.0) | `WithHashPolicy(HashReadRefresh)` |
+| `WithSignatureCache(bool)` (v0.2.0) | `WithHashPolicy(HashCachedOrReadRefresh)` — it transfers as a refresh policy but still reuses a valid stored hash — or `WithHashPolicy(HashOff)` to disable the cache |
+| `ForceRehash(bool)` (v0.2.0) | `WithHashPolicy(HashReadRefresh)`: always hash the content and rewrite the stored entry |
+| `SourceWithPath(base, paths ...string)` (v0.1.0 and v0.2.0) | `AccurateSource(base, segments ...[]string)`: the shell keeps the `af05f05c` form, so each whole path becomes its segment slice — `SourceWithPath(b, "a/x")` is `AccurateSource(b, []string{"a", "x"})` |
+| `Job.Path string` (v0.1.0 and v0.2.0 reports) | `Job.Path []string`: the row now carries the source-relative segments beside `Base`, and `FullPath` repeats the whole path |
 | `Run`, `BatchSource`, `RunStream` request/result variants of this branch's earlier revisions | the same mapping: one feed loop, one results callback |
 
 The `af05f05c` report surface stays: `Report`, `Job`, `Error`, `NewReportGetter` and the JSON
 document keep their shape, and the shell fills one terminal row per item.
+
+## Divergence from upstream `mmap`
+
+This module started from the Go project's `mmap` package and is maintained here now: reads run
+through the descriptor ACP owns, `Close` is idempotent and removes the mapping before it closes
+that descriptor, a slice range is validated before anything is allocated, and a platform without
+a mapping reads through the descriptor instead. Upstream changes are not merged automatically.
 
 # Install
 ```
@@ -448,7 +470,8 @@ failed item still gets a terminal row. The top-level `errors` array carries pipe
 only, so a single failure is recorded once. A row names its source the `af05f05c` way: `base`
 plus the source-relative `path` array, with `full_path` as the additive whole path.
 
-`-report-indent` writes the same document with a two-space indent. The report is plain JSON:
+`-report-indent` writes the same document with a two-space indent (`cmd/acp-rewrite` indents its
+accumulated report with a tab). The report is plain JSON:
 `encoding/json` reads and writes it, including the `fail_target` map, so no ACP-specific
 decoder is needed. `cmd/acp-rewrite` accumulates its `-report` across runs and treats a report
 it cannot decode as a fatal error instead of starting over with an empty history.

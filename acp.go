@@ -57,9 +57,11 @@ type StreamCopyer struct {
 	order uint64
 
 	// countBytes and countFiles are the indexed totals of the feed, which is what a progress
-	// consumer sizes its display from.
-	countBytes int64
-	countFiles int64
+	// consumer sizes its display from. Submit writes them while it feeds and the pipeline reads
+	// them for its final event, and a caller is allowed to Close from another goroutine, so they
+	// are atomic.
+	countBytes atomic.Int64
+	countFiles atomic.Int64
 
 	// onResults receives one batch of results at a time, from one goroutine.
 	onResults func([]Result) error
@@ -178,15 +180,15 @@ func (c *StreamCopyer) Submit(items ...Item) error {
 		job := c.buildJob(item, c.order)
 		c.order++
 		if job.itemError == nil && job.stat != nil {
-			c.countFiles++
-			c.countBytes += job.stat.size
+			c.countFiles.Add(1)
+			c.countBytes.Add(job.stat.size)
 		}
 		if err := c.push(job); err != nil {
 			c.setError(err)
 			return err
 		}
 	}
-	c.submit(&EventUpdateCount{Bytes: c.countBytes, Files: c.countFiles})
+	c.submit(&EventUpdateCount{Bytes: c.countBytes.Load(), Files: c.countFiles.Load()})
 
 	return nil
 }
@@ -370,8 +372,10 @@ func (c *StreamCopyer) linearTargetStopped() bool {
 
 // run owns the pipeline. It drains in dependency order, so a hard stop leaves jobs behind and
 // closes every stage that is still connected. It closes the result buffer on every path,
-// including a fatal panic, and waits for the delivery stage before it publishes its last events:
-// the caller has seen every result by the time the run reports that it finished.
+// including a fatal panic, and waits for the delivery stage before it closes the event channel:
+// the caller has seen every result by the time EventFinished is delivered. The intermediate
+// finished flags describe their own counter, not the results, so they may arrive before the
+// final flush.
 func (c *StreamCopyer) run(ctx context.Context) error {
 	defer close(c.eventCh)
 	defer c.finishSignatureCache()
@@ -394,7 +398,7 @@ func (c *StreamCopyer) run(ctx context.Context) error {
 	}
 
 	// The feed ended when the read buffer closed, so the indexed totals are final.
-	c.submit(&EventUpdateCount{Bytes: c.countBytes, Files: c.countFiles, Finished: true})
+	c.submit(&EventUpdateCount{Bytes: c.countBytes.Load(), Files: c.countFiles.Load(), Finished: true})
 
 	return nil
 }

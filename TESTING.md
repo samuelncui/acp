@@ -190,7 +190,7 @@ go test -run '^(TestRunCopiesItemsToLinearTarget|TestForwardPreparedOrdersOnlyLi
 ```
 
 Run the target-failure drain test, which proves every read buffer is released and no goroutine
-deadlocks. It writes to `/dev/full`, so it runs on Linux only:
+deadlocks. It uses its own failing writer, so it runs on every platform:
 
 ```sh
 go test -race -run '^TestWriteFailureDrainsBuffersAndTargets$' .
@@ -244,8 +244,9 @@ GOOS=linux GOARCH=amd64 go build ./...
 GOOS=windows GOARCH=amd64 go build ./...
 ```
 
-The Darwin and FreeBSD builds cover the platform-specific memory mapping (including the
-`mmap_other.go` fallback) and the managed signature attribute:
+The Darwin and FreeBSD builds cover the platform-specific memory mapping and the managed
+signature attribute; `mmap_other.go` is the FreeBSD fallback, so only the FreeBSD build compiles
+it:
 
 ```sh
 GOOS=darwin GOARCH=arm64 go build ./...

@@ -37,8 +37,10 @@ forwards what it holds; a stage that pulls an item it can no longer start marks 
 stopping reason, and the delivery stage is the only goroutine that invokes the results callback.
 A graceful stop therefore gives every accepted item exactly one result. `hardStop` stays reserved
 for fatal failures, which make no per-item promise; a panic that escapes pipeline code triggers
-it, so every handoff — the read buffer, a chunk send, an event send and the result buffer — has a
-`hardStop` escape instead of leaving a blocked send behind.
+it, so every pipeline handoff — the read buffer, a chunk send, an event submission and the result
+buffer — carries a `hardStop` escape instead of leaving a blocked send behind. The event fan-out is
+the one deliberate exception: it hands every event to each handler channel and then waits for the
+handlers, so a handler that never returns still holds the run open (`README.md` states it).
 
 ## Current maintenance context
 
@@ -87,7 +89,7 @@ entry point is `NewStream` with `Submit`/`Close`/`Wait`; `Run` and `BatchSource`
   is complete and before the descriptor closes. A target publishes its entry through the
   descriptor the writer wrote it with, while that descriptor is still open; no cache operation
   reopens a path, and no cache write outlives its item.
-- Repeated options are last-wins (`WithEventHandler` included), and the shell rejects a repeated
+- Repeated value options are last-wins (`WithEventHandler` included), and the shell rejects a repeated
   relative path instead of copying one target twice.
 
 The working tree may already contain staged or unstaged changes. Preserve them and do not reset, rewrite, or discard unrelated work.
@@ -115,7 +117,7 @@ The working tree may already contain staged or unstaged changes. Preserve them a
 - Never discard reservations a disk-usage cache already counted for copies still in flight on the same mount point; a refresh replaces the capacity estimate, not the commitments.
 - Treat a file system without the managed signature attribute namespace as a cache that stores nothing: reading is a miss, and writing or removing it is a no-op rather than a recorded failure.
 - Keep `mmap` a conforming `io.Reader`/`io.ReaderAt`: the end of the content is `io.EOF`, a mapping whose `madvise` failed is released before the error returns, `Close` is idempotent on every platform, a slice range is validated before anything is allocated, and the reader owns the descriptor it opened: `Close` removes the mapping before it closes that descriptor, and `File` reports it until then.
-- Repeated options are last-wins; `WithEventHandler` replaces the previous handler, `WithEventHandler(nil)` clears it, and an event handler is only ever called from one goroutine per registration.
+- Repeated value options are last-wins while the job options and `SetFromDevice`/`SetToDevice` accumulate; `WithEventHandler` replaces the previous handler, `WithEventHandler(nil)` clears it, and an event handler is only ever called from one goroutine per registration.
 - Validate every option in `NewStream`/`New` instead of midway through a run, and keep `Overwrite` a run-level option so it cannot be passed to `SetToDevice`.
 - Persist retry state before considering a rewrite or hardlink operation complete.
 - Preserve build-tagged behavior in `syscall_*`, `mmap/*`, and `cmd/acp-rewrite/file_*` files.
@@ -124,7 +126,7 @@ The working tree may already contain staged or unstaged changes. Preserve them a
 - Keep one descriptor per item. The stored hash is read through the descriptor that reads the content, the computed hash is published through that same descriptor before it closes, and a target publishes its entry through the descriptor that wrote it while that descriptor is still open. Never reopen a path to read or write a cache entry: an entry must describe the exact file version the item handled. Dropping a target's stale entry before the target is truncated is the one path-based cache step, and it happens before that target has a descriptor at all.
 - Report signature-cache read and write failures as aggregate warnings without adding them to `WaitErr`.
 - Treat data as stable for the duration of one run: the operator guarantees that a source does not change while work is in progress, and the implementation does not detect or recover from a mid-flow change. An item completes with the facts it observed, so its size and hash come from the actual read; a change check must never produce a failure or a completion built from pre-read facts. Revalidation a caller performs around ACP stays the caller's own policy.
-- Reject a reuse-only hash policy (`HashCachedOnly`, `HashCachedOrRead`) for an item that requests targets, as an option error. A transfer always reads its source and produces a computed hash, so the policy name would promise a stored hash the run cannot use.
+- Reject a reuse-only hash policy (`HashCachedOnly`, `HashCachedOrRead`) for an item that requests targets, as that item's `Result.Err` (not an option error): the run keeps going and the item fails, because a transfer always reads its source and produces a computed hash, so the policy name would promise a stored hash the run cannot use.
 - Wrap every call into caller-implemented code — the results callback, event handlers, and
   `Item.Source`/`Item.Targets` — so a panic becomes an error instead of unwinding a pipeline
   goroutine that owns channel closing. A panicking callback or event handler is a run error that

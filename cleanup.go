@@ -25,8 +25,9 @@ func (s *resultSink) deliver(results []Result) {
 	copyer := s.copyer
 	var callbackErr error
 	if panicErr := protectCall("onResults", func() { callbackErr = copyer.onResults(results) }); panicErr != nil {
-		// A panicking callback is a fatal failure of the delivery path: it is reported from
-		// Wait and from Close, and the remaining items keep their accounting.
+		// A panicking callback is recorded as the run's error and reported from Wait and from
+		// Close. It does not stop the delivery stage: every later result is still handed to the
+		// callback, so the remaining items keep their accounting.
 		stopErr := fmt.Errorf("results callback failed, %w", panicErr)
 		copyer.setError(stopErr)
 		copyer.recordClose(stopErr)

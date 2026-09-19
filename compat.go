@@ -250,8 +250,8 @@ func (i *compatItem) Source() string { return i.source }
 
 func (i *compatItem) Targets() []string { return i.targets }
 
-// relative is the source-relative path the row's segments join to, which is what orders and
-// de-duplicates one enumeration.
+// relative is the source-relative path the row's segments join to, which is what orders one
+// enumeration and keys its report row.
 func (i *compatItem) relative() string { return path.Join(i.path...) }
 
 // reportResults translates every result into the terminal report row event the report machinery
