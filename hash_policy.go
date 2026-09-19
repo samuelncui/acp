@@ -79,7 +79,10 @@ func (p HashPolicy) producesHash() bool {
 	return p != HashOff
 }
 
-// usesCache reports whether stored hashes are read at all.
+// usesCache reports whether the policy touches the stored cache at all: it either reuses a stored
+// hash, refreshes one with a computed hash, or both. It is what decides whether a run needs a
+// signature cache, and it is true for HashRead, which hashes content and writes nothing:
+// reusesCache reports the lookup, refreshesCache reports the write.
 func (p HashPolicy) usesCache() bool {
 	return p != HashOff
 }

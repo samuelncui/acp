@@ -641,13 +641,14 @@ func TestStoppedLinearTargetRefusesSubmission(t *testing.T) {
 	}
 }
 
-// TestSubmitRejectsANilItem pins the feed's input validation: a nil item is a submission error
-// that ends the run, and the items accepted before it keep their outcome.
+// TestSubmitRejectsANilItem pins the feed's input validation: a nil item is a submission error that
+// is recorded as the run error without ending the feed, and every accepted item keeps its outcome.
 func TestSubmitRejectsANilItem(t *testing.T) {
 	root := t.TempDir()
 	input := writeSourceFile(t, root, "source.txt", []byte("fixture"))
 	item := newFixtureItem(input, filepath.Join(root, "target.txt"))
-	fixture := newStreamFixture(item)
+	after := newFixtureItem(input, filepath.Join(root, "target-after.txt"))
+	fixture := newStreamFixture(item, after)
 
 	stream, err := NewStream(context.Background(), fixture.onResults)
 	if err != nil {
@@ -659,14 +660,21 @@ func TestSubmitRejectsANilItem(t *testing.T) {
 	if err := stream.Submit(nil); err == nil {
 		t.Fatal("Submit(nil) error = nil, want a rejected item")
 	}
+	// A rejected submission is that submission's error, not a stopping reason: the run still
+	// accepts what the caller submits next.
+	if err := stream.Submit(after); err != nil {
+		t.Fatalf("Submit() after a rejected item error = %v, want the item accepted", err)
+	}
 	if err := stream.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
 	if err := stream.Wait(); err == nil {
 		t.Fatal("Wait() error = nil, want the rejected item")
 	}
-	if _, err := item.terminal(t); err != nil {
-		t.Fatalf("item failed: %v", err)
+	for _, submitted := range []*fixtureItem{item, after} {
+		if _, err := submitted.terminal(t); err != nil {
+			t.Fatalf("item failed: %v", err)
+		}
 	}
 }
 

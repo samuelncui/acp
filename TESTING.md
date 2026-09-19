@@ -206,8 +206,11 @@ go test -race -run '^(TestRunMapsDeviceFullToTargetNoSpace|TestDeviceFullWriteFa
 ```
 
 These three select no test on another platform: the file that defines them is Linux-only. Note
-that `/dev/full` refuses `fallocate` with `ENODEV`, so the non-linear pre-allocation there reports
-`ErrTargetIO`; the `ErrTargetNoSpace` identity for that path comes from the filled-volume test.
+that `/dev/full` refuses `fallocate` with `ENODEV`, which is none of the errors a target operation
+classifies (`ENOSPC`, `EROFS`, `EIO`): the non-linear pre-allocation there fails that target with
+the device's own `ENODEV`, not with `ErrTargetIO` and not with `ErrTargetNoSpace`. The
+`ErrTargetNoSpace` identity for that path comes from the filled-volume test, which produces a real
+`ENOSPC`.
 
 Run hash policy tests, which pin the reuse, read, and refresh matrix, and the no-op policy of
 a file system without the managed signature attribute:
@@ -221,7 +224,7 @@ cache entry never travels through a reopened path, and the publication-order tes
 item publishes its entry before its result:
 
 ```sh
-go test -run '^(TestCachedSignatureCodec|TestSignatureCache|TestRunSignature|TestRunHashPolicy|TestRunRefresh|TestRunTransfer|TestOverwriteInvalidates|TestRunCorruptSignature|TestRunReadsTheStoredHash|TestRunWrites|TestRunPublishes)' .
+go test -run '^(TestCachedSignatureCodec|TestSignatureCache|TestRunSignature|TestRunHashPolicy|TestRunRefresh|TestRunTransfer|TestOverwriteInvalidates|TestRunCorruptSignature|TestRunReadsTheStoredHash|TestRunWrites|TestRunPublishes|TestRunHoldsTargetCache|TestManagedSignature)' .
 ```
 
 Run `acp-rewrite` tests, which pin one rewrite through its scratch file, the state and report
@@ -262,6 +265,13 @@ Compile the Windows-specific root package tests without running them:
 ```sh
 GOOS=windows GOARCH=amd64 go test -c -o /tmp/acp-windows.test .
 ```
+
+`make check` builds for Windows but vets only the host platform. `GOOS=windows GOARCH=amd64 go
+vet ./...` reports `possible misuse of unsafe.Pointer` in `mmap/mmap_windows.go`, on the
+`unsafe.Slice` call that turns the address `syscall.MapViewOfFile` returned into the mapped slice.
+That conversion is the supported way to read a mapped address, vet's `unsafeptr` check cannot know
+that a syscall result is a valid pointer, and the only formulation it accepts is the deprecated
+`reflect.SliceHeader` pattern, so the diagnostic is accepted instead of worked around.
 
 ## Change checklist
 

@@ -102,7 +102,8 @@ func NewStream(ctx context.Context, onResults func([]Result) error, opts ...Opti
 	return newStream(ctx, onResults, opt)
 }
 
-// buildOption applies every option in order, so a repeated option is last-wins.
+// buildOption applies every option in order, so a repeated value option is last-wins while the
+// options that accumulate build on what came before them.
 func buildOption(opts ...Option) (*option, error) {
 	opt := newOption()
 	for _, o := range opts {
@@ -158,7 +159,8 @@ func newStream(ctx context.Context, onResults func([]Result) error, opt *option)
 // results callback returned an error, or after a fatal pipeline failure.
 //
 // A single submitter is required, and Items must be submitted before Close. A nil item is a
-// submission error and ends the run.
+// submission error that does not end the feed: it is recorded as the run's error, so Wait reports
+// it, and the items submitted after it are still accepted.
 func (c *StreamCopyer) Submit(items ...Item) error {
 	if err := c.feedStop(); err != nil {
 		// An exhausted linear target stays an item outcome: the items that reached it carry
