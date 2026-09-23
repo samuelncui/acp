@@ -36,6 +36,136 @@ func collectResults() (func([]Result) error, func() [][]Result) {
 	return callback, snapshot
 }
 
+type readModeItem struct {
+	*SimpleJob
+	mode     ReadMode
+	panicErr error
+	calls    int
+}
+
+func (i *readModeItem) ReadMode() ReadMode {
+	i.calls++
+	if i.panicErr != nil {
+		panic(i.panicErr)
+	}
+	return i.mode
+}
+
+func TestItemsOverrideTheStreamReadMode(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		streamMode ReadMode
+		withOption bool
+		overrides  []ReadMode
+	}{
+		{name: "implicit buffered default", overrides: []ReadMode{ReadMapped, ReadBuffered}},
+		{name: "mapped stream default", streamMode: ReadMapped, withOption: true, overrides: []ReadMode{ReadBuffered, ReadMapped}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			plain := &SimpleJob{Path: writeSourceFile(t, root, "plain", []byte("plain")), Dsts: []string{filepath.Join(root, "plain-copy")}}
+			first := &readModeItem{SimpleJob: &SimpleJob{Path: writeSourceFile(t, root, "first", []byte("first")), Dsts: []string{filepath.Join(root, "first-copy")}}, mode: tc.overrides[0]}
+			second := &readModeItem{SimpleJob: &SimpleJob{Path: writeSourceFile(t, root, "second", []byte("second")), Dsts: []string{filepath.Join(root, "second-copy")}}, mode: tc.overrides[1]}
+			items := []Item{plain, first, second}
+
+			// Observe the mode ACP actually passes to its source opener, including the item that
+			// has no override. Source preparation may run concurrently.
+			previous := openSourceContent
+			var lock sync.Mutex
+			opened := make(map[string]ReadMode)
+			openSourceContent = func(path string, mode ReadMode) (itemSource, error) {
+				lock.Lock()
+				opened[path] = mode
+				lock.Unlock()
+				return previous(path, mode)
+			}
+			t.Cleanup(func() { openSourceContent = previous })
+
+			callback, batches := collectResults()
+			opts := []Option{WithHashPolicy(HashReadRefresh)}
+			if tc.withOption {
+				opts = append(opts, SetFromDevice(WithReadMode(tc.streamMode)))
+			}
+			if err := runStream(context.Background(), callback, items, opts...); err != nil {
+				t.Fatalf("run error = %v", err)
+			}
+
+			wantModes := map[string]ReadMode{plain.Path: tc.streamMode, first.Path: first.mode, second.Path: second.mode}
+			lock.Lock()
+			if !reflect.DeepEqual(opened, wantModes) {
+				t.Errorf("source modes = %v, want %v", opened, wantModes)
+			}
+			lock.Unlock()
+			if first.calls != 1 || second.calls != 1 {
+				t.Errorf("override calls = %d/%d, want one each", first.calls, second.calls)
+			}
+			results := make(map[Item]Result)
+			for _, batch := range batches() {
+				for _, result := range batch {
+					results[result.Job] = result
+				}
+			}
+			if len(results) != len(items) {
+				t.Fatalf("results = %d, want %d", len(results), len(items))
+			}
+			for _, item := range items {
+				result := results[item]
+				if result.Err != nil || len(result.Targets) != 1 || result.Targets[0].Err != nil {
+					t.Fatalf("item %q result = %#v", item.Source(), result)
+				}
+				got, err := os.ReadFile(item.Targets()[0])
+				if err != nil {
+					t.Fatal(err)
+				}
+				want, err := os.ReadFile(item.Source())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(got, want) {
+					t.Errorf("target %q = %q, want %q", item.Targets()[0], got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestItemReadModeFailureDoesNotStopTheRun(t *testing.T) {
+	root := t.TempDir()
+	panicCause := errors.New("read mode fixture")
+	panicking := &readModeItem{SimpleJob: &SimpleJob{Path: writeSourceFile(t, root, "panic", []byte("panic"))}, panicErr: panicCause}
+	invalid := &readModeItem{SimpleJob: &SimpleJob{Path: writeSourceFile(t, root, "invalid", []byte("invalid"))}, mode: ReadMode(99)}
+	good := &SimpleJob{Path: writeSourceFile(t, root, "good", []byte("good"))}
+	callback, batches := collectResults()
+	if err := runStream(context.Background(), callback, []Item{panicking, invalid, good}, WithHashPolicy(HashRead)); err != nil {
+		t.Fatalf("run error = %v, want item failures only", err)
+	}
+
+	results := make(map[Item]Result)
+	for _, batch := range batches() {
+		for _, result := range batch {
+			if _, exists := results[result.Job]; exists {
+				t.Fatalf("item %q was reported twice", result.Job.Source())
+			}
+			results[result.Job] = result
+		}
+	}
+	if len(results) != 3 {
+		t.Fatalf("results = %d, want 3", len(results))
+	}
+	if err := results[panicking].Err; !errors.Is(err, panicCause) || !strings.Contains(err.Error(), "Item.ReadMode panicked") {
+		t.Errorf("panicking item error = %v, want protected caller panic", err)
+	}
+	if err := results[invalid].Err; err == nil || !strings.Contains(err.Error(), "unknown item read mode") {
+		t.Errorf("invalid item error = %v, want invalid mode", err)
+	}
+	if result := results[good]; result.Err != nil || len(result.SHA256) != sha256.Size {
+		t.Errorf("following item result = %#v, want a complete hash", result)
+	}
+	if panicking.calls != 1 || invalid.calls != 1 {
+		t.Errorf("override calls = %d/%d, want one each", panicking.calls, invalid.calls)
+	}
+}
+
 // TestFailedResultBypassesTheResultBuffer pins error rule 1: a result that carries an error is
 // delivered immediately instead of waiting for a batch or the flush interval, so a caller can
 // persist it before it submits the next batch. Both error outlets count: the item's own error and
