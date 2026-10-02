@@ -101,6 +101,9 @@ non-zero. `TestACPCommandExitsNonZeroWhenACopyFails` refuses one target with `-n
 a non-zero exit status together with a report that names the refused target.
 
 The command end-to-end tests are skipped when `go test` is run with `-short`.
+`TestACPCommandHonorsIndexAndReportFlags` also verifies that `-notarget` leaves an explicit
+target untouched and reports no target outcomes, and that a completed copy exits non-zero
+when its requested report cannot be written.
 
 ## Focused tests
 
@@ -182,6 +185,13 @@ mid-run:
 
 ```sh
 go test -run '^(TestRunStopsFeedingItemsAfterGracefulStop|TestRunDoesNotReportAStopAfterACompleteRun|TestRunCancellationDrainsPrefetchedItems|TestRunReportsEveryAcceptedItemExactlyOnce)$' .
+```
+
+Run feed shutdown tests, which hold the count-event handoff while `Close` waits, verify the
+concurrent feed counters, and exclude an item whose handoff was refused from indexed totals:
+
+```sh
+go test -race -run '^(TestCloseWaitsForTheSubmissionCountEvent|TestSubmitCountsOnlyAcceptedItems|TestSubmitRacingCloseKeepsTheFeedCountersSafe)$' .
 ```
 
 Run linear stream-order tests:

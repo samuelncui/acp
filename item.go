@@ -23,6 +23,14 @@ type Item interface {
 	Targets() []string
 }
 
+// ReadModeItem optionally selects how one item's source content is read. Items that do not
+// implement it use the source device mode set by WithReadMode, which defaults to ReadBuffered.
+// ACP calls ReadMode once while indexing a describable item. A panic or invalid mode fails only
+// that item; it does not stop the run.
+type ReadModeItem interface {
+	ReadMode() ReadMode
+}
+
 // SimpleJob is an Item that carries no state of its own: Path is the source and Dsts are the
 // destinations. A caller that submits a SimpleJob finds its result by matching Result.Job
 // against the pointer it submitted, because SimpleJob has no callback of its own.

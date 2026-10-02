@@ -34,18 +34,21 @@ func init() {
 }
 
 func main() {
+	// Parse the command and establish its cancellation context.
 	ctx, cancel := context.WithCancel(context.Background())
-
 	cpuid.Flags()
 	flag.Parse()
 	cpuid.Detect()
 
+	// An index has no destinations even when -target was also supplied.
 	sources := flag.Args()
 	if len(sources) == 0 {
 		logrus.Fatalf("cannot found source path")
 	}
 
-	if !*noTarget && len(targetPaths) == 0 {
+	if *noTarget {
+		targetPaths = nil
+	} else if len(targetPaths) == 0 {
 		targetPaths = append(targetPaths, sources[len(sources)-1])
 		sources = sources[:len(sources)-1]
 	}
@@ -53,6 +56,7 @@ func main() {
 		logrus.Fatalf("cannot found source path")
 	}
 
+	// Interrupts stop the feed while the pipeline drains accepted work.
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt)
 	go func() {
@@ -64,6 +68,7 @@ func main() {
 		}
 	}()
 
+	// Collect the report and configure the requested copy or index operation.
 	report := newReport()
 	opts := make([]acp.Option, 0, 8)
 
@@ -79,6 +84,7 @@ func main() {
 	opts = append(opts, acp.WithHash(*reportPath != ""))
 	opts = append(opts, acp.Overwrite(!*notOverwrite))
 
+	// Linear devices serialize their own side of the transfer.
 	if *fromLinear {
 		opts = append(opts, acp.SetFromDevice(acp.LinearDevice(true)))
 	}
@@ -101,6 +107,7 @@ func main() {
 	}
 	opts = append(opts, acp.WithEventHandler(handler))
 
+	// Drain the run before deciding its status or writing the report.
 	copyer, err := acp.New(ctx, opts...)
 	if err != nil {
 		logrus.Fatalf("unexpected exit: %s", err)
@@ -112,14 +119,15 @@ func main() {
 
 	// The report is stored even when the run failed, so a batch can be inspected after the
 	// command told its caller that something went wrong.
-	if err := storeReport(report, *reportPath, *reportIndent); err != nil {
-		logrus.Warnf("open report fail, path= '%s', err= %s", *reportPath, err)
+	reportErr := storeReport(report, *reportPath, *reportIndent)
+	if reportErr != nil {
+		logrus.Warnf("open report fail, path= '%s', err= %s", *reportPath, reportErr)
 		logrus.Infof("report= %q", report.getter().ToJSONString(false))
 	}
 
 	// A copy that did not finish is not a success: an item ACP could not process, a target
-	// that was not written, or a pipeline failure all make the command exit non-zero.
-	if runErr != nil || report.hasFailure() {
+	// that was not written, a pipeline failure or an unsaved requested report all exit non-zero.
+	if runErr != nil || reportErr != nil || report.hasFailure() {
 		os.Exit(1)
 	}
 }

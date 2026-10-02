@@ -162,6 +162,7 @@ func newStream(ctx context.Context, onResults func([]Result) error, opt *option)
 // submission error that does not end the feed: it is recorded as the run's error, so Wait reports
 // it, and the items submitted after it are still accepted.
 func (c *StreamCopyer) Submit(items ...Item) error {
+	// Check stopping reasons once per batch, so accepted work can still drain after a stop.
 	if err := c.feedStop(); err != nil {
 		// An exhausted linear target stays an item outcome: the items that reached it carry
 		// the error, and the run itself is not a failure.
@@ -171,6 +172,7 @@ func (c *StreamCopyer) Submit(items ...Item) error {
 		return err
 	}
 
+	// Describe and hand off each item before reporting the batch's indexed totals.
 	for _, item := range items {
 		if item == nil {
 			err := fmt.Errorf("submit failed, item is nil")
@@ -181,17 +183,19 @@ func (c *StreamCopyer) Submit(items ...Item) error {
 		// Orders are zero-based: the linear reorder buffer forwards from request zero.
 		job := c.buildJob(item, c.order)
 		c.order++
-		if job.itemError == nil && job.stat != nil {
-			c.countFiles.Add(1)
-			c.countBytes.Add(job.stat.size)
-		}
 		if err := c.push(job); err != nil {
 			c.setError(err)
 			return err
 		}
 	}
-	c.submit(&EventUpdateCount{Bytes: c.countBytes.Load(), Files: c.countFiles.Load()})
 
+	// Close must not end the pipeline while the feed still owns an event send. If it already
+	// closed the feed, the pipeline's final count event owns the totals instead.
+	c.feedLock.Lock()
+	defer c.feedLock.Unlock()
+	if !c.closed {
+		c.submit(&EventUpdateCount{Bytes: c.countBytes.Load(), Files: c.countFiles.Load()})
+	}
 	return nil
 }
 
@@ -227,15 +231,23 @@ func (c *StreamCopyer) Wait() error {
 // push hands one job to the read buffer. It holds the feed lock, so Close cannot close the
 // channel between the check and the send.
 func (c *StreamCopyer) push(job *baseJob) error {
+	// Keep channel ownership with the feed until this handoff has settled.
 	c.feedLock.Lock()
 	defer c.feedLock.Unlock()
-
 	if c.closed {
 		return errStreamClosed
 	}
 
+	// Snapshot indexed facts before another stage can update the job, and count them only if
+	// the handoff succeeds, before Close can publish the pipeline's final totals.
+	var files, size int64
+	if job.itemError == nil && job.stat != nil {
+		files, size = 1, job.stat.size
+	}
 	select {
 	case c.readCh <- job:
+		c.countFiles.Add(files)
+		c.countBytes.Add(size)
 		return nil
 	case <-c.hardStop:
 		return errStreamStopped

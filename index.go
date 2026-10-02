@@ -60,11 +60,12 @@ func (c *StreamCopyer) newJob(item Item, targets []string, order uint64) (*baseJ
 
 	path := filepath.Clean(sourceName)
 	job := &baseJob{
-		copyer:  c,
-		item:    item,
-		path:    path,
-		targets: targets,
-		order:   order,
+		copyer:   c,
+		item:     item,
+		path:     path,
+		targets:  targets,
+		order:    order,
+		readMode: c.fromDevice.readMode,
 	}
 
 	// A transfer always reads its source, so a policy that trades a computed hash for a
@@ -74,6 +75,14 @@ func (c *StreamCopyer) newJob(item Item, targets []string, order uint64) (*baseJ
 			"check hash policy failed, policy= %s, source= '%s': a copy always reads its source so it cannot reuse a stored hash",
 			c.hashPolicy, path,
 		)
+	}
+	if selected, ok := item.(ReadModeItem); ok {
+		if err := protectCall("Item.ReadMode", func() { job.readMode = selected.ReadMode() }); err != nil {
+			return job, err
+		}
+		if job.readMode != ReadBuffered && job.readMode != ReadMapped {
+			return job, fmt.Errorf("unknown item read mode, mode= %s", job.readMode)
+		}
 	}
 
 	info, err := os.Stat(path)

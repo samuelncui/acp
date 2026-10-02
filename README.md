@@ -61,6 +61,11 @@ type Item interface {
 	                   // hash policy produces a hash, so the default HashOff records no hash
 }
 
+// Optional: override the source device mode for this item.
+type ReadModeItem interface {
+	ReadMode() ReadMode
+}
+
 type SimpleJob struct {
 	Path string
 	Dsts []string
@@ -126,7 +131,9 @@ type TargetResult struct {
    exactly once and the run continues. A panic that escapes pipeline code itself is recorded as
    the run error and ends the run.
 7. **`Close` then `Wait`**, with a single submitter. `Submit` blocks while the read buffer is
-   full, which is the feed's backpressure, and a nil item is a submission error. A caller must
+   full, which is the feed's backpressure, and a nil item is a submission error. When `Close`
+   races a submission, indexed totals include only accepted items, and shutdown waits for the
+   feed's count-event send before closing event delivery. A caller must
    not call `Close`, `Wait` or `Submit` from inside `onResults`: the callback runs on the
    delivery goroutine, so `Close` would wait for the call it is in.
 
@@ -195,7 +202,10 @@ concurrently, so it may keep unguarded state; registering the same handler twice
 registration, so it is still called once. The results callback is called from one goroutine as
 well, never concurrently.
 
-`WithReadMode` applies to the source device only. Buffered reads are the default and avoid
+`WithReadMode` applies to the source device only. An item implementing `ReadModeItem` overrides
+that choice for its own source; ACP calls the method once during indexing, and an invalid mode
+or panic fails that item without stopping the run. Items without the method keep the device mode.
+Buffered reads are the default and avoid
 updating the source access time where the platform allows it (`O_NOATIME`, with a fallback when
 the open is refused); mapped reads use the `mmap` package, whose reader reports the end of an
 empty mapping immediately. Either way one descriptor serves the whole item.
@@ -446,7 +456,9 @@ Usage of acp:
 
 The command exits `0` only when every selected item was copied to every requested target.
 Any item failure, any target that was not written, and any pipeline failure make it exit
-non-zero, and the report file is written either way.
+non-zero, and the report file is written either way. Failure to write a requested report also
+exits non-zero. `-notarget` selects an index operation with no destinations, including when
+`-target` flags were supplied.
 
 ## Example
 

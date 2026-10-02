@@ -162,6 +162,106 @@ func TestACPCommandE2E(t *testing.T) {
 	}
 }
 
+func TestACPCommandHonorsIndexAndReportFlags(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end test in short mode")
+	}
+
+	// Build the command once so both cases exercise its actual flag parsing and exit status.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary := filepath.Join(t.TempDir(), "acp")
+	if runtime.GOOS == "windows" {
+		binary += ".exe"
+	}
+	build := exec.CommandContext(ctx, "go", "build", "-o", binary, "./cmd/acp")
+	build.Dir = repoRoot
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build the command: %v\n%s", err, output)
+	}
+
+	t.Run("notarget overrides explicit targets", func(t *testing.T) {
+		// An explicit target already contains data that an index operation must leave alone.
+		root := t.TempDir()
+		source := filepath.Join(root, "source.txt")
+		target := filepath.Join(root, "target")
+		if err := os.MkdirAll(target, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(source, []byte("source content"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		existing := filepath.Join(target, "source.txt")
+		if err := os.WriteFile(existing, []byte("existing content"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Request the index together with -target: it must still have no target outcomes.
+		reportPath := filepath.Join(root, "index.json")
+		command := exec.CommandContext(ctx, binary, "-p=false", "-notarget", "-target", target, "-report", reportPath, source)
+		command.Dir = repoRoot
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("run the index: %v\n%s", err, output)
+		}
+		data, err := os.ReadFile(reportPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var report acp.Report
+		if err := json.Unmarshal(data, &report); err != nil {
+			t.Fatal(err)
+		}
+		if len(report.Errors) != 0 || len(report.Jobs) != 1 {
+			t.Fatalf("index errors/rows = %d/%d, want 0/1", len(report.Errors), len(report.Jobs))
+		}
+		row := report.Jobs[0]
+		if row.SHA256 == "" || len(row.SuccessTargets) != 0 || len(row.FailTargets) != 0 {
+			t.Errorf("index row = %#v, want a hash and no targets", row)
+		}
+		content, err := os.ReadFile(existing)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(content) != "existing content" {
+			t.Errorf("existing target = %q, want unchanged content", content)
+		}
+	})
+
+	t.Run("report failure exits nonzero", func(t *testing.T) {
+		// A directory cannot be replaced by a report file, regardless of host permissions.
+		root := t.TempDir()
+		source := filepath.Join(root, "source.txt")
+		target := filepath.Join(root, "target.txt")
+		reportPath := filepath.Join(root, "report-directory")
+		if err := os.WriteFile(source, []byte("fixture"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(reportPath, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		// A successful copy with an unsaved requested report must tell its caller it failed.
+		command := exec.CommandContext(ctx, binary, "-p=false", "-report", reportPath, source, target)
+		command.Dir = repoRoot
+		output, err := command.CombinedOutput()
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) || !strings.Contains(string(output), "open report fail") {
+			t.Errorf("command exit = %v, want a report-write failure:\n%s", err, output)
+		}
+		content, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(content) != "fixture" {
+			t.Errorf("target = %q, want a completed copy", content)
+		}
+	})
+}
+
 // selectedSourceFiles returns every regular file below source, which is the set of files a
 // wildcard run selects. The pre-stream API exposed that selection as data; the shell does not,
 // so the test walks the tree itself instead of asking the library what it selected.

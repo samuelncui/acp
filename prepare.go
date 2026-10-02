@@ -72,7 +72,7 @@ func (c *StreamCopyer) prepareItem(job *baseJob) *writeJob {
 	}
 
 	// Only an item that reads content opens a mapping: a reuse-only item reads a stored hash.
-	mode := c.fromDevice.readMode
+	mode := job.readMode
 	if !needsContent {
 		mode = ReadBuffered
 	}
