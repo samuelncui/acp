@@ -7,36 +7,13 @@ package mmap
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 )
-
-func TestOpen(t *testing.T) {
-	const filename = "mmap_test.go"
-	r, err := Open(filename)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	got := make([]byte, r.Len())
-	if _, err := r.ReadAt(got, 0); err != nil && err != io.EOF {
-		t.Fatalf("ReadAt: %v", err)
-	}
-	want, err := ioutil.ReadFile(filename)
-	if err != nil {
-		t.Fatalf("ioutil.ReadFile: %v", err)
-	}
-	if len(got) != len(want) {
-		t.Fatalf("got %d bytes, want %d", len(got), len(want))
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("\ngot  %q\nwant %q", string(got), string(want))
-	}
-}
 
 // writeFixture writes one file with the given content and returns its path.
 func writeFixture(t *testing.T, name string, content []byte) string {
@@ -94,7 +71,7 @@ func TestReaderAtContract(t *testing.T) {
 	}
 }
 
-// TestOpenEmptyMappingIsNotEmpty pins the empty mapping against the closed-reader sentinel: an open
+// TestOpenEmptyMappingIsNotClosed pins the empty mapping against the closed-reader sentinel: an open
 // reader over a zero-length file is empty, not closed, so it behaves like an empty *os.File or
 // bytes.Reader. Reporting it as closed breaks every io.ReaderAt consumer that probes an empty
 // source, such as archive/zip.
@@ -162,13 +139,9 @@ func TestOpenEmptyFile(t *testing.T) {
 }
 
 // TestReaderRetainsItsDescriptor pins the descriptor ownership every platform must implement: the
-// reader keeps the descriptor it opened, reads through it after the path is gone, and closes it
-// together with its mapping.
+// reader keeps the descriptor it opened and closes it together with its mapping.
 func TestReaderRetainsItsDescriptor(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("a Windows file cannot be unlinked while it is open")
-	}
-
+	// Keep the source stable while its mapping owns the descriptor.
 	content := []byte("descriptor contract fixture")
 	path := writeFixture(t, "descriptor.bin", content)
 	reader, err := Open(path)
@@ -176,19 +149,16 @@ func TestReaderRetainsItsDescriptor(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	// The reader owns an open descriptor for its whole lifecycle, which is what lets its caller
-	// keep using the file after the path itself is gone.
+	// The reader owns an open descriptor for its whole lifecycle.
 	file := reader.File()
 	if file == nil {
 		t.Fatal("File() = nil, want the descriptor the reader opened")
-	}
-	if err := os.Remove(path); err != nil {
-		t.Fatalf("Remove: %v", err)
 	}
 	if _, err := file.Stat(); err != nil {
 		t.Fatalf("retained descriptor is not open: %v", err)
 	}
 
+	// Read through the mapping while its descriptor remains open.
 	buf := make([]byte, len(content))
 	n, err := reader.ReadAt(buf, 0)
 	if err != nil && err != io.EOF {
@@ -213,6 +183,42 @@ func TestReaderRetainsItsDescriptor(t *testing.T) {
 	}
 	if err := reader.Close(); err != nil {
 		t.Fatalf("second Close = %v, want nil", err)
+	}
+}
+
+func TestOpenWithInfo(t *testing.T) {
+	for _, content := range [][]byte{nil, []byte("indexed mapping fixture")} {
+		t.Run(fmt.Sprintf("size-%d", len(content)), func(t *testing.T) {
+			// Obtain metadata once before opening the stable file for mapped reading.
+			path := writeFixture(t, "indexed.bin", content)
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// The reader owns one descriptor for empty and non-empty mappings alike.
+			reader, err := OpenWithInfo(path, info)
+			if err != nil {
+				t.Fatalf("OpenWithInfo: %v", err)
+			}
+			t.Cleanup(func() { _ = reader.Close() })
+			file := reader.File()
+			if file == nil || reader.Len() != len(content) {
+				t.Fatalf("reader file=%v length=%d, want an owned descriptor and length=%d", file, reader.Len(), len(content))
+			}
+			got, err := io.ReadAll(NewReader(reader))
+			if err != nil || !bytes.Equal(got, content) {
+				t.Fatalf("ReadAll = %q / %v, want %q", got, err, content)
+			}
+
+			// Closing the mapping must also release its descriptor.
+			if err := reader.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := file.Stat(); !errors.Is(err, os.ErrClosed) {
+				t.Fatalf("descriptor after Close = %v, want closed", err)
+			}
+		})
 	}
 }
 

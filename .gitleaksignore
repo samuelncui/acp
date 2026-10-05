@@ -1,0 +1,6 @@
+# HISTORY ONLY: explicitly approved fingerprints in published v0.2.2 ancestry.
+# Preserve published history; never apply these exceptions to current source or artifacts.
+# Match the complete commit:file:rule:line fingerprint; no wildcard commit/path/rule exemptions.
+# New findings require review and explicit approval before adding an exception.
+290748251e4217e8a5e78414a60a17b3489dc485:fs_test.go:personal-build-path:11
+8502bf37dc002d24deddd754b243c3f94a3c16cd:fs_test.go:personal-build-path:11

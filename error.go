@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+
+	"github.com/samuelncui/acp/internal/fileio"
 )
 
 var (
@@ -60,6 +62,12 @@ func (e *Error) MarshalJSON() ([]byte, error) {
 		return []byte("null"), nil
 	}
 
+	// Source and target paths are identities, so JSON must never normalize invalid bytes.
+	if err := fileio.CheckJSONPaths(e.Src, e.Dst); err != nil {
+		return nil, err
+	}
+
+	// Keep an absent failure absent instead of inventing a message.
 	message := ""
 	if !isNilError(e.Err) {
 		message = e.Err.Error()
@@ -67,18 +75,20 @@ func (e *Error) MarshalJSON() ([]byte, error) {
 	return json.Marshal(&jsonError{Src: e.Src, Dst: e.Dst, Err: message})
 }
 
-// UnmarshalJSON decodes the object form. An absent or empty message leaves Err nil, which is
-// what a report stores for it, so a round trip neither loses an error nor invents one.
+// UnmarshalJSON decodes the object form or null. An absent or empty message leaves Err nil,
+// so a round trip neither loses an error nor invents one.
 func (e *Error) UnmarshalJSON(buf []byte) error {
 	if e == nil {
 		return errors.New("decode acp error failed, receiver is nil")
 	}
 
-	m := new(jsonError)
+	// Decode into a value so null represents an absent error without a nil pointer.
+	var m jsonError
 	if err := json.Unmarshal(buf, &m); err != nil {
 		return err
 	}
 
+	// Replace the prior error only after the document has decoded successfully.
 	e.Src, e.Dst, e.Err = m.Src, m.Dst, nil
 	if m.Err != "" {
 		e.Err = errors.New(m.Err)

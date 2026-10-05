@@ -1,9 +1,55 @@
 package mmap
 
 import (
+	"fmt"
 	"io"
 	"os"
+	"runtime"
 )
+
+// Open opens the named file with one metadata read. Close releases its mapping and descriptor.
+func Open(filename string) (*ReaderAt, error) {
+	return OpenWithInfo(filename, nil)
+}
+
+// OpenWithInfo opens the named file using metadata already collected by the caller. The caller
+// keeps the file stable while it is read. A nil info obtains metadata from the opened descriptor.
+func OpenWithInfo(filename string, info os.FileInfo) (*ReaderAt, error) {
+	// Retain descriptor ownership until the mapping has been acquired successfully.
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if f != nil {
+			_ = f.Close()
+		}
+	}()
+	if info == nil {
+		info, err = f.Stat()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Reject lengths that cannot be represented by a mapping on this platform.
+	size := info.Size()
+	if size < 0 {
+		return nil, fmt.Errorf("mmap: file %q has negative size", filename)
+	}
+	if size != int64(int(size)) {
+		return nil, fmt.Errorf("mmap: file %q is too large", filename)
+	}
+
+	// Transfer both resources to the reader; explicit Close owns their release.
+	r, err := mapFile(f, int(size))
+	if err != nil {
+		return nil, err
+	}
+	runtime.SetFinalizer(r, (*ReaderAt).Close)
+	f = nil
+	return r, nil
+}
 
 type Reader struct {
 	*ReaderAt

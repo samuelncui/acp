@@ -42,6 +42,7 @@ func TestACPLibraryE2E(t *testing.T) {
 		t.Skip("skipping end-to-end test in short mode")
 	}
 
+	// Prepare two target directories and a tree with non-default metadata.
 	tempDir := t.TempDir()
 	source := filepath.Join(tempDir, "source")
 	targets := []string{
@@ -53,26 +54,34 @@ func TestACPLibraryE2E(t *testing.T) {
 			t.Fatalf("create target directory %q: %v", target, err)
 		}
 	}
-
 	files := map[string][]byte{
 		"plain.txt":                     []byte("library copy\n"),
 		"empty.txt":                     nil,
 		filepath.Join("nested", "data"): {5, 4, 3, 2, 1},
 	}
+	modified := time.Unix(1700000000, 0)
+	metadata := make(map[string]os.FileInfo, len(files))
 	for relativePath, data := range files {
 		path := filepath.Join(source, relativePath)
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatalf("create source directory: %v", err)
 		}
-		if err := os.WriteFile(path, data, 0o644); err != nil {
+		if err := os.WriteFile(path, data, 0o640); err != nil {
 			t.Fatalf("write source file %q: %v", relativePath, err)
 		}
+		if err := os.Chtimes(path, modified, modified); err != nil {
+			t.Fatalf("set source times: %v", err)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat source: %v", err)
+		}
+		metadata[relativePath] = info
 	}
 
+	// The shell maps the source tree onto both targets and reports one terminal row per file.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	// The shell maps the source tree onto both targets and reports one terminal row per file.
 	handler, getter := acp.NewReportGetter()
 	copyer, err := acp.New(
 		ctx,
@@ -88,6 +97,7 @@ func TestACPLibraryE2E(t *testing.T) {
 		t.Fatalf("run: %v", err)
 	}
 
+	// Verify the shell actually restores content and metadata at both targets.
 	for _, target := range targets {
 		copyRoot := filepath.Join(target, filepath.Base(source))
 		for relativePath, want := range files {
@@ -98,9 +108,18 @@ func TestACPLibraryE2E(t *testing.T) {
 			if !bytes.Equal(got, want) {
 				t.Fatalf("copied file %q from %q = %v, want %v", relativePath, target, got, want)
 			}
+			info, err := os.Stat(filepath.Join(copyRoot, relativePath))
+			if err != nil {
+				t.Fatalf("stat target: %v", err)
+			}
+			if want := metadata[relativePath]; info.Mode() != want.Mode() || !info.ModTime().Equal(want.ModTime()) {
+				t.Fatalf("target %q metadata = %v / %v, want %v / %v",
+					relativePath, info.Mode(), info.ModTime(), want.Mode(), want.ModTime())
+			}
 		}
 	}
 
+	// Report rows must match the files the shell selected and copied.
 	report := getter()
 	if len(report.Errors) != 0 {
 		t.Fatalf("report errors = %v", report.Errors)
@@ -109,6 +128,7 @@ func TestACPLibraryE2E(t *testing.T) {
 		t.Fatalf("report jobs = %d, want %d", len(report.Jobs), len(files))
 	}
 
+	// Locate each selected file's row independently of delivery order.
 	jobs := make(map[string]*acp.Job, len(report.Jobs))
 	for _, job := range report.Jobs {
 		jobs[job.FullPath] = job
@@ -128,7 +148,12 @@ func TestACPLibraryE2E(t *testing.T) {
 		if job.Size != int64(len(data)) {
 			t.Fatalf("job %q size = %d, want %d", sourcePath, job.Size, len(data))
 		}
+		if want := metadata[relativePath]; job.Mode != want.Mode() || !job.ModTime.Equal(want.ModTime()) {
+			t.Fatalf("job %q metadata = %v / %v, want %v / %v",
+				sourcePath, job.Mode, job.ModTime, want.Mode(), want.ModTime())
+		}
 
+		// Each requested target must appear exactly once in the report row.
 		wantTargets := make(map[string]struct{}, len(targets))
 		for _, target := range targets {
 			wantTargets[filepath.Join(target, filepath.Base(source), relativePath)] = struct{}{}
@@ -140,29 +165,30 @@ func TestACPLibraryE2E(t *testing.T) {
 			if _, ok := wantTargets[target]; !ok {
 				t.Fatalf("job %q unexpected success target %q", sourcePath, target)
 			}
+			delete(wantTargets, target)
 		}
 
+		// A hash must describe the selected file's exact content, including an empty file.
 		sum := sha256.Sum256(data)
 		if want := hex.EncodeToString(sum[:]); job.SHA256 != want {
 			t.Fatalf("job %q SHA256 = %q, want %q", sourcePath, job.SHA256, want)
 		}
 	}
 
-	// The caller-owned variant submits the same files as its own items, so every result has to
-	// name the exact item that was submitted instead of a copy the library made.
+	// Submit caller-owned items to fresh targets so the shell's copies cannot hide a failed write.
 	items := make([]acp.Item, 0, len(files))
 	submitted := make([]*acp.SimpleJob, 0, len(files))
 	for relativePath := range files {
 		dsts := make([]string, 0, len(targets))
 		for _, target := range targets {
-			dsts = append(dsts, filepath.Join(target, filepath.Base(source), relativePath))
+			dsts = append(dsts, filepath.Join(target, "stream", relativePath))
 		}
-
 		job := &acp.SimpleJob{Path: filepath.Join(source, relativePath), Dsts: dsts}
 		items = append(items, job)
 		submitted = append(submitted, job)
 	}
 
+	// Exercise the public stream lifecycle without the compatibility shell.
 	run := new(streamRun)
 	stream, err := acp.NewStream(
 		ctx,
@@ -197,6 +223,7 @@ func TestACPLibraryE2E(t *testing.T) {
 		}
 		counted[job]++
 
+		// Validate the source facts associated with this exact submitted instance.
 		relativePath, err := filepath.Rel(source, job.Path)
 		if err != nil {
 			t.Fatalf("relative path of %q: %v", job.Path, err)
@@ -211,12 +238,18 @@ func TestACPLibraryE2E(t *testing.T) {
 		if result.Size != int64(len(data)) {
 			t.Fatalf("job %q size = %d, want %d", job.Path, result.Size, len(data))
 		}
+		if want := metadata[relativePath]; result.Mode != want.Mode() || !result.ModTime.Equal(want.ModTime()) {
+			t.Fatalf("job %q metadata = %v / %v, want %v / %v",
+				job.Path, result.Mode, result.ModTime, want.Mode(), want.ModTime())
+		}
 
+		// Verify the computed hash and the requested target outcomes against the source fixture.
 		sum := sha256.Sum256(data)
 		if !bytes.Equal(result.SHA256, sum[:]) {
 			t.Fatalf("job %q SHA256 = %x, want %x", job.Path, result.SHA256, sum)
 		}
 
+		// Fresh target files must hold the content and metadata reported by this item.
 		if len(result.Targets) != len(job.Dsts) {
 			t.Fatalf("job %q targets = %v, want %d", job.Path, result.Targets, len(job.Dsts))
 		}
@@ -224,8 +257,25 @@ func TestACPLibraryE2E(t *testing.T) {
 			if outcome.Path != job.Dsts[index] || outcome.Err != nil {
 				t.Fatalf("job %q target %d = %#v", job.Path, index, outcome)
 			}
+			if outcome.Size != result.Size || outcome.WriteTime.IsZero() || !outcome.WriteTime.Equal(result.WriteTime) {
+				t.Fatalf("target %q facts = %#v, want the item's size and write time", outcome.Path, outcome)
+			}
+			got, err := os.ReadFile(outcome.Path)
+			if err != nil || !bytes.Equal(got, data) {
+				t.Fatalf("target %q content = %v / %v, want %v", outcome.Path, got, err, data)
+			}
+			info, err := os.Stat(outcome.Path)
+			if err != nil {
+				t.Fatalf("stat target: %v", err)
+			}
+			if want := metadata[relativePath]; info.Mode() != want.Mode() || !info.ModTime().Equal(want.ModTime()) {
+				t.Fatalf("target %q metadata = %v / %v, want %v / %v",
+					outcome.Path, info.Mode(), info.ModTime(), want.Mode(), want.ModTime())
+			}
 		}
 	}
+
+	// No submitted instance may be lost or reported twice.
 	for _, job := range submitted {
 		if counted[job] != 1 {
 			t.Fatalf("job %q received %d results, want exactly 1", job.Path, counted[job])

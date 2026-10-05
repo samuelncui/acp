@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/samuelncui/acp/internal/fileio"
 	"github.com/sirupsen/logrus"
 )
 
@@ -15,6 +16,7 @@ type counter struct {
 // buildJob resolves one submitted item into a job. An item ACP cannot describe becomes a job
 // that reports the failure through its own result, not a pipeline failure.
 func (c *StreamCopyer) buildJob(item Item, order uint64) *baseJob {
+	// A failed target description still evaluates the source once for its terminal result.
 	targets, err := itemTargets(item)
 	if err != nil {
 		c.logf(logrus.ErrorLevel, "read item targets failed, err= %v", err)
@@ -23,83 +25,87 @@ func (c *StreamCopyer) buildJob(item Item, order uint64) *baseJob {
 		return job
 	}
 
-	job, err := c.newJob(item, targets, order)
-	if err == nil {
-		return job
+	// Record source facts only after both caller-owned descriptions are available.
+	job := c.namedFailureJob(item, order)
+	job.targets = targets
+	if job.itemError == nil {
+		job.itemError = c.indexItem(job)
 	}
-	c.logf(logrus.ErrorLevel, "read item failed, %v", err)
-	if job == nil {
-		job = c.namedFailureJob(item, order)
+	if job.itemError != nil {
+		c.logf(logrus.ErrorLevel, "read item failed, %v", job.itemError)
 	}
-	job.itemError = err
 	return job
 }
 
-// namedFailureJob builds the job of an item ACP could not describe, so the failure still names
-// the item. A source the caller cannot report leaves the job unnamed.
+// namedFailureJob asks for the source exactly once, including when the caller panics.
 func (c *StreamCopyer) namedFailureJob(item Item, order uint64) *baseJob {
-	job := &baseJob{copyer: c, item: item, order: order}
-
+	job := &baseJob{copyer: c, item: item, order: order, readMode: c.fromDevice.readMode}
 	var sourceName string
-	if err := protectCall("Item.Source", func() { sourceName = item.Source() }); err != nil {
-		return job
+	job.itemError = protectCall("Item.Source", func() { sourceName = item.Source() })
+	if job.itemError == nil {
+		job.path = filepath.Clean(sourceName)
 	}
-
-	job.path = filepath.Clean(sourceName)
 	return job
 }
 
-// newJob resolves one item's source facts and validates the run options that apply to it. The
-// returned job carries the identity it resolved even when it reports an error, so the failure
-// still names the item.
-func (c *StreamCopyer) newJob(item Item, targets []string, order uint64) (*baseJob, error) {
-	var sourceName string
-	if err := protectCall("Item.Source", func() { sourceName = item.Source() }); err != nil {
-		return nil, err
+// indexItem owns source facts and target decisions; later stages reuse them unchanged.
+func (c *StreamCopyer) indexItem(job *baseJob) error {
+	// Validate the read policy before acquiring file resources.
+	if len(job.targets) > 0 && !c.hashPolicy.appliesToTransfer() {
+		return fmt.Errorf("check hash policy failed, policy= %s, source= %q: a copy always reads its source so it cannot reuse a stored hash", c.hashPolicy, job.path)
 	}
-
-	path := filepath.Clean(sourceName)
-	job := &baseJob{
-		copyer:   c,
-		item:     item,
-		path:     path,
-		targets:  targets,
-		order:    order,
-		readMode: c.fromDevice.readMode,
-	}
-
-	// A transfer always reads its source, so a policy that trades a computed hash for a
-	// stored one cannot describe it. Reject it here instead of silently reading the source.
-	if len(targets) > 0 && !c.hashPolicy.appliesToTransfer() {
-		return job, fmt.Errorf(
-			"check hash policy failed, policy= %s, source= '%s': a copy always reads its source so it cannot reuse a stored hash",
-			c.hashPolicy, path,
-		)
-	}
-	if selected, ok := item.(ReadModeItem); ok {
+	if selected, ok := job.item.(ReadModeItem); ok {
 		if err := protectCall("Item.ReadMode", func() { job.readMode = selected.ReadMode() }); err != nil {
-			return job, err
+			return err
 		}
 		if job.readMode != ReadBuffered && job.readMode != ReadMapped {
-			return job, fmt.Errorf("unknown item read mode, mode= %s", job.readMode)
+			return fmt.Errorf("unknown item read mode, mode= %s", job.readMode)
 		}
 	}
 
-	info, err := os.Stat(path)
-	if err != nil {
-		return job, fmt.Errorf("get source stat failed, source= '%s', %w", path, err)
+	// Enumeration and rewrite already own a source snapshot; direct items obtain it here.
+	var info os.FileInfo
+	switch item := job.item.(type) {
+	case *compatItem:
+		info = item.info
+	case *fileio.RewriteItem:
+		info = item.Info
+	}
+	if info == nil {
+		var err error
+		info, err = os.Stat(job.path)
+		if err != nil {
+			return fmt.Errorf("get source stat failed, source= %q, %w", job.path, err)
+		}
 	}
 	if !info.Mode().IsRegular() {
-		return job, fmt.Errorf("source is not a regular file, source= '%s', mode= %s", path, info.Mode())
+		return fmt.Errorf("source is not a regular file, source= %q, mode= %s", job.path, info.Mode())
 	}
-
-	stat, err := newStat(path, info)
+	var err error
+	job.stat, err = newStat(job.path, info)
 	if err != nil {
-		return job, fmt.Errorf("read source stat failed, source= '%s', %w", path, err)
+		return fmt.Errorf("read source stat failed, source= %q, %w", job.path, err)
 	}
-	job.stat = stat
 
-	return job, nil
+	// Rewrite alone can replace its own source, using the temporary it already recorded.
+	if item, ok := job.item.(*fileio.RewriteItem); ok {
+		dev, err := c.getDevice(item.Path)
+		if err != nil {
+			return fmt.Errorf("get target device failed, %w", err)
+		}
+		job.outputs = []targetSpec{{name: item.Path, path: item.Path, device: dev, output: item.Output}}
+		return nil
+	}
+	job.outputs = make([]targetSpec, 0, len(job.targets))
+	for _, name := range job.targets {
+		target, err := c.indexTarget(name, info)
+		if err != nil {
+			job.fail(name, err)
+			continue
+		}
+		job.outputs = append(job.outputs, target)
+	}
+	return nil
 }
 
 // itemTargets copies the targets the caller requested, turning a panic in the caller's code

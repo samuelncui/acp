@@ -23,9 +23,8 @@ var errSignatureXattrUnsupported = errors.New("signature xattr is unsupported")
 // The managed-xattr operations are indirected so a test can exercise the missing, unsupported
 // and failing paths on a file system that accepts the attribute.
 var (
-	readManagedXattr   = readSignatureXattr
-	writeManagedXattr  = writeSignatureXattr
-	removeManagedXattr = removeSignatureXattr
+	readManagedXattr  = readSignatureXattr
+	writeManagedXattr = writeSignatureXattr
 )
 
 // signatureXattrIgnorable reports whether an xattr error leaves the cache in a well-defined
@@ -117,15 +116,19 @@ func readCachedSignature(path string) (CachedSignature, signatureReadStatus, err
 	return readCachedSignatureFile(file)
 }
 
-// readCachedSignatureFile reads the stored signature through a descriptor the caller already
-// owns, so the entry it reports belongs to the file version that descriptor sees. It never
-// closes the descriptor.
+// readCachedSignatureFile obtains metadata for a standalone lookup through an owned descriptor.
+// Pipeline lookups already have that metadata and call readCachedSignatureInfo directly.
 func readCachedSignatureFile(file *os.File) (CachedSignature, signatureReadStatus, error) {
 	// Capture the regular-file facts that bind the cached signature.
 	info, err := file.Stat()
 	if err != nil {
 		return CachedSignature{}, signatureReadMiss, fmt.Errorf("stat signature source failed, %w", err)
 	}
+	return readCachedSignatureInfo(file, info)
+}
+
+func readCachedSignatureInfo(file *os.File, info os.FileInfo) (CachedSignature, signatureReadStatus, error) {
+	// Only regular-file metadata can validate a stored content signature.
 	if !info.Mode().IsRegular() {
 		return CachedSignature{}, signatureReadMiss, fmt.Errorf("signature source is not a regular file")
 	}
@@ -144,14 +147,7 @@ func readCachedSignatureFile(file *os.File) (CachedSignature, signatureReadStatu
 		return CachedSignature{}, signatureReadMiss, err
 	}
 
-	// Revalidate metadata after the xattr read before declaring a cache hit.
-	after, err := file.Stat()
-	if err != nil {
-		return CachedSignature{}, signatureReadMiss, fmt.Errorf("restat signature source failed, %w", err)
-	}
-	if !after.Mode().IsRegular() || after.Size() != info.Size() || !after.ModTime().Equal(info.ModTime()) {
-		return signature, signatureReadStale, nil
-	}
+	// Compare with this run's metadata so a file changed between runs rejects its old entry.
 	if signature.Size != info.Size() || signature.MtimeNS != info.ModTime().UnixNano() {
 		return signature, signatureReadStale, nil
 	}
@@ -160,9 +156,7 @@ func readCachedSignatureFile(file *os.File) (CachedSignature, signatureReadStatu
 
 // signatureCache is the aggregate accounting of one run's cache activity. It owns no writer and
 // no queue: an item reads its stored hash and publishes its computed one through the descriptor it
-// already owns, so a cache operation never reopens a path and never outlives its item. Dropping a
-// target's stale entry before that target is truncated is the one path-based cache step, and it
-// happens before the target has a descriptor at all.
+// already owns, so a cache operation never reopens a path and never outlives its item.
 type signatureCache struct {
 	lock    sync.Mutex
 	summary SignatureCacheSummary
@@ -190,7 +184,7 @@ func newCachedSignature(hash []byte, indexed *stat) (CachedSignature, error) {
 
 func (c *signatureCache) lookup(file *os.File, path string, indexed *stat) ([]byte, bool) {
 	// Treat every unusable cache read as a non-fatal miss with diagnostics.
-	signature, status, err := readCachedSignatureFile(file)
+	signature, status, err := readCachedSignatureInfo(file, indexed.info)
 	if err != nil {
 		c.recordFailure(path, err)
 		c.incrementMiss()
@@ -200,10 +194,6 @@ func (c *signatureCache) lookup(file *os.File, path string, indexed *stat) ([]by
 	// Distinguish metadata staleness from an absent entry for aggregate reporting.
 	switch status {
 	case signatureReadHit:
-		if signature.Size != indexed.size || signature.MtimeNS != indexed.modTime.UnixNano() {
-			c.incrementStale()
-			return nil, false
-		}
 		c.incrementHit()
 		return append([]byte(nil), signature.SHA256[:]...), true
 	case signatureReadStale:
@@ -214,54 +204,18 @@ func (c *signatureCache) lookup(file *os.File, path string, indexed *stat) ([]by
 	return nil, false
 }
 
-func (c *StreamCopyer) invalidateSignature(file *os.File, path string) {
-	// A file system that cannot store the managed attribute has no stale entry to drop.
-	if err := removeManagedXattr(file); err != nil && !signatureXattrIgnorable(err) {
-		if c.signatures != nil {
-			c.signatures.recordFailure(path, fmt.Errorf("remove old signature xattr failed, %w", err))
-		}
-	}
-}
-
-func (c *StreamCopyer) invalidateSignaturePath(path string) {
-	file, err := os.Open(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return
-	}
-	if err != nil {
-		if c.signatures != nil {
-			c.signatures.recordFailure(path, fmt.Errorf("open old signature target failed, %w", err))
-		}
-		return
-	}
-	defer file.Close()
-	c.invalidateSignature(file, path)
-}
-
 // refreshCacheEntry publishes the computed content signature of a finished item through the
 // descriptor that owns one of that item's files. It publishes nothing when the item has no hash it
 // computed itself or the policy does not refresh the cache, and a nil descriptor is an item that
 // never opened the file it names rather than a failure.
 //
-// An entry states the size and modification time a later lookup compares, so it may only be
-// published for the exact file version whose bytes produced the hash: an entry that binds that hash
-// to other facts makes a later run report a hash for content it never read. The descriptor the item
-// still owns is the evidence, and which evidence it can give depends on which of the item's files
-// it is:
-//
-//   - The source descriptor must still show the size the item read and the modification time it
-//     indexed. The run never wrote that file, so a source whose metadata moved after indexing cannot
-//     be shown to be the version the run hashed, and it publishes nothing instead of a guess.
-//   - A target descriptor is a file this run wrote with exactly the bytes that were hashed, and the
-//     run stamps the item's metadata onto it after this publication, so its length is the evidence
-//     available here.
-//
-// Every check runs through that descriptor, so a cache operation never reopens a path.
+// Sources and paths stay stable during a run. Preparation retained the source's stored entry;
+// targets use fresh temporary files, so neither publication needs another metadata or xattr read.
 func (c *StreamCopyer) refreshCacheEntry(file *os.File, path string, job *baseJob, target bool) {
+	// Only a completed content hash under a refresh policy can publish an entry.
 	if file == nil || c.signatures == nil || !c.hashPolicy.refreshesCache() {
 		return
 	}
-
 	hash, ok := job.computedHash()
 	if !ok {
 		return
@@ -272,32 +226,11 @@ func (c *StreamCopyer) refreshCacheEntry(file *os.File, path string, job *baseJo
 		return
 	}
 
-	info, err := file.Stat()
-	if err != nil {
-		c.signatures.recordFailure(path, fmt.Errorf("stat signature target failed, %w", err))
+	// Avoid rewriting an equal source entry; a fresh target has no stored entry to inspect.
+	if !target && job.cachedSignature != nil && *job.cachedSignature == signature {
 		return
 	}
-	if info.Size() != signature.Size || (!target && info.ModTime().UnixNano() != signature.MtimeNS) {
-		return
-	}
-
-	c.signatures.refresh(file, path, signature)
-}
-
-// refresh publishes one computed signature through a descriptor that owns the file, unless that
-// descriptor already stores it. Re-reading the entry is what makes a refresh cheap: a run that
-// finds the same stored value writes nothing, which keeps an identical rewrite from costing a
-// physical attribute block on copy-on-write file systems. A stored value that cannot be read is
-// no stored value, so the entry is published.
-func (c *signatureCache) refresh(file *os.File, path string, signature CachedSignature) {
-	if file == nil {
-		return
-	}
-	if stored, status, err := readCachedSignatureFile(file); err == nil && status == signatureReadHit && stored == signature {
-		return
-	}
-
-	c.write(file, path, signature)
+	c.signatures.write(file, path, signature)
 }
 
 // write publishes one computed signature through the descriptor that owns the file. The snapshot
@@ -306,17 +239,7 @@ func (c *signatureCache) refresh(file *os.File, path string, signature CachedSig
 // bind the hash to a version it never described. Every failure is an aggregate warning, because a
 // cache that cannot store an entry never fails the item that computed it.
 func (c *signatureCache) write(file *os.File, path string, signature CachedSignature) {
-	// Reject anything a content signature cannot describe.
-	info, err := file.Stat()
-	if err != nil {
-		c.recordFailure(path, fmt.Errorf("stat signature target failed, %w", err))
-		return
-	}
-	if !info.Mode().IsRegular() {
-		c.recordFailure(path, fmt.Errorf("signature target is not a regular file"))
-		return
-	}
-
+	// Publish the item's facts directly; unsupported attributes remain a no-op.
 	if err := writeManagedXattr(file, encodeCachedSignature(signature)); err != nil {
 		// A file system without the managed attribute namespace cannot hold the cache at all:
 		// that is a no-op, not a failure of this run.
@@ -327,6 +250,7 @@ func (c *signatureCache) write(file *os.File, path string, signature CachedSigna
 		return
 	}
 
+	// Count only entries accepted by the file system.
 	c.incrementWrite()
 }
 

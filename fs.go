@@ -16,48 +16,27 @@ import (
 // can force the failure path that a real working directory almost never produces.
 var absPath = filepath.Abs
 
-// getMountpointCache returns a memoized resolver from a path to the longest mount point that
-// contains it.
-func getMountpointCache() (func(string) (string, error), error) {
+// getMountpointResolver keeps only the mount list for a run. Each indexed target carries
+// its resolved device, so the resolver retains no per-file cache.
+func getMountpointResolver() (func(string) (string, error), error) {
 	mounts, err := mountinfo.GetMounts(nil)
 	if err != nil {
 		return nil, fmt.Errorf("get mounts fail, %w", err)
 	}
-
 	mountPoints := mapset.NewThreadUnsafeSet[string]()
 	for _, mount := range mounts {
-		if mount == nil {
-			continue
+		if mount != nil && mount.Mountpoint != "" {
+			mountPoints.Add(filepath.Clean(mount.Mountpoint))
 		}
-		if mount.Mountpoint == "" {
-			continue
-		}
-
-		mountPoints.Add(filepath.Clean(mount.Mountpoint))
 	}
-
 	mps := mountPoints.ToSlice()
-	resolve := Cache(func(path string) mountPoint {
-		// A path that cannot be made absolute has no mount point to report: the caller
-		// receives the failure instead of a panic it cannot recover from.
+	return func(path string) (string, error) {
 		abs, err := absPath(path)
 		if err != nil {
-			return mountPoint{err: fmt.Errorf("get abs from file path failed, path= '%s', %w", path, err)}
+			return "", fmt.Errorf("get abs from file path failed, path= %q, %w", path, err)
 		}
-
-		return mountPoint{point: findMountpoint(abs, mps)}
-	})
-	return func(path string) (string, error) {
-		matched := resolve(path)
-		return matched.point, matched.err
+		return findMountpoint(abs, mps), nil
 	}, nil
-}
-
-// mountPoint is the memoized outcome of resolving one path to its mount point. Both the match
-// and the failure are cached, because a path that cannot be resolved cannot become resolvable.
-type mountPoint struct {
-	point string
-	err   error
 }
 
 // openSource opens a source for buffered reading without updating its access time.
@@ -72,16 +51,15 @@ func openSource(path string) (*os.File, error) {
 }
 
 func findMountpoint(path string, mountPoints []string) string {
+	// Match directory boundaries directly; resolving each target must not allocate a prefix per mount.
 	matched := ""
 	for _, mountPoint := range mountPoints {
-		if path != mountPoint {
-			prefix := mountPoint
-			if !strings.HasSuffix(prefix, string(filepath.Separator)) {
-				prefix += string(filepath.Separator)
-			}
-			if !strings.HasPrefix(path, prefix) {
-				continue
-			}
+		if !strings.HasPrefix(path, mountPoint) {
+			continue
+		}
+		if len(path) > len(mountPoint) && !strings.HasSuffix(mountPoint, string(filepath.Separator)) &&
+			path[len(mountPoint)] != filepath.Separator {
+			continue
 		}
 		if len(mountPoint) > len(matched) {
 			matched = mountPoint

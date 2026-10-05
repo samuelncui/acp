@@ -2,10 +2,20 @@ package acp
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/sirupsen/logrus"
 )
+
+// Keep console I/O and interleaved log lines out of the standard benchmark output.
+var benchmarkLogger = func() *logrus.Logger {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	return logger
+}()
 
 // benchItem is the benchmark's caller-owned item: one source and no target, which is the shape a
 // hash-only run uses. The push engine reads it once per submission.
@@ -25,6 +35,7 @@ func (i *benchItem) Failed(error) { i.failures++ }
 func benchHash(b *testing.B, path string, opts ...Option) {
 	b.Helper()
 
+	// Preserve real result failures while suppressing routine per-run log output.
 	item := &benchItem{path: path}
 	onResults := func(results []Result) error {
 		for _, result := range results {
@@ -35,7 +46,8 @@ func benchHash(b *testing.B, path string, opts ...Option) {
 		return nil
 	}
 
-	if err := runStream(context.Background(), onResults, []Item{item}, opts...); err != nil {
+	// Use the same explicit logger on both source revisions, as the copy benchmarks do.
+	if err := runStream(context.Background(), onResults, []Item{item}, append(opts, WithLogger(benchmarkLogger))...); err != nil {
 		b.Fatal(err)
 	}
 	if item.failures != 0 {
@@ -46,6 +58,7 @@ func benchHash(b *testing.B, path string, opts ...Option) {
 func benchFile(b *testing.B, size int64) string {
 	b.Helper()
 
+	// Own the fixture until its complete, exact-size contents are ready for the timed run.
 	path := filepath.Join(b.TempDir(), "content.bin")
 	file, err := os.Create(path)
 	if err != nil {
@@ -53,14 +66,24 @@ func benchFile(b *testing.B, size int64) string {
 	}
 	defer file.Close()
 
+	// Write deterministic bytes; both source revisions use this same fixture generator.
 	block := make([]byte, 1<<20)
 	for index := range block {
 		block[index] = byte(index)
 	}
 	for written := int64(0); written < size; written += int64(len(block)) {
-		if _, err := file.Write(block); err != nil {
+		if _, err := file.Write(block[:min(int64(len(block)), size-written)]); err != nil {
 			b.Fatal(err)
 		}
+	}
+
+	// Fail instead of reporting throughput or cache timings for a different fixture size.
+	info, err := file.Stat()
+	if err != nil {
+		b.Fatal(err)
+	}
+	if info.Size() != size {
+		b.Fatalf("fixture size: got %d, want %d", info.Size(), size)
 	}
 	if err := file.Close(); err != nil {
 		b.Fatal(err)

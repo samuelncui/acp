@@ -364,3 +364,24 @@ func TestValueOptionsAreLastWins(t *testing.T) {
 		t.Fatalf("result flush interval = %s, want %s", option.resultFlushInterval, time.Minute)
 	}
 }
+
+func TestDeviceOptionsAccumulate(t *testing.T) {
+	// Separate device options adjust the same description rather than replacing it.
+	option, err := buildOption(
+		SetFromDevice(DeviceThreads(3)),
+		SetFromDevice(WithReadMode(ReadMapped)),
+		SetToDevice(LinearDevice(true)),
+		SetToDevice(DeviceThreads(5)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The source retains both settings, and the later target option retains linear ordering.
+	if option.fromDevice.threads != 3 || option.fromDevice.readMode != ReadMapped {
+		t.Fatalf("source device = %#v, want three workers with mapped reads", option.fromDevice)
+	}
+	if !option.toDevice.linear || option.toDevice.threads != 1 {
+		t.Fatalf("target device = %#v, want a linear target with one worker", option.toDevice)
+	}
+}

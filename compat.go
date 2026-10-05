@@ -133,7 +133,11 @@ func (c *Copyer) walkWildcard(job *wildcardJob) ([]*compatItem, error) {
 	walk = func(src *source) {
 		path := src.src()
 
-		info, err := os.Stat(path)
+		info := src.info
+		var err error
+		if info == nil {
+			info, err = os.Stat(path)
+		}
 		if err != nil {
 			c.stream.reportError(path, "", fmt.Errorf("walk get stat, %w", err))
 			return
@@ -145,7 +149,7 @@ func (c *Copyer) walkWildcard(job *wildcardJob) ([]*compatItem, error) {
 			for _, dst := range job.dst {
 				targets = append(targets, src.dst(dst))
 			}
-			entries = append(entries, compatItemOf(src, path, targets))
+			entries = append(entries, compatItemOf(src, path, targets, info))
 			return
 		}
 		if mode&UnexpectFileMode != 0 {
@@ -189,7 +193,12 @@ func (c *Copyer) walkWildcard(job *wildcardJob) ([]*compatItem, error) {
 // accurateItem resolves one exact source and target pair, which copies a file to the path it was
 // given instead of mapping a relative path onto a target directory.
 func (c *Copyer) accurateItem(job *accurateJob) *compatItem {
-	path := filepath.Clean(job.src)
+	// Resolve the source once so Base plus Path and FullPath always describe the same file.
+	path, err := filepath.Abs(job.src)
+	if err != nil {
+		c.stream.reportError(job.src, "", fmt.Errorf("resolve accurate source failed, %w", err))
+		return nil
+	}
 
 	info, err := os.Stat(path)
 	if err != nil {
@@ -208,14 +217,16 @@ func (c *Copyer) accurateItem(job *accurateJob) *compatItem {
 	// af05f05c reported an exact source against the file-system root, with the source split into
 	// path segments, so the old row keeps that base and those segments; FullPath names the source
 	// directly for a consumer that needs one path.
-	return compatItemOf(&source{base: "/", path: path}, path, targets)
+	base := filepath.VolumeName(path) + string(filepath.Separator)
+	return compatItemOf(&source{base: base, path: strings.TrimPrefix(path, base)}, path, targets, info)
 }
 
 // compatItemOf builds the report coordinates of one enumerated file. The shell's walk knows the
 // source base and the source-relative path, which are exactly the af05f05c report row fields.
-func compatItemOf(src *source, sourcePath string, targets []string) *compatItem {
+func compatItemOf(src *source, sourcePath string, targets []string, info os.FileInfo) *compatItem {
 	return &compatItem{
 		source:  sourcePath,
+		info:    info,
 		targets: targets,
 		base:    src.base,
 		path:    pathSegments(src.path),
@@ -240,6 +251,7 @@ func pathSegments(name string) []string {
 // translated back into the row this surface promises: the whole source path plus the base and
 // the source-relative path segments the af05f05c report row is made of.
 type compatItem struct {
+	info    os.FileInfo
 	source  string
 	targets []string
 	base    string
@@ -325,7 +337,6 @@ type wildcardJob struct {
 func (job *wildcardJob) check() error {
 	filteredDst := make([]string, 0, len(job.dst))
 	for _, p := range job.dst {
-		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
 		}
@@ -350,10 +361,21 @@ func (job *wildcardJob) check() error {
 		return comparePath(job.src[i].path, job.src[j].path) < 0
 	})
 	for _, s := range job.src {
+		// Relative source coordinates resolve against one absolute base for both I/O and reports.
+		base, err := filepath.Abs(s.base)
+		if err != nil {
+			return fmt.Errorf("resolve source base failed, %w", err)
+		}
+		if strings.HasSuffix(s.base, string(filepath.Separator)) && !strings.HasSuffix(base, string(filepath.Separator)) {
+			base += string(filepath.Separator)
+		}
+		s.base = base
 		src := s.src()
-		if _, err := os.Stat(src); err != nil {
+		info, err := os.Stat(src)
+		if err != nil {
 			return fmt.Errorf("check src path '%s', %w", src, err)
 		}
+		s.info = info
 	}
 
 	return nil
@@ -384,7 +406,6 @@ type WildcardJobOption func(*wildcardJob) *wildcardJob
 func Source(paths ...string) WildcardJobOption {
 	return func(j *wildcardJob) *wildcardJob {
 		for _, p := range paths {
-			p = strings.TrimSpace(p)
 			if p == "" {
 				continue
 			}

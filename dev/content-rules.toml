@@ -1,0 +1,14 @@
+title = "ACP public content checks"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "personal-build-path"
+description = "Personal filesystem path in public content"
+regex = '''(?:/(?:Users|home)/[A-Za-z0-9_.-]+/|/(?:private/)?var/folders/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/)'''
+
+[[rules]]
+id = "private-service-url"
+description = "Private service reference in public content"
+regex = '''(?:https?|ssh)://(?:[A-Za-z0-9_-]+\.)*(?:byted\.org|bytedance\.net|byteintl\.net|corp|internal)(?:[:/\s]|$)'''

@@ -49,7 +49,8 @@ type StreamCopyer struct {
 	stopLock          sync.Mutex
 	callbackStopErr   error
 	getDevice         func(in string) (string, error)
-	getDiskUsageCache func(mountPoint string) *diskUsageCache
+	availableSpace    func(mountPoint string) (int64, error)
+	targetDirs        map[string]string // Indexed parent paths; Submit is their sole owner.
 	linearTargetEnded uint32
 	signatures        *signatureCache
 
@@ -121,24 +122,22 @@ func buildOption(opts ...Option) (*option, error) {
 
 // newStream starts the pipeline of an already validated option set.
 func newStream(ctx context.Context, onResults func([]Result) error, opt *option) (*StreamCopyer, error) {
-	getDevice, err := getMountpointCache()
+	getDevice, err := getMountpointResolver()
 	if err != nil {
 		return nil, err
 	}
 
 	c := &StreamCopyer{
-		option:      opt,
-		ctx:         ctx,
-		readCh:      make(chan *baseJob, opt.readBuffer),
-		resultCh:    make(chan Result, opt.resultBuffer),
-		resultsDone: make(chan struct{}),
-		onResults:   onResults,
-		eventCh:     make(chan Event, 128),
-		hardStop:    make(chan struct{}),
-		getDevice:   getDevice,
-		getDiskUsageCache: Cache(func(mountPoint string) *diskUsageCache {
-			return newDiskUsageCache(mountPoint, defaultDiskUsageFreshInterval)
-		}),
+		option:         opt,
+		ctx:            ctx,
+		readCh:         make(chan *baseJob, opt.readBuffer),
+		resultCh:       make(chan Result, opt.resultBuffer),
+		resultsDone:    make(chan struct{}),
+		onResults:      onResults,
+		eventCh:        make(chan Event, 128),
+		hardStop:       make(chan struct{}),
+		getDevice:      getDevice,
+		availableSpace: availableSpace,
 	}
 	if opt.hashPolicy.usesCache() {
 		c.signatures = newSignatureCache()

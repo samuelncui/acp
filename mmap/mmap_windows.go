@@ -15,15 +15,6 @@ import (
 	"unsafe"
 )
 
-// debug is whether to print debugging messages for manual testing.
-//
-// The runtime.SetFinalizer documentation says that, "The finalizer for x is
-// scheduled to run at some arbitrary time after x becomes unreachable. There
-// is no guarantee that finalizers will run before a program exits", so we
-// cannot automatically test that the finalizer runs. Instead, set this to true
-// when running the manual test.
-const debug = false
-
 // ReaderAt reads a memory-mapped file.
 //
 // Like any io.ReaderAt, clients can execute parallel ReadAt calls, but it is
@@ -36,6 +27,7 @@ type ReaderAt struct {
 // Close releases the mapping and then the descriptor it was created from. It is idempotent: a
 // second call releases nothing, and an empty mapping still closes the descriptor it retains.
 func (r *ReaderAt) Close() error {
+	// Detach owned resources so another Close has nothing left to release.
 	data := r.data
 	file := r.file
 	r.data = nil
@@ -45,11 +37,9 @@ func (r *ReaderAt) Close() error {
 	// collection can only ever repeat this no-op.
 	runtime.SetFinalizer(r, nil)
 
+	// Unmap before closing the descriptor, retaining errors from both operations.
 	var unmapErr error
 	if len(data) != 0 {
-		if debug {
-			println("munmap", r, &data[0])
-		}
 		unmapErr = syscall.UnmapViewOfFile(uintptr(unsafe.Pointer(&data[0])))
 	}
 	if file == nil {
@@ -103,56 +93,33 @@ func (r *ReaderAt) Slice(off, limit int64) ([]byte, error) {
 	return r.data[off : off+limit], nil
 }
 
-// Open memory-maps the named file for reading. The reader owns the descriptor it opened: Close
-// removes the mapping and then closes that descriptor.
-func Open(filename string) (*ReaderAt, error) {
-	f, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	fi, err := f.Stat()
-	if err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-
-	size := fi.Size()
-	if size < 0 {
-		_ = f.Close()
-		return nil, fmt.Errorf("mmap: file %q has negative size", filename)
-	}
-	if size != int64(int(size)) {
-		_ = f.Close()
-		return nil, fmt.Errorf("mmap: file %q is too large", filename)
-	}
-
+// mapFile acquires the mapping; the caller retains descriptor ownership on failure.
+func mapFile(f *os.File, size int) (*ReaderAt, error) {
 	// An empty file has no mapping, but it still has the descriptor this reader owns. The mapping
 	// of a zero-length file is an empty, non-nil slice, so only a closed reader reports a nil one.
 	data := make([]byte, 0)
+	// A mapping that has not reached a reader is still owned by this acquisition scope.
+	defer func() {
+		if len(data) != 0 {
+			_ = syscall.UnmapViewOfFile(uintptr(unsafe.Pointer(&data[0])))
+		}
+	}()
 	if size != 0 {
-		low, high := uint32(size), uint32(size>>32)
+		low, high := uint32(size), uint32(int64(size)>>32)
 		fmap, err := syscall.CreateFileMapping(syscall.Handle(f.Fd()), nil, syscall.PAGE_READONLY, high, low, nil)
 		if err != nil {
-			_ = f.Close()
 			return nil, err
 		}
 		defer syscall.CloseHandle(fmap)
 		ptr, err := syscall.MapViewOfFile(fmap, syscall.FILE_MAP_READ, 0, 0, uintptr(size))
 		if err != nil {
-			_ = f.Close()
 			return nil, err
 		}
 		data = unsafe.Slice((*byte)(unsafe.Pointer(ptr)), size)
 	}
 
+	// Transfer the mapping to the reader before the opener transfers its descriptor.
 	r := &ReaderAt{data: data, file: f}
-	if debug {
-		var p *byte
-		if len(data) != 0 {
-			p = &data[0]
-		}
-		println("mmap", r, p)
-	}
-	runtime.SetFinalizer(r, (*ReaderAt).Close)
+	data = nil
 	return r, nil
 }

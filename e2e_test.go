@@ -3,6 +3,8 @@ package acp_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -22,9 +25,9 @@ func TestACPCommandE2E(t *testing.T) {
 		t.Skip("skipping end-to-end test in short mode")
 	}
 
+	// Build the real command for the copy, index and linear-target cases.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-
 	repoRoot, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("get working directory: %v", err)
@@ -34,7 +37,6 @@ func TestACPCommandE2E(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		binary += ".exe"
 	}
-
 	run := func(name string, args ...string) {
 		t.Helper()
 		cmd := exec.CommandContext(ctx, name, args...)
@@ -45,13 +47,15 @@ func TestACPCommandE2E(t *testing.T) {
 	}
 	run("go", "build", "-o", binary, "./cmd/acp")
 
+	// Select a tree with regular, empty and nested files and two target flags.
 	source := filepath.Join(tempDir, "source")
-	target := filepath.Join(tempDir, "target")
+	targets := []string{filepath.Join(tempDir, "target-a"), filepath.Join(tempDir, "target-b")}
 	reportPath := filepath.Join(tempDir, "report.json")
-	if err := os.MkdirAll(target, 0o755); err != nil {
-		t.Fatalf("create target directory: %v", err)
+	for _, target := range targets {
+		if err := os.MkdirAll(target, 0o755); err != nil {
+			t.Fatalf("create target directory: %v", err)
+		}
 	}
-
 	files := map[string][]byte{
 		"plain.txt":                     []byte("plain text\n"),
 		"empty.txt":                     nil,
@@ -67,22 +71,27 @@ func TestACPCommandE2E(t *testing.T) {
 		}
 	}
 
-	run(binary, "-p=false", "-report", reportPath, source, target)
-
-	copyRoot := filepath.Join(target, filepath.Base(source))
-	for relativePath, want := range files {
-		got, err := os.ReadFile(filepath.Join(copyRoot, relativePath))
-		if err != nil {
-			t.Fatalf("read copied file %q: %v", relativePath, err)
-		}
-		if !bytes.Equal(got, want) {
-			t.Fatalf("copied file %q = %v, want %v", relativePath, got, want)
+	// Repeated target flags must write every file to both target directories.
+	run(binary, "-p=false", "-report", reportPath, "-report-indent", "-target", targets[0], "-target", targets[1], source)
+	for _, target := range targets {
+		for relativePath, want := range files {
+			got, err := os.ReadFile(filepath.Join(target, filepath.Base(source), relativePath))
+			if err != nil {
+				t.Fatalf("read copied file %q: %v", relativePath, err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("copied file %q = %v, want %v", relativePath, got, want)
+			}
 		}
 	}
 
+	// The CLI's indentation flag must reach the report writer, with exact hashes and target sets.
 	reportData, err := os.ReadFile(reportPath)
 	if err != nil {
 		t.Fatalf("read report: %v", err)
+	}
+	if !bytes.Contains(reportData, []byte("\n  \"files\"")) || bytes.Contains(reportData, []byte("\t")) {
+		t.Fatalf("report does not use two-space indentation:\n%s", reportData)
 	}
 	var report acp.Report
 	if err := json.Unmarshal(reportData, &report); err != nil {
@@ -95,11 +104,12 @@ func TestACPCommandE2E(t *testing.T) {
 		t.Fatalf("report jobs = %d, want %d", len(report.Jobs), len(files))
 	}
 
+	// Every selected source needs its own row regardless of result delivery order.
 	jobs := make(map[string]*acp.Job, len(report.Jobs))
 	for _, job := range report.Jobs {
 		jobs[job.FullPath] = job
 	}
-	for relativePath := range files {
+	for relativePath, data := range files {
 		sourcePath := filepath.Join(source, relativePath)
 		job, ok := jobs[sourcePath]
 		if !ok {
@@ -111,12 +121,19 @@ func TestACPCommandE2E(t *testing.T) {
 		if len(job.FailTargets) != 0 {
 			t.Fatalf("job %q failures = %v", sourcePath, job.FailTargets)
 		}
-		wantTarget := filepath.Join(copyRoot, relativePath)
-		if len(job.SuccessTargets) != 1 || job.SuccessTargets[0] != wantTarget {
+		if len(job.SuccessTargets) != len(targets) {
 			t.Fatalf("job %q success targets = %v", sourcePath, job.SuccessTargets)
 		}
-		if job.SHA256 == "" {
-			t.Fatalf("job %q has no SHA256", sourcePath)
+		for _, target := range targets {
+			want := filepath.Join(target, filepath.Base(source), relativePath)
+			if !slices.Contains(job.SuccessTargets, want) {
+				t.Fatalf("job %q does not report target %q: %v", sourcePath, want, job.SuccessTargets)
+			}
+		}
+		sum := sha256.Sum256(data)
+		if job.SHA256 != hex.EncodeToString(sum[:]) || job.Size != int64(len(data)) {
+			t.Fatalf("job %q content facts = %d / %q, want %d / %x",
+				sourcePath, job.Size, job.SHA256, len(data), sum)
 		}
 	}
 
@@ -124,7 +141,6 @@ func TestACPCommandE2E(t *testing.T) {
 	// written anywhere.
 	indexPath := filepath.Join(tempDir, "index.json")
 	run(binary, "-p=false", "-notarget", "-report", indexPath, source)
-
 	indexData, err := os.ReadFile(indexPath)
 	if err != nil {
 		t.Fatalf("read index report: %v", err)
@@ -136,9 +152,21 @@ func TestACPCommandE2E(t *testing.T) {
 	if len(index.Errors) != 0 || len(index.Jobs) != len(files) {
 		t.Fatalf("index report errors/files = %d/%d, want 0/%d", len(index.Errors), len(index.Jobs), len(files))
 	}
+	indexed := make(map[string]bool, len(index.Jobs))
 	for _, job := range index.Jobs {
-		if job.SHA256 == "" {
-			t.Fatalf("index row %q has no SHA256", job.FullPath)
+		relative, err := filepath.Rel(source, job.FullPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, ok := files[relative]
+		if !ok || indexed[relative] {
+			t.Fatalf("unexpected or repeated index row %q", job.FullPath)
+		}
+		indexed[relative] = true
+		sum := sha256.Sum256(data)
+		if job.SHA256 != hex.EncodeToString(sum[:]) || job.Size != int64(len(data)) {
+			t.Fatalf("index row %q content facts = %d / %q, want %d / %x",
+				job.FullPath, job.Size, job.SHA256, len(data), sum)
 		}
 		if len(job.SuccessTargets) != 0 || len(job.FailTargets) != 0 {
 			t.Fatalf("index row %q targets = %v / %v, want none", job.FullPath, job.SuccessTargets, job.FailTargets)
@@ -262,9 +290,7 @@ func TestACPCommandHonorsIndexAndReportFlags(t *testing.T) {
 	})
 }
 
-// selectedSourceFiles returns every regular file below source, which is the set of files a
-// wildcard run selects. The pre-stream API exposed that selection as data; the shell does not,
-// so the test walks the tree itself instead of asking the library what it selected.
+// selectedSourceFiles independently enumerates the regular files expected in a wildcard report.
 func selectedSourceFiles(t *testing.T, source string) []string {
 	t.Helper()
 
@@ -564,4 +590,67 @@ func TestACPCommandRendersTheProgressBar(t *testing.T) {
 	if !strings.Contains(rendered, "MB") {
 		t.Fatalf("the progress bar never received a progress event, stderr:\n%s", rendered)
 	}
+}
+
+func TestACPCommandExitCodesAndSameFilePartialFailure(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping end-to-end test in short mode")
+	}
+
+	// Exercise exit codes from a compiled command, including a same-file error alongside a valid target.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	root := t.TempDir()
+	binary := filepath.Join(root, "acp")
+	if runtime.GOOS == "windows" {
+		binary += ".exe"
+	}
+	if output, err := exec.CommandContext(ctx, "go", "build", "-o", binary, "./cmd/acp").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, output)
+	}
+	code := func(want int, args ...string) {
+		t.Helper()
+		output, err := exec.CommandContext(ctx, binary, args...).CombinedOutput()
+		got := 0
+		if err != nil {
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) {
+				t.Fatal(err)
+			}
+			got = exit.ExitCode()
+		}
+		if got != want {
+			t.Fatalf("exit=%d want=%d args=%v\n%s", got, want, args, output)
+		}
+	}
+	code(2)
+	code(2, "-unknown")
+	source := filepath.Join(root, "source")
+	good := filepath.Join(root, "good")
+	if err := os.WriteFile(source, []byte("source survives"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(good, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	reportPath := filepath.Join(root, "report.json")
+	code(1, "-p=false", "-report", reportPath, "-target", root, "-target", good, source)
+
+	// A partial failure writes its report and completes the independent target before exit 1.
+	data, err := os.ReadFile(filepath.Join(good, "source"))
+	if err != nil || string(data) != "source survives" {
+		t.Fatalf("independent copy=%q / %v", data, err)
+	}
+	data, err = os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report acp.Report
+	if err := json.Unmarshal(data, &report); err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Jobs) != 1 || len(report.Jobs[0].FailTargets) != 1 || len(report.Jobs[0].SuccessTargets) != 1 {
+		t.Fatalf("partial report=%+v", report)
+	}
+	code(0, "-p=false", source, filepath.Join(root, "exact-copy"))
 }

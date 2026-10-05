@@ -1,9 +1,7 @@
 package acp
 
 import (
-	"errors"
 	"fmt"
-	"os"
 	"time"
 )
 
@@ -67,7 +65,7 @@ func (c *StreamCopyer) report(copyed <-chan *baseJob) {
 			if !ok {
 				return
 			}
-			c.publishResult(c.finalizeJob(job))
+			c.publishResult(job.result())
 		case <-c.hardStop:
 			return
 		}
@@ -120,31 +118,4 @@ func hasFailedTarget(result Result) bool {
 		}
 	}
 	return false
-}
-
-// finalizeJob turns one finished job into its result. An item ACP could not process has no data
-// and metadata lifecycle to finish, so it is reported as it is.
-func (c *StreamCopyer) finalizeJob(job *baseJob) Result {
-	if job.itemError == nil {
-		c.completeJob(job)
-	}
-	return job.result()
-}
-
-// completeJob finishes one item after restoring its metadata. The content cache is already
-// published: the copy stage wrote it through the descriptors that read the source and wrote each
-// target, while those descriptors were still open.
-func (c *StreamCopyer) completeJob(job *baseJob) {
-	// Restore metadata before publishing the final result.
-	for _, dst := range append([]string(nil), job.successTargets...) {
-		if err := mappingError(writeSysStat(dst, job.stat)); err != nil {
-			c.endLinearTarget(err)
-			job.fail(dst, fmt.Errorf("change info, write sys stat fail, %w", err))
-
-			// Remove the failed target so the same operation can retry it.
-			if err := os.Remove(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
-				c.reportError(job.path, dst, fmt.Errorf("delete target after metadata failure failed, %w", err))
-			}
-		}
-	}
 }

@@ -7,6 +7,7 @@ import (
 )
 
 type stat struct {
+	info    fs.FileInfo // source facts collected once by indexing or enumeration
 	size    int64       // length in bytes for regular files; system-dependent for others
 	mode    fs.FileMode // file mode bits
 	modTime time.Time   // modification time
@@ -20,6 +21,7 @@ func newStat(path string, fi fs.FileInfo) (*stat, error) {
 	}
 
 	return &stat{
+		info:    fi,
 		size:    fi.Size(),
 		mode:    fi.Mode(),
 		modTime: fi.ModTime(),

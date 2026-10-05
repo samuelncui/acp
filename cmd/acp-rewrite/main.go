@@ -2,680 +2,321 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io/fs"
-	"math/rand"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"sort"
-	"strings"
-	"time"
 
 	"github.com/samuelncui/acp"
+	"github.com/samuelncui/acp/internal/fileio"
 	"github.com/schollz/progressbar/v3"
 	"github.com/sirupsen/logrus"
 )
 
-var (
-	randSource = rand.New(rand.NewSource(time.Now().UnixNano()))
-)
-
-type rewriteEntry struct {
-	Path  string   `json:"path"`
-	Links []string `json:"links,omitempty"`
-}
-
-type rewriteState struct {
-	Root     string         `json:"root"`
-	Pending  []rewriteEntry `json:"pending,omitempty"`
-	Busy     []rewriteEntry `json:"busy,omitempty"`
-	Missing  []rewriteEntry `json:"missing,omitempty"`
-	TmpFiles []string       `json:"tmp_files,omitempty"`
-}
+var errRewriteBusy = errors.New("rewrite source is busy")
 
 func main() {
-	withProgressBar := flag.Bool("p", true, "display progress bar")
-	dryRun := flag.Bool("dryrun", false, "only generate task list without rewriting")
-	statePath := flag.String("state", ".acp-rewrite-state.json", "state storage path")
-	reportPath := flag.String("report", "", "json report storage path")
-	reportIndent := flag.Bool("report-indent", false, "json report with indent")
-	ignorePaths := make([]string, 0, 4)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	code := run(ctx, os.Args[1:])
+	stop()
+	os.Exit(code)
+}
 
-	flag.Func("ignore", "ignore path, file or dir", func(s string) error {
-		ignorePaths = append(ignorePaths, s)
-		return nil
-	})
-
-	flag.Parse()
-	if flag.NArg() == 0 {
-		logrus.Fatalf("path required")
+func run(ctx context.Context, args []string) int {
+	// Parse syntax separately from execution so usage failures consistently exit with status 2.
+	flags := flag.NewFlagSet("acp-rewrite", flag.ContinueOnError)
+	progress := flags.Bool("p", true, "display progress bar")
+	dryRun := flags.Bool("dryrun", false, "only generate task list without rewriting")
+	statePath := flags.String("state", ".acp-rewrite-state.json", "state storage path")
+	reportPath := flags.String("report", "", "json report storage path")
+	indent := flags.Bool("report-indent", false, "json report with indent")
+	var ignores []string
+	flags.Func("ignore", "ignore path, file or dir", func(path string) error { ignores = append(ignores, path); return nil })
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if flags.NArg() != 1 {
+		logrus.Error("exactly one root path required")
+		return 2
 	}
 
-	root := flag.Arg(0)
-	rootAbs, err := filepath.Abs(root)
+	// Resolve the saved documents before any scan, cleanup, or source modification.
+	root, err := filepath.Abs(flags.Arg(0))
 	if err != nil {
-		logrus.Fatalf("get abs root fail, %s", err)
+		logrus.Error(err)
+		return 1
 	}
 	stateAbs, err := filepath.Abs(*statePath)
 	if err != nil {
-		logrus.Fatalf("get abs state path fail, %s", err)
+		logrus.Error(err)
+		return 1
 	}
-	var reportAbs string
+	reportAbs := ""
 	if *reportPath != "" {
 		reportAbs, err = filepath.Abs(*reportPath)
 		if err != nil {
-			logrus.Fatalf("get abs report path fail, %s", err)
+			logrus.Error(err)
+			return 1
 		}
 	}
-	ignoreAbs, err := normalizeIgnorePaths(rootAbs, ignorePaths)
-	if err != nil {
-		logrus.Fatalf("normalize ignore path fail, %s", err)
+	if err := fileio.CheckJSONPaths(root, filepath.Dir(stateAbs), filepath.Dir(reportAbs)); err != nil {
+		logrus.Error(err)
+		return 1
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-
+	ignoreAbs, err := normalizeIgnorePaths(root, ignores)
+	if err != nil {
+		logrus.Error(err)
+		return 1
+	}
 	state, err := loadState(stateAbs)
 	if err != nil {
-		logrus.Fatalf("load state fail, %s", err)
+		logrus.Errorf("load state fail, %s", err)
+		return 1
 	}
-	if state == nil || state.Root != rootAbs {
-		state = &rewriteState{Root: rootAbs}
+	if state != nil && state.Root != root {
+		logrus.Error("saved state belongs to a different root")
+		return 1
 	}
-
-	reportJobs, reportErrors, err := loadReport(*reportPath)
+	if state == nil {
+		state = &rewriteState{Root: root}
+	}
+	jobs, reportErrors, err := loadReport(reportAbs)
 	if err != nil {
-		// A report that cannot be read must never be replaced by an empty one: the accumulated
-		// history of previous runs would be lost silently.
-		logrus.Fatalf("load report fail, %s", err)
+		logrus.Errorf("load report fail, %s", err)
+		return 1
 	}
 
-	if len(state.TmpFiles) > 0 {
-		if err := cleanupTmpFiles(state); err != nil {
-			logrus.Warnf("cleanup tmp files fail, %s", err)
+	// Once both documents are decoded, execution failures still write the requested report.
+	var startupErr error
+	defer func() {
+		if startupErr == nil {
+			return
 		}
-		if err := saveState(stateAbs, state); err != nil {
-			logrus.Fatalf("save state fail, %s", err)
+		reportErrors = append(reportErrors, &acp.Error{Err: startupErr})
+		if err := writeReport(reportAbs, *indent, jobs, reportErrors); err != nil {
+			rememberCleanup(state, err)
+			logrus.Errorf("save report failed, %v", err)
 		}
-	}
-
-	if len(state.Pending) == 0 && len(state.Busy) == 0 {
-		entries, err := scanEntries(ctx, rootAbs, stateAbs, reportAbs, ignoreAbs)
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return
+		// A failed checkpoint or report may have retained a newly owned temporary.
+		if !state.saved {
+			if err := writeState(stateAbs, state); err != nil {
+				logrus.Errorf("save cleanup ownership failed, %v", err)
 			}
-			logrus.Fatalf("scan path fail, %s", err)
 		}
-		state.Pending = entries
-		if err := saveState(stateAbs, state); err != nil {
-			logrus.Fatalf("save state fail, %s", err)
+	}()
+
+	// Keep failed cleanup recorded; a failed checkpoint must not hide the cleanup failure.
+	if err := cleanupTmpFiles(state); err != nil {
+		startupErr = err
+		if !state.saved {
+			startupErr = errors.Join(startupErr, writeState(stateAbs, state))
+		}
+		logrus.Error(startupErr)
+		return 1
+	}
+	if len(state.Pending) == 0 && len(state.Busy) == 0 {
+		state.Pending, err = scanEntries(ctx, root, stateAbs, reportAbs, ignoreAbs)
+		if err != nil {
+			startupErr = err
+			logrus.Errorf("scan path fail, %s", err)
+			return 1
+		}
+		if len(state.Pending) > 0 {
+			state.saved = false
+		}
+	}
+	if !state.saved {
+		if err := writeState(stateAbs, state); err != nil {
+			startupErr = err
+			logrus.Errorf("save state fail, %s", err)
+			return 1
 		}
 	}
 	if *dryRun {
 		logrus.Infof("dryrun tasks= %d", len(state.Pending)+len(state.Busy))
-		return
+		return 0
 	}
 
-	queue := append([]rewriteEntry{}, state.Pending...)
-	queue = append(queue, state.Busy...)
-	state.Pending = nil
-	state.Busy = nil
-	if err := saveState(stateAbs, state); err != nil {
-		logrus.Fatalf("save state fail, %s", err)
+	// The sequential rewrite owner drains its current copy before advancing the persisted queue.
+	err = runQueue(ctx, state, stateAbs, reportAbs, *indent, *progress, jobs, &reportErrors)
+	if err != nil {
+		logrus.Error(err)
+		return 1
 	}
+	printDuplicates(jobs)
+	return 0
+}
 
+func runQueue(ctx context.Context, state *rewriteState, statePath, reportPath string,
+	indent, progress bool, jobs map[string]*acp.Job, reportErrors *[]*acp.Error) (runErr error) {
+	// Fold the prior busy queue into pending once; each item keeps the remaining slice in place.
+	if len(state.Busy) > 0 {
+		state.Pending = append(state.Pending, state.Busy...)
+		state.Busy = nil
+		state.saved = false
+	}
+	// An empty run only creates a requested report when no previous document exists.
+	reportDirty := false
+	if len(state.Pending) == 0 && reportPath != "" {
+		if _, err := os.Stat(reportPath); err != nil {
+			if !os.IsNotExist(err) {
+				return fmt.Errorf("stat report failed, %w", err)
+			}
+			reportDirty = true
+		}
+	}
+	defer func() {
+		// Retry only unpublished changes; failed removal keeps its durable ownership.
+		runErr = errors.Join(runErr, cleanupTmpFiles(state))
+		if reportDirty {
+			if err := writeReport(reportPath, indent, jobs, *reportErrors); err != nil {
+				rememberCleanup(state, err)
+				runErr = errors.Join(runErr, fmt.Errorf("save report failed, %w", err))
+			}
+		}
+		if !state.saved {
+			if err := writeState(statePath, state); err != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("save state failed, %w", err))
+			}
+		}
+	}()
+	if !state.saved {
+		if err := writeState(statePath, state); err != nil {
+			return fmt.Errorf("save state failed, %w", err)
+		}
+	}
 	var bar *progressbar.ProgressBar
-	if *withProgressBar {
-		bar = progressbar.NewOptions(len(queue))
+	if progress {
+		bar = progressbar.NewOptions(len(state.Pending))
 	}
 
-	var currentTmp string
-	for idx, entry := range queue {
-		if ctx.Err() != nil {
-			if currentTmp != "" {
-				_ = os.Remove(currentTmp)
-				currentTmp = ""
-			}
-			state.Pending = append(state.Pending, queue[idx:]...)
-			if err := saveState(stateAbs, state); err != nil {
-				logrus.Fatalf("save state fail, %s", err)
-			}
-			return
+	// Retained failures stay ahead of the unprocessed tail in the existing queue order.
+	retries := 0
+	for remaining := len(state.Pending); remaining > 0; remaining-- {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(runErr, err)
+		}
+		entry := state.Pending[retries]
+		report, itemErr := processEntry(ctx, entry, state, statePath)
+		if itemErr != nil {
+			logrus.Warnf("rewrite failed, path=%q, %v", entry.Path, itemErr)
+			runErr = errors.Join(runErr, itemErr)
+			report = failedReport(report, entry, itemErr)
+		}
+		mergeReport(jobs, reportErrors, report)
+		reportDirty = true
+
+		// Report and relinks must be durable before the current entry can leave pending work.
+		if err := writeReport(reportPath, indent, jobs, *reportErrors); err != nil {
+			rememberCleanup(state, err)
+			return errors.Join(runErr, fmt.Errorf("save report failed, %w", err))
+		}
+		reportDirty = false
+		var persistence *persistenceError
+		if errors.As(itemErr, &persistence) {
+			return runErr
 		}
 
-		if _, err := os.Stat(entry.Path); err != nil {
-			if os.IsNotExist(err) {
-				state.Missing = append(state.Missing, entry)
-				if bar != nil {
-					_ = bar.Add(1)
-				}
-				continue
+		// Advance past completed work by moving only the retained retry prefix, never the tail.
+		if itemErr != nil && !errors.Is(itemErr, errRewriteBusy) {
+			retries++
+		} else {
+			if itemErr != nil {
+				state.Busy = append(state.Busy, entry)
 			}
-			logrus.Warnf("stat fail, path= '%s', err= %s", entry.Path, err)
-			state.Pending = append(state.Pending, entry)
-			if bar != nil {
-				_ = bar.Add(1)
+			copy(state.Pending[1:retries+1], state.Pending[:retries])
+			state.Pending[0] = rewriteEntry{}
+			state.Pending = state.Pending[1:]
+			state.saved = false
+		}
+		if !state.saved {
+			if err := writeState(statePath, state); err != nil {
+				return errors.Join(runErr, fmt.Errorf("save state failed, %w", err))
 			}
-			continue
-		}
-
-		busy, err := isFileBusy(entry.Path)
-		if err != nil {
-			logrus.Warnf("check busy fail, path= '%s', err= %s", entry.Path, err)
-			state.Pending = append(state.Pending, entry)
-			if bar != nil {
-				_ = bar.Add(1)
-			}
-			continue
-		}
-		if busy {
-			state.Busy = append(state.Busy, entry)
-			if bar != nil {
-				_ = bar.Add(1)
-			}
-			continue
-		}
-
-		tmpPath, err := newTmpPath(entry.Path, randSource)
-		if err != nil {
-			logrus.Warnf("generate tmp fail, path= '%s', err= %s", entry.Path, err)
-			state.Pending = append(state.Pending, entry)
-			if bar != nil {
-				_ = bar.Add(1)
-			}
-			continue
-		}
-
-		state.TmpFiles = append(state.TmpFiles, tmpPath)
-		if err := saveState(stateAbs, state); err != nil {
-			logrus.Fatalf("save state fail, %s", err)
-		}
-
-		currentTmp = tmpPath
-		report, err := rewriteFile(ctx, entry, tmpPath)
-		currentTmp = ""
-
-		state.TmpFiles = removeTmp(state.TmpFiles, tmpPath)
-		if err := saveState(stateAbs, state); err != nil {
-			logrus.Fatalf("save state fail, %s", err)
-		}
-
-		if err != nil {
-			if ctx.Err() != nil {
-				_ = os.Remove(tmpPath)
-			}
-			logrus.Warnf("rewrite fail, path= '%s', err= %s", entry.Path, err)
-			state.Pending = append(state.Pending, entry)
-			if bar != nil {
-				_ = bar.Add(1)
-			}
-			continue
-		}
-
-		if err := relinkOrRetry(state, entry); err != nil {
-			logrus.Warnf("relink fail, path= '%s', err= %s", entry.Path, err)
-		}
-
-		mergeReport(reportJobs, &reportErrors, report)
-		if err := saveReport(*reportPath, *reportIndent, reportJobs, reportErrors); err != nil {
-			logrus.Warnf("save report fail, %s", err)
-		}
-		if err := saveState(stateAbs, state); err != nil {
-			logrus.Fatalf("save state fail, %s", err)
 		}
 		if bar != nil {
 			_ = bar.Add(1)
 		}
 	}
-
-	if err := saveState(stateAbs, state); err != nil {
-		logrus.Fatalf("save state fail, %s", err)
-	}
-	if err := saveReport(*reportPath, *reportIndent, reportJobs, reportErrors); err != nil {
-		logrus.Warnf("save report fail, %s", err)
-	}
-
-	printDuplicates(reportJobs)
+	return runErr
 }
 
-func scanEntries(ctx context.Context, root, statePath, reportPath string, ignorePaths []string) ([]rewriteEntry, error) {
-	groups := make(map[fileIdentity][]string)
-	entries := make([]rewriteEntry, 0, 128)
-
-	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
+func processEntry(ctx context.Context, entry rewriteEntry, state *rewriteState, statePath string) (report *acp.Report, err error) {
+	// Reuse scan metadata during this run; resumed entries observe their source once.
+	missing := len(state.Missing)
+	state.Missing = removeEntry(state.Missing, entry.Path)
+	if len(state.Missing) != missing {
+		state.saved = false
+	}
+	info := entry.Info
+	if info == nil {
+		info, err = os.Stat(entry.Path)
 		if err != nil {
-			return err
-		}
-		if shouldIgnorePath(p, ignorePaths) {
-			if d.IsDir() {
-				return fs.SkipDir
+			if errors.Is(err, os.ErrNotExist) {
+				state.Missing = append(state.Missing, entry)
+				state.saved = false
 			}
-			return nil
+			return nil, fmt.Errorf("stat rewrite source failed, %w", err)
 		}
-		if p == statePath || (reportPath != "" && p == reportPath) {
-			return nil
-		}
-		if d.IsDir() {
-			return nil
-		}
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("rewrite source is not a regular file: %q", entry.Path)
+	}
+	busy, err := isFileBusy(entry.Path)
+	if err != nil {
+		return nil, fmt.Errorf("check busy failed, %w", err)
+	}
+	if busy {
+		return nil, fmt.Errorf("%w: %q", errRewriteBusy, entry.Path)
+	}
 
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() {
-			return nil
-		}
-
-		id, linked := checkFileLinked(info)
-		if linked {
-			groups[id] = append(groups[id], p)
-			return nil
-		}
-
-		entries = append(entries, rewriteEntry{Path: p})
-		return nil
-	})
+	// Persist ownership before submission and settle it only after all core users have ended.
+	output, err := fileio.NewOutput(entry.Path)
 	if err != nil {
 		return nil, err
 	}
-
-	for _, paths := range groups {
-		sort.Strings(paths)
-		if len(paths) == 0 {
-			continue
+	tmp := output.Temporary
+	defer func() {
+		err = errors.Join(err, output.Discard())
+		if output.Temporary == "" {
+			state.TmpFiles = removeTmp(state.TmpFiles, tmp)
+			state.saved = false
 		}
-		entry := rewriteEntry{Path: paths[0]}
-		if len(paths) > 1 {
-			entry.Links = append(entry.Links, paths[1:]...)
-		}
-		entries = append(entries, entry)
+	}()
+	state.TmpFiles = append(state.TmpFiles, tmp)
+	state.saved = false
+	if err := writeState(statePath, state); err != nil {
+		return nil, &persistenceError{err}
 	}
-
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
-	return entries, nil
-}
-
-func normalizeIgnorePaths(root string, ignores []string) ([]string, error) {
-	if len(ignores) == 0 {
-		return nil, nil
-	}
-	normalized := make([]string, 0, len(ignores))
-	for _, p := range ignores {
-		if p == "" {
-			continue
-		}
-		if !filepath.IsAbs(p) {
-			p = filepath.Join(root, p)
-		}
-		abs, err := filepath.Abs(p)
-		if err != nil {
-			return nil, err
-		}
-		normalized = append(normalized, filepath.Clean(abs))
-	}
-	return normalized, nil
-}
-
-func shouldIgnorePath(p string, ignores []string) bool {
-	if len(ignores) == 0 {
-		return false
-	}
-	for _, ig := range ignores {
-		if ig == "" {
-			continue
-		}
-		if p == ig {
-			return true
-		}
-		if strings.HasPrefix(p, ig+string(os.PathSeparator)) {
-			return true
-		}
-	}
-	return false
-}
-
-func newTmpPath(path string, rnd *rand.Rand) (string, error) {
-	suffix := func() string {
-		const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-		buf := make([]byte, 4)
-		for i := range buf {
-			buf[i] = letters[rnd.Intn(len(letters))]
-		}
-		return string(buf)
-	}
-	for i := 0; i < 10; i++ {
-		tmp := fmt.Sprintf("%s.tmp%s", path, suffix())
-		if _, err := os.Stat(tmp); err != nil {
-			if os.IsNotExist(err) {
-				return tmp, nil
-			}
-			return "", err
-		}
-	}
-	return "", fmt.Errorf("tmp path collide")
-}
-
-func rewriteFile(ctx context.Context, entry rewriteEntry, tmpPath string) (*acp.Report, error) {
-	stat, err := os.Stat(entry.Path)
+	report, err = copyRewrite(ctx, &fileio.RewriteItem{Path: entry.Path, Info: info, Output: output})
 	if err != nil {
-		return nil, err
-	}
-	if !stat.Mode().IsRegular() {
-		return nil, nil
+		return report, err
 	}
 
-	handler, getter := acp.NewReportGetter()
-	opts := []acp.Option{
-		acp.AccurateJob(entry.Path, []string{tmpPath}),
-		acp.WithHashPolicy(acp.HashRead),
-		acp.Overwrite(true),
-		acp.WithEventHandler(handler),
+	// A retry may redo the current file; every original hardlink stays recorded until all succeed.
+	if err := relink(entry, state, statePath); err != nil {
+		return report, err
 	}
-
-	copyer, err := acp.New(ctx, opts...)
-	if err != nil {
-		return nil, err
-	}
-	if err := copyer.WaitErr(); err != nil {
-		return nil, err
-	}
-
-	report := getter()
-	if report == nil {
-		return nil, fmt.Errorf("report nil")
-	}
-	if len(report.Errors) > 0 {
-		return report, report.Errors[0]
-	}
-
-	job, ok := findJob(report, entry.Path)
-	if !ok {
-		return report, fmt.Errorf("job not found")
-	}
-	if len(job.FailTargets) > 0 {
-		return report, fmt.Errorf("copy fail")
-	}
-	if len(job.SuccessTargets) == 0 {
-		return report, fmt.Errorf("copy not finished")
-	}
-
-	if err := os.Rename(tmpPath, entry.Path); err != nil {
-		if remErr := os.Remove(entry.Path); remErr != nil {
-			return report, err
-		}
-		if err2 := os.Rename(tmpPath, entry.Path); err2 != nil {
-			return report, err2
-		}
-	}
-
-	// The scratch file is gone once the rewrite is committed, so the row reports the final
-	// path: a report names the file the run produced, not the temporary it was built in.
-	reportFinalTarget(job, tmpPath, entry.Path)
-
 	return report, nil
 }
 
-// reportFinalTarget replaces the scratch path of one rewrite report row with the final path.
-func reportFinalTarget(job *acp.Job, tmpPath, finalPath string) {
-	for index, target := range job.SuccessTargets {
-		if target != tmpPath {
-			continue
-		}
-
-		targets := append([]string(nil), job.SuccessTargets...)
-		targets[index] = finalPath
-		job.SuccessTargets = targets
-		return
-	}
-}
-
-func relink(entry rewriteEntry) error {
-	if len(entry.Links) == 0 {
-		return nil
-	}
-	for _, link := range entry.Links {
-		if link == entry.Path {
-			continue
-		}
-		if err := relinkOne(entry.Path, link); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func relinkOrRetry(state *rewriteState, entry rewriteEntry) error {
-	if err := relink(entry); err != nil {
-		state.Pending = append(state.Pending, entry)
-		return err
-	}
-	return nil
-}
-
-func relinkOne(src, link string) error {
-	tmpPath, err := newTmpPath(link, randSource)
-	if err != nil {
-		return fmt.Errorf("new tmp path fail, path= %q, %w", link, err)
-	}
-	if err := os.Link(src, tmpPath); err != nil {
-		return fmt.Errorf("create link fail, src= %q dst= %q, %w", src, tmpPath, err)
-	}
-
-	if err := acp.CopyAttrs(tmpPath, link); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("copy attrs fail, dst= %q src= %q, %w", tmpPath, link, err)
-	}
-
-	if err := os.Rename(tmpPath, link); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("rename tmp fail, from= %q to= %q, %w", tmpPath, link, err)
-	}
-
-	return nil
-}
-
-func loadState(path string) (*rewriteState, error) {
-	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	var state rewriteState
-	if err := json.NewDecoder(f).Decode(&state); err != nil {
-		return nil, err
-	}
-	return &state, nil
-}
-
-func saveState(path string, state *rewriteState) error {
-	if state == nil {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "\t")
-	if err := enc.Encode(state); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-func cleanupTmpFiles(state *rewriteState) error {
-	for _, tmp := range state.TmpFiles {
-		_ = os.Remove(tmp)
-	}
-	state.TmpFiles = nil
-	return nil
-}
-
-func removeTmp(tmpFiles []string, tmp string) []string {
-	next := make([]string, 0, len(tmpFiles))
-	for _, t := range tmpFiles {
-		if t == tmp {
-			continue
-		}
-		next = append(next, t)
-	}
-	return next
-}
-
-func findJob(report *acp.Report, filePath string) (*acp.Job, bool) {
-	for _, job := range report.Jobs {
-		if job.FullPath == filePath {
-			return job, true
-		}
-	}
-	return nil, false
-}
-
-// loadReport reads the report accumulated by previous runs. A report that exists but cannot
-// be decoded is an error: starting over with an empty history would drop every row the
-// earlier runs recorded.
-func loadReport(path string) (map[string]*acp.Job, []*acp.Error, error) {
-	jobs := make(map[string]*acp.Job, 128)
-	errors := make([]*acp.Error, 0)
-	if path == "" {
-		return jobs, errors, nil
-	}
-	if _, err := os.Stat(path); err != nil {
-		if os.IsNotExist(err) {
-			return jobs, errors, nil
-		}
-		return nil, nil, err
-	}
-
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer f.Close()
-
-	var report acp.Report
-	if err := json.NewDecoder(f).Decode(&report); err != nil {
-		return nil, nil, fmt.Errorf("decode report fail, path= %q, %w", path, err)
-	}
-
-	mergeReport(jobs, &errors, &report)
-	return jobs, errors, nil
-}
-
-func mergeReport(jobs map[string]*acp.Job, errors *[]*acp.Error, report *acp.Report) {
+func failedReport(report *acp.Report, entry rewriteEntry, err error) *acp.Report {
+	// Early failures still get a terminal row, and commit/relink failures cannot look successful.
 	if report == nil {
-		return
+		report = new(acp.Report)
 	}
-	for _, job := range report.Jobs {
-		jobs[job.FullPath] = job
+	job, found := findJob(report, entry.Path)
+	if !found {
+		base, name := filepath.Split(entry.Path)
+		job = &acp.Job{Base: base, Path: []string{name}, FullPath: entry.Path, Status: acp.JobStatusFinished}
+		report.Jobs = append(report.Jobs, job)
 	}
-	if len(report.Errors) > 0 {
-		*errors = append(*errors, report.Errors...)
-	}
-}
-
-// saveReport writes the accumulated report. Rows are ordered by path, so two runs of the same
-// work produce the same document, and the file is replaced atomically: a crash mid-write leaves
-// the previous report readable instead of a document the next run refuses to decode.
-func saveReport(path string, indent bool, jobs map[string]*acp.Job, errors []*acp.Error) error {
-	if path == "" {
-		return nil
-	}
-
-	names := make([]string, 0, len(jobs))
-	for name := range jobs {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-
-	report := &acp.Report{
-		Jobs:   make([]*acp.Job, 0, len(jobs)),
-		Errors: errors,
-	}
-	for _, name := range names {
-		report.Jobs = append(report.Jobs, jobs[name])
-	}
-
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-
-	enc := json.NewEncoder(f)
-	if indent {
-		enc.SetIndent("", "\t")
-	}
-	if err := enc.Encode(report); err != nil {
-		_ = f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
-}
-
-func printDuplicates(jobs map[string]*acp.Job) {
-	type dupKey struct {
-		size int64
-		hash string
-	}
-	dups := make(map[dupKey][]string)
-	for _, job := range jobs {
-		if job == nil || job.SHA256 == "" || job.Size == 0 {
-			continue
-		}
-		key := dupKey{size: job.Size, hash: job.SHA256}
-		dups[key] = append(dups[key], job.FullPath)
-	}
-
-	keys := make([]dupKey, 0, len(dups))
-	for key := range dups {
-		if len(dups[key]) > 1 {
-			keys = append(keys, key)
-		}
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].size != keys[j].size {
-			return keys[i].size < keys[j].size
-		}
-		return keys[i].hash < keys[j].hash
-	})
-
-	for _, key := range keys {
-		paths := dups[key]
-		sort.Strings(paths)
-		logrus.Infof("duplicate size= %d sha256= %s files= %v", key.size, key.hash, paths)
-	}
+	job.SuccessTargets = nil
+	job.FailTargets = map[string]error{entry.Path: err}
+	return report
 }

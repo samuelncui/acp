@@ -14,17 +14,8 @@ import (
 const signatureXattrName = "acp.signature"
 
 func readSignatureXattr(file *os.File) ([]byte, error) {
-	// Query the exact value size before allocating the bounded codec payload.
-	size, err := unix.ExtattrGetFd(int(file.Fd()), unix.EXTATTR_NAMESPACE_USER, signatureXattrName, 0, 0)
-	if err != nil {
-		return nil, err
-	}
-	value := make([]byte, size)
-	if size == 0 {
-		return value, nil
-	}
-
-	// Read through the same descriptor so path replacement cannot redirect the lookup.
+	// One bounded read captures the fixed codec and detects an oversized attribute.
+	value := make([]byte, signatureEncodedSize+1)
 	n, err := unix.ExtattrGetFd(
 		int(file.Fd()),
 		unix.EXTATTR_NAMESPACE_USER,
@@ -51,10 +42,6 @@ func writeSignatureXattr(file *os.File, value []byte) error {
 		len(value),
 	)
 	return err
-}
-
-func removeSignatureXattr(file *os.File) error {
-	return unix.ExtattrDeleteFd(int(file.Fd()), unix.EXTATTR_NAMESPACE_USER, signatureXattrName)
 }
 
 func isSignatureXattrMissing(err error) bool {

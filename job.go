@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/samuelncui/acp/internal/fileio"
 	"github.com/sirupsen/logrus"
 )
 
@@ -37,12 +38,14 @@ type baseJob struct {
 	lock      sync.Mutex
 	writeTime time.Time
 
-	targets        []string
-	successTargets []string
-	failedTargets  map[string]error
-	hash           []byte
-	cacheHit       bool
-	hashValid      bool
+	targets         []string
+	outputs         []targetSpec
+	cachedSignature *CachedSignature
+	successTargets  []string
+	failedTargets   map[string]error
+	hash            []byte
+	cacheHit        bool
+	hashValid       bool
 }
 
 // startWrite records when the copy stage took the item, which is the write time of every
@@ -86,16 +89,6 @@ func (j *baseJob) computedHash() ([]byte, bool) {
 		return nil, false
 	}
 	return j.hash, true
-}
-
-// setSize replaces the indexed size with the number of bytes the item actually read. The item
-// reports the facts it observed: a source that changed while a run is in progress is out of
-// scope, so no change check fails the item and no stale size is published.
-func (j *baseJob) setSize(size int64) {
-	j.lock.Lock()
-	defer j.lock.Unlock()
-
-	j.stat.size = size
 }
 
 func (j *baseJob) success(path string) {
@@ -179,14 +172,15 @@ func (j *baseJob) result() Result {
 type writeJob struct {
 	*baseJob
 	reader io.ReadCloser
-	size   int64
 
 	// source is the descriptor this item owns: the reader that closes it, and the file the item
 	// reads its stored hash through and publishes its computed one through. It is nil for a job
 	// that opened no source.
 	source *os.File
 
-	consumed chan struct{}
+	consumed   chan struct{}
+	sourceOnce sync.Once
+	sourceErr  error
 
 	// hardStop ends the wait for a consumer when the pipeline fails fatally.
 	hardStop <-chan struct{}
@@ -195,29 +189,37 @@ type writeJob struct {
 	skipContent bool
 }
 
-func newWriteJob(job *baseJob, src io.ReadCloser, size int64, waitConsumed bool) *writeJob {
+func newWriteJob(job *baseJob, src io.ReadCloser, waitConsumed bool) *writeJob {
+	// The write stage adds resource ownership; all source facts remain with the indexed job.
 	j := &writeJob{
 		baseJob: job,
 		reader:  src,
-		size:    size,
 	}
 	if job != nil && job.copyer != nil {
 		j.hardStop = job.copyer.hardStop
 	}
+
+	// Linear sources hand their next reader over only after this one is consumed.
 	if waitConsumed {
 		j.consumed = make(chan struct{})
 	}
 	return j
 }
 
-func (wj *writeJob) finishSource() {
-	if wj.reader != nil {
-		_ = wj.reader.Close()
-	}
-
-	if wj.consumed != nil {
-		close(wj.consumed)
-	}
+func (wj *writeJob) finishSource() error {
+	// Clear descriptor ownership before closing, and notify a linear producer exactly once.
+	wj.sourceOnce.Do(func() {
+		reader := wj.reader
+		wj.reader = nil
+		wj.source = nil
+		if wj.consumed != nil {
+			defer close(wj.consumed)
+		}
+		if reader != nil {
+			wj.sourceErr = reader.Close()
+		}
+	})
+	return wj.sourceErr
 }
 
 // waitConsumed waits until the copy stage owns the reader. A graceful stop never releases the
@@ -291,6 +293,14 @@ func (j *Job) MarshalJSON() ([]byte, error) {
 		return []byte("null"), nil
 	}
 
+	// JSON paths must keep their exact identity, including legitimate replacement runes.
+	for _, paths := range [][]string{{j.Base, j.FullPath}, j.Path, j.SuccessTargets} {
+		if err := fileio.CheckJSONPaths(paths...); err != nil {
+			return nil, err
+		}
+	}
+
+	// Preserve the established wire shape and encode failures as optional messages.
 	encoded := &jobJSON{
 		Base: j.Base,
 		Path: j.Path,
@@ -310,6 +320,9 @@ func (j *Job) MarshalJSON() ([]byte, error) {
 	if len(j.FailTargets) > 0 {
 		encoded.FailTargets = make(map[string]*string, len(j.FailTargets))
 		for target, err := range j.FailTargets {
+			if err := fileio.CheckJSONPaths(target); err != nil {
+				return nil, err
+			}
 			if isNilError(err) {
 				encoded.FailTargets[target] = nil
 				continue

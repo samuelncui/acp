@@ -1,23 +1,76 @@
 # acp
-An Advanced Copy Tools, with following extra features:
-- Process bar
-- Sorted copy order, to improve tape device read performance
-- Concurrent source preparation with request-ordered writes for linear targets
-- Multi target path, read once write many
-- Buffered or memory-mapped source reads
-- JSON format job report
-- Optional SHA-256 xattr cache for content hashes
-- Can use as a golang library
+
+ACP is a file copy tool and Go library with concurrent workers, ordered access for linear
+media, buffered or mapped reads, multiple targets from one content read, metadata preservation,
+progress events and JSON reports. An optional xattr cache stores SHA-256 content hashes.
 
 ## Requirements
 
-Building the library or a command needs Go 1.26.8 or newer: `go.mod` declares `go 1.26.8`,
-and the code uses `context.WithoutCancel` and `errors.Join`.
+Build with Go 1.26.8 or newer, as declared in `go.mod`.
+
+## Operating model and stages
+
+For the duration of a run, source contents and path relationships stay stable. The caller does
+not submit one item's output as another item's source in the same run, or edit files, directories,
+symlinks or hardlinks during copying. ACP owns its output changes; the rewrite command intentionally
+replaces its own source after reading it. ACP does not detect or recover from unsupported input
+changes. Files may change between runs.
+
+| Stage | Responsibility |
+| --- | --- |
+| `index` | Evaluate each needed `Item` method once, collect source facts (reusing available enumeration metadata), and resolve target paths and devices. Validate source/target aliases and overwrite rules before any target mutation. Pass the source facts unchanged to later stages. |
+| `prepare` | Open the source once when content or a cached hash is needed. Read the stored signature as required by the hash policy through that descriptor. |
+| `copy` | Read content once and, when enabled, compute one hash while fanning out to the targets. Complete ordinary-file metadata, cache work, synchronization and closure before final replacement; device nodes use direct output. |
+| `results` | Form one `Result` per accepted item and deliver it through one callback goroutine. Fatal pipeline failures are the exception to per-item completion; see [delivery and lifecycle](#delivery-and-lifecycle). |
+
+Indexed source facts are immutable; content-byte progress is tracked separately.
+
+### Target completion
+
+Ordinary targets use an exclusively created `.tmp_*` file beside the resolved final path. The
+old target remains in place while ACP writes the new file; the rename happens only after the
+copy stage completes its other work. Success is reported after replacement, using the final
+target path. A failed copy cleans up only its owned temporary file and retains cleanup errors
+alongside the primary error. ACP never deletes the original to work around a rename failure.
+
+An existing valid destination symlink is resolved once during indexing: ACP replaces its referent
+and retains the symlink. A dangling destination symlink is refused. Directory symlinks are also
+resolved once per parent during the run, including when child directories do not yet exist.
+For missing directories, ACP finds the existing ancestor first and resolves its symlinks once.
+Replacement creates a new inode
+at the final path; other hardlinks to the old inode keep their old content. It requires write
+permission on the destination directory and space for the complete new file while the old file
+still exists. A source alias, including a hardlink or symlink alias, fails that target while
+independent targets continue.
+
+`Overwrite(false)` and `acp -n` reject targets found during indexing. For an initially missing
+target, Linux and macOS use the filesystem's exclusive rename: another item's completed output
+cannot be replaced, and independent targets finish concurrently. Other platforms, and filesystems
+that do not support exclusive rename, serialize only the final existence check and rename.
+Copying, sync and close stay outside that fallback lock. This preserves ACP's own output without
+a per-file lock registry; external writers remain outside the supported operating model.
+
+Device nodes are written directly, without rename or metadata/cache changes, and may contain
+partial output after failure. Linear writers retain request order and perform neither
+preallocation nor per-file sync. Ordinary non-linear files retain the allocation and sync
+policy described under [platform behavior](#platform-behavior), with no free-space estimate.
+A positive-size linear target gets one fresh free-space estimate immediately before writing.
+Actual no-space and read-only errors stop the affected device and retain `ErrTargetNoSpace` and
+`ErrTargetDropToReadonly`; `ErrTargetIO` remains an individual target failure.
+
+Same-directory rename does not promise atomic replacement on every platform, including Windows,
+or durability through power failure. ACP's existing sync policy is not a filesystem transaction.
+
+The internal `fileio.Output` owns the temporary descriptor and path. The [rewrite command](#rewrite-command)
+supplies its scanned source facts and preallocated output through internal `RewriteItem`, so
+source replacement reuses the same completion path without a second temporary allocation, open
+or source stat. Before replacement, rewrite closes its source descriptor and mapping, as required
+by [Windows file sharing](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew).
+Rewrite retains its own state, hardlink and report responsibilities.
 
 ## Library API
 
-The engine is push-based. The caller submits items, ACP reports every accepted item through one
-results callback, and `Wait` returns the run's terminal error:
+The caller submits items to a push engine and consumes their results:
 
 ```go
 func NewStream(ctx context.Context, onResults func([]Result) error, opts ...Option) (*StreamCopyer, error)
@@ -29,7 +82,7 @@ func (c *StreamCopyer) Wait() error
 ```go
 stream, err := acp.NewStream(ctx, func(results []acp.Result) error {
 	for _, result := range results {
-		job := result.Job.(*myJob) // the exact instance that was submitted
+		job := result.Job.(*acp.SimpleJob) // the exact instance that was submitted
 		if result.Err != nil {
 			recordFailure(job, result.Err)
 			continue
@@ -99,72 +152,52 @@ type TargetResult struct {
 }
 ```
 
-### Error rules
+### Terminology
 
-1. **A result that carries any error is delivered immediately, as its own batch.** `Result.Err`
-   (a source ACP could not describe or open, a targetless read that failed, an item a stop
-   abandoned) and `TargetResult.Err` (one target that was not written) both skip the batch, so
-   the caller can persist the outcome before it submits the next batch. A nil `Result.Err` means
-   the item completed, even when every requested target failed.
-2. **Results without an error are buffered into batches.** They wait in the result buffer
-   (`WithResultBuffer`) until a delivery has `WithResultBatch` results, the result flush interval
-   elapses (`WithResultFlushInterval`), or `Close` flushes the rest. The result buffer is the
-   depth of the queue behind the delivery, so a caller that stops reading the batches slows the
-   pipeline instead of growing an unbounded queue.
-3. **An error returned by `onResults` is a cancellation, not a hard stop.** Items already past
-   the read stage finish and are delivered normally; items still inside the read pipeline are
-   delivered as failures carrying that error; the batch in hand is still submitted, the next
-   `Submit` returns an error, and `Wait` returns it.
-4. **Two outlets for a run error.** `NewStream` returns creation and validation errors. `Wait`
-   returns run-time errors: a pipeline failure, an error `onResults` returned, and a submission
-   the run no longer accepts. `Close` returns the wrap-up and flush error.
-5. **A graceful stop is the caller's context plus `Close`.** The item feed is the pipeline's
-   only cancellation checkpoint: `Submit` consults the context, the results callback error and
-   an exhausted linear target before it accepts a batch. Every later stage runs on a context
-   that never cancels, so it only drains and forwards what it holds, and a stage that pulls an
-   item it can no longer start reports it with the stopping error. Every accepted item
-   therefore appears in exactly one result. A fatal pipeline failure is the exception: it ends
-   the pipeline without a per-item promise.
-6. **Caller code is called under panic protection.** A panic in `onResults` or in an event
-   handler becomes an error `Wait` returns instead of unwinding a pipeline goroutine; a panic in
-   `Item.Source`/`Item.Targets` becomes that item's `Result.Err`, so the item is still reported
-   exactly once and the run continues. A panic that escapes pipeline code itself is recorded as
-   the run error and ends the run.
-7. **`Close` then `Wait`**, with a single submitter. `Submit` blocks while the read buffer is
-   full, which is the feed's backpressure, and a nil item is a submission error. When `Close`
-   races a submission, indexed totals include only accepted items, and shutdown waits for the
-   feed's count-event send before closing event delivery. A caller must
-   not call `Close`, `Wait` or `Submit` from inside `onResults`: the callback runs on the
-   delivery goroutine, so `Close` would wait for the call it is in.
+| Term | Meaning |
+| --- | --- |
+| Item | One caller-owned unit submitted to the push engine through `Item`. |
+| Job | The compatibility `Job` report row; `SimpleJob` is the existing convenience implementation of `Item`, and internal job types carry pipeline state. These roles retain their names. |
+| Target | One path requested by `Item.Targets` or the shell's target options; “destination” describes the same path. |
+| Result | One item's terminal facts, error and target outcomes. `Result.Job` retains the submitted item. |
+| Result buffer | The bounded queue of results waiting for delivery. |
+| Result batch | The slice passed to one invocation of the results callback. |
+| Content hash / cached signature | SHA-256 identifies content; a cached signature stores that hash together with size and mtime. |
+| Stream / compatibility shell | The stream accepts items; the shell enumerates job options and produces report rows over that stream. |
 
-### Result order
+`Copyer`, `StreamCopyer`, `AccurateJob`, `WildcardJob`, `Result.Job` and the report's existing
+field names are public API names. Their spelling and type roles are preserved for compatibility.
+A rewrite entry describes persisted rewrite work; it is separate from the stream's submitted item
+and the report row.
 
-Result order is **unspecified**. Results arrive in completion order, so a failure may arrive
-before a success of the same submission batch. A linear target still *writes* in request order,
-because a single writer consumes the items in that order; that is a property of the medium, not
-of the callback.
+### Delivery and lifecycle
 
-### Result persistence
+Use one submitter, then call `Close` and `Wait`. `Submit` blocks when the read buffer is full
+and rejects nil items. `Close` ends the feed and drains accepted work; it returns wrap-up or
+flush errors. `NewStream` returns creation and option-validation errors; `Wait` returns the
+terminal run error.
 
-ACP owns delivery, not persistence. Every result travels through the one `onResults` callback,
-and ACP batches successful results itself: they wait in the result buffer (`WithResultBuffer`)
-until a delivery holds `WithResultBatch` results, the result flush interval elapses
-(`WithResultFlushInterval`), or `Close` flushes the rest, while a result that carries an error is
-delivered immediately as its own batch. A caller that wants a write-goroutine pool or a second
-queue does that behind the callback: persist the batch, return, and let ACP keep feeding. A
-blocking callback is what applies backpressure to the pipeline — the callback runs on the
-delivery goroutine, so a slow persistence layer slows the copy instead of growing an unbounded
-queue. The slice handed to the callback is valid for the duration of that call: a caller that
-keeps results beyond it copies them.
+`Result.Err` describes an item ACP could not process, including a source description/open failure,
+a failed targetless read or an item abandoned by a graceful stop. `TargetResult.Err` describes
+one failed target. A nil `Result.Err` can accompany failed targets, so callers must inspect both.
+Any result carrying an error is delivered immediately as its own batch. Successful results wait
+for `WithResultBatch`, `WithResultFlushInterval`, or the final `Close` flush. `WithResultBuffer` bounds the queue;
+slow callbacks apply backpressure. ACP owns batching; persistence belongs to the caller.
+Copy a callback's result slice if retaining it beyond that call.
 
-### Stop modes
+Result order is unspecified; target outcomes within a result retain request order. Never call
+`Submit`, `Close` or `Wait` from inside `onResults`, since delivery must return before the run
+can finish.
 
-| Mode | Trigger | Every accepted item reported |
-| --- | --- | --- |
-| graceful | the caller cancels `ctx` | yes, with the stopping error for the items that had not started |
-| callback cancellation | `onResults` returns an error | yes, same mechanism as the context |
-| close | the caller calls `Close` | yes: `Close` drains what was already submitted |
-| hard stop | a fatal pipeline failure | no per-item promise |
+Cancellation of the caller's context, a callback error or an exhausted linear target stops new
+submissions. Accepted items that cannot start receive the stopping error; work already past the
+read stage finishes and is reported. A callback error does not retract the submission already
+in progress. Closing the feed alone is not a stopping error. A fatal pipeline failure ends the
+run without a per-item completion guarantee.
+
+Caller methods, the results callback and event handlers run under panic protection. A panic
+in an item method fails that item; a callback or event-handler panic becomes a run error. A
+panic escaping pipeline code is a fatal run error, preserving the panic value.
 
 ## Options
 
@@ -172,7 +205,7 @@ keeps results beyond it copies them.
 | --- | --- | --- |
 | `SetFromDevice(...)` | run | Source device options |
 | `SetToDevice(...)` | run | Target device options |
-| `LinearDevice(bool)` | device | One worker and request order for a tape-like device |
+| `LinearDevice(bool)` | device | Enable linear device behavior |
 | `DeviceThreads(int)` | device | Worker count, default 8, forced to 1 for a linear device |
 | `WithReadMode(ReadBuffered\|ReadMapped)` | source device | Read sources buffered or through a memory mapping |
 | `Overwrite(bool)` | run | Replace an existing target instead of refusing it; applies to every target |
@@ -197,50 +230,26 @@ the only one that receives events, and `WithEventHandler(nil)` clears the regist
 `WithProgressBar()` installs its handler through the same option, so a later `WithEventHandler`
 replaces the bar. The job options and `SetFromDevice`/`SetToDevice` accumulate by design: a
 second `WildcardJob` adds another walk, and a second device option adjusts the same device
-description. An event handler is called from one goroutine per registration and never
-concurrently, so it may keep unguarded state; registering the same handler twice replaces the first
-registration, so it is still called once. The results callback is called from one goroutine as
-well, never concurrently.
+description.
 
 `WithReadMode` applies to the source device only. An item implementing `ReadModeItem` overrides
-that choice for its own source; ACP calls the method once during indexing, and an invalid mode
-or panic fails that item without stopping the run. Items without the method keep the device mode.
-Buffered reads are the default and avoid
-updating the source access time where the platform allows it (`O_NOATIME`, with a fallback when
-the open is refused); mapped reads use the `mmap` package, whose reader reports the end of an
-empty mapping immediately. Either way one descriptor serves the whole item.
+that choice for its own source; an invalid mode or panic fails that item without stopping the
+run. Buffered reads are the default; platform differences are listed below.
 
 ## Events
 
-`WithEventHandler` receives the run's `Event` values; `WithProgressBar()` is one handler built
-from them, and because a run keeps one handler, a command that wants a bar *and* its own
-collector composes them (which is what `cmd/acp` does). A run can emit this set, and not every run
-emits all of it: `EventUpdateJob` only comes from the `af05f05c` shell, `EventSignatureCacheSummary`
-only from a run that manages the signature cache, which the default `HashOff` policy does not, and
-`EventReportError` only when the run recorded a pipeline-level error:
+`WithEventHandler` receives `Event` values serially on one goroutine. A command needing both a
+progress bar and another consumer composes them into that handler. `EventFinished` is sent once,
+last; `Close` and `Wait` wait for the handler, so a handler that never returns holds the run open.
 
 | Event | What it reports |
 | --- | --- |
-| `EventUpdateCount` | the feed's indexed totals (`Bytes`, `Files`), with `Finished` set on the last one |
-| `EventUpdateProgress` | the copy stage's completed totals (`Bytes`, `Files`), with `Finished` set on the last one |
-| `EventUpdateJob` | one terminal report row (`Job`), published by the `af05f05c` shell |
-| `EventReportError` | one pipeline-level error (`Error`: source, target, cause) |
-| `EventSignatureCacheSummary` | the run's aggregate cache activity (`SignatureCacheSummary`) |
-| `EventFinished` | the run ended; the last event of one registration |
-
-Events are delivered under the same contract as the results callback:
-
-- **One goroutine per registration, never concurrently.** A handler may keep unguarded state
-  between events, which is what lets the progress bar hold its file total without a lock. A run
-  has at most one registration: `WithEventHandler` is last-wins, and `WithEventHandler(nil)`
-  clears it.
-- **`EventFinished` is delivered exactly once per registration**, after every other event of
-  that run.
-- **The run waits for its handlers.** `Close` and `Wait` return only after every registered
-  handler received `EventFinished`, so a handler that never returns blocks the run instead of
-  being abandoned.
-- **A panic in a handler is an error `Wait` returns**, exactly like a panic in the results
-  callback; ACP never unwinds the dispatching goroutine on the caller's behalf.
+| `EventUpdateCount` | Accepted totals (`Bytes`, `Files`), with `Finished` on the last update |
+| `EventUpdateProgress` | Completed totals (`Bytes`, `Files`), with `Finished` on the last update |
+| `EventUpdateJob` | One terminal `Job` report row, emitted by the compatibility shell |
+| `EventReportError` | A pipeline error (`Error`: source, target, cause) |
+| `EventSignatureCacheSummary` | Aggregate cache activity when a policy manages the cache |
+| `EventFinished` | The run ended |
 
 ## Content hash policy
 
@@ -250,90 +259,52 @@ facts; a transfer reads its source to write it somewhere:
 
 | Policy | Targetless item | Transfer |
 | --- | --- | --- |
-| `HashOff` | no hash, cache untouched | no hash, cache untouched |
+| `HashOff` | no hash or cache use | no hash or cache use |
 | `HashCachedOnly` | stored hash reused; a miss leaves the item without one | rejected: a copy always reads its source |
 | `HashCachedOrRead` | stored hash reused; a miss reads and hashes | rejected: a copy always reads its source |
 | `HashCachedOrReadRefresh` | stored hash reused; a miss reads, hashes and refreshes | always reads, hashes and refreshes |
-| `HashRead` | always reads and hashes, cache untouched | always reads and hashes, cache untouched |
+| `HashRead` | always reads and hashes; no cache use | always reads and hashes; no cache use |
 | `HashReadRefresh` | always reads and hashes, and refreshes the cache | always reads, hashes and refreshes the cache |
 
-A transfer always reads its source and produces a computed hash, so a reused stored hash would
-describe content the run never computed. `HashCachedOnly` and `HashCachedOrRead` are therefore
-rejected for an item that requests a target, as that item's `Result.Err`, instead of silently
-behaving as `HashRead`. `HashCachedOrReadRefresh` keeps its cache promise on a transfer and
-transfers as `HashReadRefresh`. A refresh publishes the stored value only when it differs from
-the computed one, which keeps an identical rewrite from touching the attribute. A targetless
-item whose policy neither reads content nor uses the cache completes without opening the source
-at all.
+Transfers read source content and compute a hash only when the policy enables hashing. The two
+reuse-only policies fail the item with `Result.Err` when it requests targets; they do not fail
+stream creation. `HashCachedOrReadRefresh` transfers as `HashReadRefresh`.
 
 ## Content signature cache
 
-ACP stores a fixed binary SHA-256 plus the file size and nanosecond mtime in
-`user.acp.signature` on Linux and the canonical `acp.signature` user attribute on Darwin
-and FreeBSD.
+The managed xattr holds a fixed binary SHA-256, size and nanosecond mtime. A lookup compares the
+stored metadata with the indexed facts to detect a cache made stale between runs. The source
+entry is read at most once when needed; refresh compares that saved value with the computed
+entry and skips an unchanged write. A fresh staged target receives a new entry directly only
+when refresh is enabled, without reading or invalidating an old one.
+The target entry is written before restoring restrictive permissions; all metadata is complete
+before replacement.
 
-The xattr is a disposable optimization. A policy that reuses a stored hash may skip reading
-content, and a policy that refreshes rewrites the source and every successful target. One
-descriptor serves the whole item: the stored hash is read through the descriptor that will read
-the content, and the computed hash is published through it before it closes, so a cache
-operation never reopens a path and nothing about cache writing outlives its item. A target
-carries its own descriptor and keeps it open until the item's hash is known, so the target's
-entry is published through the descriptor that wrote it, while that descriptor is still open. The
-one path-based step runs before a target has a descriptor at all: an overwrite drops the target's
-stale entry before the file is truncated, so a crash cannot leave the old entry describing the new
-bytes.
-Writers publish an entry only for the version whose bytes produced the hash, and they state that
-version's size and mtime. The evidence is the descriptor the item still owns: a source keeps its
-own metadata, so it must still show the facts the item observed, and a source that cannot be shown
-to be that version publishes nothing instead of binding its hash to metadata the run never saw. A
-target receives the item's metadata after the entry is published, so its length is what the
-descriptor has to show. An entry whose file changes after it was written fails the reader's
-metadata comparison and is treated as stale. Missing, stale, corrupt, read-only, full, or
-unsupported xattrs are summarized as warnings and never become copy errors. A file system without
-the managed attribute namespace stores no cache at all, which is a no-op: reading it is a miss and
-writing or removing it records no failure. ACP's managed key is not copied as an ordinary source
-xattr. The run reports its aggregate summary as `EventSignatureCacheSummary`.
+Cache operations use the descriptors that read or wrote the content, finish before those
+descriptors close, and never reopen a path. The managed key is excluded from ordinary xattr
+copying. Cache diagnostics are aggregated in `EventSignatureCacheSummary`; they never become
+copy or `Wait` errors. A filesystem without the managed attribute namespace stores nothing:
+reads miss and writes are silent no-ops.
 
-## Platform behaviour
+## Platform behavior
 
-One descriptor per item and the same result contract hold on every platform; the platform
-changes how a read avoids the access time, where the signature cache lives, how a target is
-preallocated, what metadata can be restored, and how a mapped read is implemented.
-
-| Platform | Source access time | Managed signature attribute | Target preallocation | Metadata restore | Mapped read |
+| Platform | Buffered source access time | Managed signature attribute | Non-linear file allocation | Metadata restore | Mapped read |
 | --- | --- | --- | --- | --- | --- |
-| Linux | suppressed: a buffered source opens with `O_NOATIME`, falling back to an ordinary open when the flag is refused | `user.acp.signature`, in the `user.` namespace | `fallocate` reserves the whole target size | xattrs, mode, owner as root, times | `syscall.Mmap`, plus `MADV_SEQUENTIAL` and `MADV_WILLNEED` (one advice per call) for files up to 16 MiB |
+| Linux | `O_NOATIME`, falling back when refused | `user.acp.signature` | `fallocate` | xattrs, mode, owner as root, times | `syscall.Mmap`; sequential/prefetch advice for files up to 16 MiB |
 | Darwin | not suppressed | `acp.signature` | `Truncate` | xattrs, mode, owner as root, times | `syscall.Mmap` |
-| FreeBSD | not suppressed | `acp.signature`, in the user extended-attribute namespace | `Truncate` | mode and times only | no mapping: the descriptor is read with `ReadAt` |
-| Windows | not suppressed | none: the cache is a silent no-op | `Truncate` | mode and times only | `CreateFileMapping` plus `MapViewOfFile` |
-| other | not suppressed | none: the cache is a silent no-op | `Truncate` | mode and times only | no mapping: the descriptor is read with `ReadAt` |
+| FreeBSD | not suppressed | `acp.signature` in the user namespace | `Truncate` | mode and times | descriptor-backed `ReadAt` |
+| Windows | not suppressed | none | `Truncate` | mode and times | `CreateFileMapping` and `MapViewOfFile` |
+| other | not suppressed | none | `Truncate` | mode and times | descriptor-backed `ReadAt` |
 
-- **Access time.** Suppression exists on Linux only, where `O_NOATIME` needs ownership or
-  privilege, so `openSource` falls back to an ordinary open when the flag is refused. A mapped
-  read never suppresses the access time on any platform: `mmap.Open` opens the file without
-  `O_NOATIME`.
-- **Signature attribute.** `user.acp.signature` is Linux's `user.` namespace spelling of one
-  fixed binary codec; Darwin and FreeBSD address the canonical `acp.signature` directly, FreeBSD
-  through the user extended-attribute namespace. A platform without a managed attribute
-  namespace is a silent no-op rather than an error: reading it is a cache miss, and writing or
-  removing it records no failure.
-- **Preallocation.** Linux reserves the target's whole size with `fallocate`; Darwin, FreeBSD,
-  Windows and other platforms use `Truncate`. Both run only for a non-linear target with a
-  non-zero size, so a zero-length file and a tape-like target are left alone.
-- **Metadata restore.** Only the unix builds restore xattrs, and only they restore ownership,
-  and only while the process runs as root; every platform restores mode and times. ACP's managed
-  signature key is never copied as an ordinary source xattr.
-- **Mapped reads.** `ReadMapped` is one package with a per-platform implementation: `Mmap` on
-  Linux and Darwin, `CreateFileMapping` plus `MapViewOfFile` on Windows, and a descriptor-backed
-  `ReadAt` reader on every other platform, so the option works everywhere even where no mapping
-  exists. `Close` releases the mapping and then the descriptor the reader owns, and an empty file
-  has no mapping but still has that descriptor.
+Zero-length files need no preallocation. Non-linear writers sync content before closing.
+Mapped reads do not suppress access time. See [platform verification limits](TESTING.md#platform-and-environment-limits)
+for checks requiring a native runtime.
 
 ## af05f05c compatibility shell
 
-The shell restores the public surface of `af05f05c`, the commit before the streaming API, so
-existing callers and both commands keep working, and it carries today's additive options and errors
-beside that surface. It is a shell over the push engine, not a second implementation:
+The `af05f05c` surface delegates to the push engine and retains its exported names, field types
+and [report format](#report). `v0.1.0` and `v0.2.0` are withdrawn and are not compatibility
+baselines.
 
 ```go
 c, err := acp.New(ctx, acp.WildcardJob(acp.Source("example"), acp.Target("target")), acp.WithHash(true))
@@ -348,11 +319,9 @@ c.Wait()
 - `AccurateJob(src, dsts)` copies one exact source to exact target paths; `WildcardJob(Source(...),
   Target(...))`, `AccurateSource(base, paths...)`, `WildcardJobOption` walk sources, keep regular
   files, map each source-relative path onto every target directory, and sort them in the
-  platform's path order. The walking, the mapping and the ordering are unexported helpers now:
-  the intermediate revision's `SelectFiles` and `FileEntry` are gone.
-- A repeated relative path inside one `WildcardJob` is an enumeration error that **ends the
-  run**: `WaitErr` returns it and nothing is copied, instead of logging it and keeping the
-  first file.
+  platform's path order.
+- A repeated relative path inside one `WildcardJob` is an enumeration error: `WaitErr` returns it
+  and nothing is copied.
 - `Overwrite(bool) Option`, `SetFromDevice`, `SetToDevice`, `LinearDevice`, `DeviceThreads`,
   `WithReadMode`, `WithReadBuffer`, `WithResultBuffer`, `WithResultBatch`,
   `WithResultFlushInterval`, `WithHashPolicy`, `WithLogger`, `WithEventHandler`,
@@ -361,74 +330,31 @@ c.Wait()
   `WildcardJobOption`, `Option`, `ReadCachedSignature`, `CachedSignature`,
   `DecodeCachedSignature`, `ErrTargetNoSpace`, `ErrTargetDropToReadonly`, `ErrTargetIO`,
   `CopyAttrs`, `UnexpectFileMode`.
-- `WithHash(true)` maps to `HashReadRefresh` and `WithHash(false)` to `HashOff`; a repeated hash
-  option is last-wins. Every symbol added since (`WithReadMode`, the result options,
-  `WithHashPolicy`, `ErrTargetIO` and so on) is additive: every
-  `af05f05c` symbol keeps working, and `compat_af05f05c_test.go` fails the build if one is renamed
-  or retyped.
-- Each item is translated into one terminal `EventUpdateJob` row, so `Report`, `NewReportGetter`
-  and the JSON report keep their shape, including a row for an item ACP could not process: its
-  failure travels under the empty `fail_target` key. The row is keyed by the joined relative path,
-  exactly as `af05f05c` keyed it, so two items that resolve to one relative path share a row; a
-  repeated relative path inside one job option already ends the run, and a library caller that
-  submits overlapping job options should treat the shared row as a known limit of the report
-  surface.
-- A row carries `base`, the directory the source-relative `path` segments are resolved against, and
-  `path` as an array. `full_path` names the source as one whole path and `signature_cache_hit`
-  reports where the hash came from; both are additive fields that a row written before them does not
-  have. `NewReportGetter` keys a row by the joined relative path.
-- Two behaviours differ from `af05f05c` and are deliberate. First, an error the pipeline reports
-  for a path — a walk that could not read a directory, a target that could not be removed after
-  its metadata failed — is a run error, so `WaitErr` returns it and `cmd/acp` exits non-zero;
-  `af05f05c` only logged such an error and published its event, and finished with a success
-  status. Second, `WithHash(true)` manages the content-signature cache on the source and on every
-  target, which `af05f05c` had no code for: a computed hash is published as a disposable
-  size-and-mtime entry, and an overwritten target drops its stale entry before it is truncated.
+- `WithHash(true)` maps to `HashReadRefresh`; `WithHash(false)` maps to `HashOff`.
+- Pipeline errors are returned by `WaitErr` and cause the command to fail. The shell produces
+  reports from final results, including failed items.
+- `Cache[K,V]` initializes a key once while allowing different keys to initialize concurrently.
 
-## Withdrawn versions and how to migrate
+## Memory reader
 
-`v0.1.0` and `v0.2.0` are **withdrawn**: neither is the compatibility baseline, both were
-published from the abandoned intermediate streaming API, and their tags are revoked. `v0.2.1`
-is source-compatible with `af05f05c` — the `New`/`Copyer` shell above — so a caller of the
-baseline upgrades without changes. A caller that built against the withdrawn tags, or against
-the intermediate names of this development branch, migrates like this:
+The `mmap` package includes code derived from `golang.org/x/exp/mmap`; its upstream
+notice and license are retained in [mmap/LICENSE](mmap/LICENSE).
 
-| Removed | `v0.2.1` |
-| --- | --- |
-| `RunStream(ctx, source, sink, opts...) error` | `NewStream(ctx, onResults, opts...)`, then `Submit`, `Close`, `Wait` |
-| `StreamSource` (`Next(ctx) (*StreamRequest, error)`, `io.EOF` ends) | the caller's own loop calling `Submit(items...)` |
-| `StreamSink` (`Write(ctx, *StreamResult) error`, `Flush(ctx) error`) | the `onResults func([]Result) error` callback; ACP owns the flush and the batch |
-| `StreamRequest{ID, Source, Targets}` | the caller's own `Item` (`Source()`, `Targets()`); the ID becomes a field of that item |
-| `StreamResult{ID, Job *Job}` | `Result`: `Result.Job` is the submitted `Item`, so the caller recovers its own state by assertion |
-| `WithSignatureCache(bool)` (v0.2.0) | `WithHashPolicy(HashCachedOrReadRefresh)` — it transfers as a refresh policy but still reuses a valid stored hash — or `WithHashPolicy(HashOff)` to disable the cache |
-| `ForceRehash(bool)` (v0.2.0) | `WithHashPolicy(HashReadRefresh)`: always hash the content and rewrite the stored entry |
-| `SourceWithPath(base, paths ...string)` (v0.1.0 and v0.2.0) | `AccurateSource(base, segments ...[]string)`: the shell keeps the `af05f05c` form, so each whole path becomes its segment slice — `SourceWithPath(b, "a/x")` is `AccurateSource(b, []string{"a", "x"})` |
-| `Job.Path string` (v0.1.0 and v0.2.0 reports) | `Job.Path []string`: the row now carries the source-relative segments beside `Base`, and `FullPath` repeats the whole path |
-| `Run`, `BatchSource`, `RunStream` request/result variants of this branch's earlier revisions | the same mapping: one feed loop, one results callback |
+The `mmap` package retains its source descriptor. Explicit `Close` releases a mapping before
+closing the descriptor and is idempotent on every platform. An open empty file is readable as
+empty, not closed; a failed mapping setup releases its resources. Slice bounds are checked
+before allocation. `Read` returns `io.EOF` at the end; `ReadAt` rejects an offset past the end.
+`File` returns the owned descriptor, so keep the reader reachable while using it. The finalizer
+is a fallback, not a substitute for `Close`.
 
-The `af05f05c` report surface stays: `Report`, `Job`, `Error`, `NewReportGetter` and the JSON
-document keep their shape, and the shell fills one terminal row per item.
+## Install
 
-## Divergence from upstream `mmap`
-
-This module started from the Go project's `mmap` package and is maintained here now: reads run
-through the descriptor ACP owns, the end of the content is `io.EOF` and an open mapping of an empty
-file is empty rather than closed, `Close` is idempotent and removes the mapping before it closes
-that descriptor, a slice range is validated before anything is allocated, and a platform without
-a mapping reads through the descriptor instead. Upstream changes are not merged automatically.
-
-Two details of that contract are worth stating: a `ReadAt` that starts past the end of the content
-reports an invalid offset rather than `io.EOF`, because only reaching the end of the content is the
-end of the file; and `File` hands out the descriptor the reader owns, so a caller that keeps it must
-keep the reader reachable, since the finalizer closes the descriptor once the reader is gone.
-
-# Install
-```
-# Install acp
-go install github.com/samuelncui/acp/cmd/acp
+```sh
+go install github.com/samuelncui/acp/cmd/acp@latest
+go install github.com/samuelncui/acp/cmd/acp-rewrite@latest
 ```
 
-# Usage
+## Usage
 
 ```
 Usage of acp:
@@ -455,12 +381,15 @@ Usage of acp:
 ```
 
 The command exits `0` only when every selected item was copied to every requested target.
-Any item failure, any target that was not written, and any pipeline failure make it exit
-non-zero, and the report file is written either way. Failure to write a requested report also
-exits non-zero. `-notarget` selects an index operation with no destinations, including when
-`-target` flags were supplied.
+Any item failure, any target that was not written, cancellation, and any pipeline failure make
+it exit `1`, and the requested report is attempted before exit. Failure to write that report also
+exits `1`; invalid flags or missing positional arguments exit `2`. Independent items and targets
+continue after individual failures. `-notarget` selects an index operation with no destinations,
+including when `-target` flags were supplied.
 
-## Example
+### Examples
+
+Place flags before positional source and target paths; Go flag parsing stops at the first positional argument.
 
 ```
 # copy `example` dir to `target` dir
@@ -476,10 +405,10 @@ acp -report report.json -report-indent example target/
 acp example/a.bin target-b.bin
 
 # copy `example` dir to `target1` and `target2` dir
-acp example -target target1 -target target2
+acp -target target1 -target target2 example
 
 # do not copy, just get a dir index, write to `report.json`
-acp example -notarget -report report.json
+acp -notarget -report report.json example
 
 # copy from a tape-like source to a tape-like target
 acp -from-linear -to-linear example target/
@@ -487,24 +416,57 @@ acp -from-linear -to-linear example target/
 
 ## Report
 
-`-report` writes one `files` row per item plus, when the run recorded a pipeline problem, a
-top-level `errors` array; an empty `files` or `errors` array is omitted, so a run with no items and
-no problems writes `{}`. Rows are ordered by the joined relative path that keys them, so the same
-items always write the same document. Per-item and per-target failures stay inside the row's
-`fail_target` map, keyed by the target path, or by the empty key when ACP could not process the item
-itself: an unreadable source, an item abandoned by a stop, or a targetless item whose content read
-failed. The empty key is the one slot no requested target can occupy, so every item-level failure
-has the same shape, and a failed item still gets a terminal row. The top-level `errors` array
-carries pipeline problems only, so a single failure is recorded once. A row names its source the
-`af05f05c` way: `base` plus the source-relative `path` array, with `full_path` as the additive whole
-path.
+The compatibility shell owns report rows; the push engine returns `Result` values. Each terminal
+item, including a failed item, produces one `Job` row. `Base` is the source base directory and
+`Path` is its relative segment slice, encoded as a JSON array. Their joined path is the additive
+`FullPath` (`full_path`); `SignatureCacheHit` (`signature_cache_hit`) is also additive.
+`NewReportGetter` keys and sorts rows by the joined relative path. Overlapping job options that
+produce the same relative key share a row.
 
-`-report-indent` writes the same document with a two-space indent (`cmd/acp-rewrite` indents its
-accumulated report with a tab). The report is plain JSON:
-`encoding/json` reads and writes it, including the `fail_target` map, so no ACP-specific
-decoder is needed. `cmd/acp-rewrite` accumulates its `-report` across runs and treats a report
-it cannot decode as a fatal error instead of starting over with an empty history.
+`-report` writes these rows under `files`. Per-target failures use the final target path in
+`fail_target`; item-level failures use the empty key. Pipeline errors appear only in the
+top-level `errors` array. Empty `files` and `errors` arrays are omitted, so an empty report is
+`{}`. Nil errors remain absent. `-report-indent` and `Report.ToJSONString(true)` use two-space
+indentation. Standard `encoding/json` handles reports without a custom decoder.
+
+JSON report paths require valid UTF-8. Invalid filename bytes cause an encoding error instead
+of a lossy path; native copies and in-memory results retain host filename semantics. Individual
+rows and errors use `*Job` and `*Error` because their JSON methods have pointer receivers.
+`json.Marshal` and `json.Encoder` return encoding errors; `Report.ToJSONString` returns an empty
+string on encoding failure. Commands preserve the previous report and exit `1` if the requested
+report cannot be saved.
+
+## Rewrite command
+
+`acp-rewrite -state state.json -report report.json ROOT` replaces regular files under the
+[target completion contract](#target-completion), preserves each scanned hardlink group, and
+accumulates report rows across runs. It reports final paths and duplicate content by size and
+SHA-256. `-dryrun` saves the selected work without rewriting it; repeated `-ignore PATH` excludes
+a file or subtree.
+Busy entries remain in the state's busy queue; missing and failed entries remain pending for an
+explicit later invocation. Missing paths are also recorded in the state's missing list. As with `acp`,
+exit codes are `0` for success, `1` for execution or partial failure, and `2` for usage errors.
+
+The persisted pending queue includes the current entry, its hardlinks and the unprocessed tail.
+An entry leaves pending only after its copy, replacement, relinks, report and progress writes
+succeed. An interrupted current entry may be rewritten again. Individual failures retain that
+entry and allow independent entries to continue; a state or report persistence failure stops new
+entries. State and report files must both decode before any source or saved temporary file is
+changed.
+
+Rewrite requires valid UTF-8 paths for its root, selected regular files and hardlinks, and the
+directories holding its state/report documents and their temporary files. The document basenames
+themselves retain host filename semantics. Scanning rejects an unsupported selected filename
+before any file is rewritten; no lossy queue is saved. `-ignore` can exclude an unsupported file or subtree.
+Whitespace, control characters, backslashes and the literal Unicode replacement character
+are preserved wherever the host filesystem supports them.
+
+State and report writes use the shared temporary-file allocation and JSON writer: encode, sync,
+close, then rename. Temporary hardlinks use exclusive allocation with collision retry. Cleanup
+removes only allocated paths or ownership recorded in state; a cleanup failure keeps that
+ownership for a later run and is reported alongside the primary failure.
 
 ## Testing
 
-See [TESTING.md](TESTING.md) for unit, race, end-to-end, and cross-platform test instructions.
+See [TESTING.md](TESTING.md) for unit, race, end-to-end, and cross-platform test instructions
+and the [release SOP](TESTING.md#release-sop).

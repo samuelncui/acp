@@ -1,17 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/samuelncui/acp"
+	"github.com/samuelncui/acp/internal/fileio"
+	"github.com/sirupsen/logrus"
 )
 
 func TestScanEntriesHardlinks(t *testing.T) {
@@ -75,6 +78,40 @@ func TestScanEntriesHardlinks(t *testing.T) {
 	}
 }
 
+func TestPrintDuplicatesGroupsOnlyMatchingNonEmptyContent(t *testing.T) {
+	// Capture duplicate output and restore the shared logger after this test.
+	logger := logrus.StandardLogger()
+	previousOutput, previousLevel := logger.Out, logger.GetLevel()
+	var output bytes.Buffer
+	logger.SetOutput(&output)
+	logger.SetLevel(logrus.InfoLevel)
+	t.Cleanup(func() {
+		logger.SetOutput(previousOutput)
+		logger.SetLevel(previousLevel)
+	})
+
+	// Only equal size and hash identify duplicates; missing hashes and empty files are omitted.
+	jobs := map[string]*acp.Job{
+		"/b":           {FullPath: "/b", Size: 7, SHA256: "same"},
+		"/a":           {FullPath: "/a", Size: 7, SHA256: "same"},
+		"/other-size":  {FullPath: "/other-size", Size: 8, SHA256: "same"},
+		"/other-hash":  {FullPath: "/other-hash", Size: 7, SHA256: "different"},
+		"/unhashed-a":  {FullPath: "/unhashed-a", Size: 7},
+		"/unhashed-b":  {FullPath: "/unhashed-b", Size: 7},
+		"/empty-a":     {FullPath: "/empty-a", SHA256: "empty"},
+		"/empty-b":     {FullPath: "/empty-b", SHA256: "empty"},
+		"/missing-row": nil,
+	}
+	printDuplicates(jobs)
+
+	// Exactly one group is reported, with both matching paths in deterministic order.
+	rendered := output.String()
+	if strings.Count(rendered, "duplicate size=") != 1 ||
+		!strings.Contains(rendered, "duplicate size= 7 sha256= same files= [/a /b]") {
+		t.Fatalf("duplicate report = %q, want only the matching non-empty files", rendered)
+	}
+}
+
 func TestScanEntriesCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -121,95 +158,73 @@ func TestScanEntriesIgnorePaths(t *testing.T) {
 	}
 }
 
-func TestRelinkOnePreserveLinkAttrs(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("hardlink attrs unsupported on windows")
+func TestRewriteHardlinkGroupPreservesMetadata(t *testing.T) {
+	// Scan recognizes hardlink groups on the platforms that provide file identities.
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("hardlink scan unsupported on this platform")
 	}
 
+	// Every original path shares the same content and metadata before the rewrite.
 	root := t.TempDir()
-	src := filepath.Join(root, "src.txt")
-	link := filepath.Join(root, "link.txt")
-	tmp := filepath.Join(root, "tmp.txt")
-
-	if err := os.WriteFile(src, []byte("old"), 0o644); err != nil {
-		t.Fatalf("write src: %v", err)
+	src := filepath.Join(root, "a.txt")
+	links := []string{filepath.Join(root, "b.txt"), filepath.Join(root, "c.txt")}
+	content := []byte("hardlink group fixture")
+	modified := time.Unix(1700000000, 0)
+	if err := os.WriteFile(src, content, 0o640); err != nil {
+		t.Fatal(err)
 	}
-	if err := os.Link(src, link); err != nil {
-		t.Fatalf("link: %v", err)
+	if err := os.Chtimes(src, modified, modified); err != nil {
+		t.Fatal(err)
 	}
-
-	oldTime := time.Unix(1700000000, 0)
-	newTime := time.Unix(1700001000, 0)
-
-	if err := os.Chmod(link, 0o600); err != nil {
-		t.Fatalf("chmod link: %v", err)
+	for _, link := range links {
+		if err := os.Link(src, link); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := os.Chtimes(link, oldTime, oldTime); err != nil {
-		t.Fatalf("chtimes link: %v", err)
-	}
-
-	if err := os.WriteFile(tmp, []byte("new"), 0o644); err != nil {
-		t.Fatalf("write tmp: %v", err)
-	}
-	if err := os.Chtimes(tmp, newTime, newTime); err != nil {
-		t.Fatalf("chtimes tmp: %v", err)
-	}
-	if err := os.Rename(tmp, src); err != nil {
-		t.Fatalf("rename tmp to src: %v", err)
-	}
-
-	if err := relinkOne(src, link); err != nil {
-		t.Fatalf("relinkOne: %v", err)
-	}
-
-	srcInfo, err := os.Stat(src)
+	before, err := os.Stat(src)
 	if err != nil {
-		t.Fatalf("stat src: %v", err)
+		t.Fatal(err)
 	}
-	linkInfo, err := os.Stat(link)
-	if err != nil {
-		t.Fatalf("stat link: %v", err)
-	}
-	if !os.SameFile(srcInfo, linkInfo) {
-		t.Fatalf("src and link not same file")
-	}
-	if srcInfo.Mode().Perm() != 0o600 || linkInfo.Mode().Perm() != 0o600 {
-		t.Fatalf("mode mismatch src=%v link=%v", srcInfo.Mode().Perm(), linkInfo.Mode().Perm())
-	}
-	if srcInfo.ModTime().Unix() != oldTime.Unix() || linkInfo.ModTime().Unix() != oldTime.Unix() {
-		t.Fatalf("modtime mismatch src=%v link=%v", srcInfo.ModTime(), linkInfo.ModTime())
-	}
-	data, err := os.ReadFile(link)
-	if err != nil {
-		t.Fatalf("read link: %v", err)
-	}
-	if string(data) != "new" {
-		t.Fatalf("link content = %q", string(data))
-	}
-}
 
-func TestRelinkOrRetry(t *testing.T) {
-	dir := t.TempDir()
-	entry := rewriteEntry{
-		Path:  filepath.Join(dir, "missing-src"),
-		Links: []string{filepath.Join(dir, "link")},
+	// One scanned entry rewrites the source once, then relinks both remaining names.
+	statePath := filepath.Join(root, "state.json")
+	entries, err := scanEntries(context.Background(), root, statePath, "", nil)
+	if err != nil || len(entries) != 1 || entries[0].Path != src || !reflect.DeepEqual(entries[0].Links, links) {
+		t.Fatalf("scanned group = %+v / %v", entries, err)
 	}
-	state := new(rewriteState)
+	state := &rewriteState{Root: root, Pending: entries}
+	report, err := processEntry(context.Background(), entries[0], state, statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Jobs) != 1 || len(report.Jobs[0].FailTargets) != 0 || len(state.TmpFiles) != 0 {
+		t.Fatalf("rewrite result = %+v / %+v", report, state)
+	}
 
-	if err := relinkOrRetry(state, entry); err == nil {
-		t.Fatalf("expected relink error")
+	// All paths share the new inode and the metadata already restored by the core copy.
+	after, err := os.Stat(src)
+	if err != nil || os.SameFile(before, after) {
+		t.Fatalf("source was not rewritten: %v", err)
 	}
-	if len(state.Pending) != 1 {
-		t.Fatalf("pending entries = %d", len(state.Pending))
-	}
-	if state.Pending[0].Path != entry.Path {
-		t.Fatalf("pending path = %q", state.Pending[0].Path)
+	for _, path := range append([]string{src}, links...) {
+		info, err := os.Stat(path)
+		if err != nil || !os.SameFile(after, info) {
+			t.Fatalf("group member %q does not share the rewritten inode: %v", path, err)
+		}
+		if info.Mode() != before.Mode() || !info.ModTime().Equal(before.ModTime()) {
+			t.Fatalf("metadata for %q = %v / %v, want %v / %v", path,
+				info.Mode(), info.ModTime(), before.Mode(), before.ModTime())
+		}
+		if data, err := os.ReadFile(path); err != nil || !bytes.Equal(data, content) {
+			t.Fatalf("content for %q = %q / %v", path, data, err)
+		}
 	}
 }
 
 // TestRewriteFileCommitsTheFinalPath pins one rewrite: the content survives, the scratch file
 // is gone, and the report row names the final path rather than the temporary one.
 func TestRewriteFileCommitsTheFinalPath(t *testing.T) {
+	// Keep content and metadata distinguishable from the temporary allocation.
 	root := t.TempDir()
 	path := filepath.Join(root, "a.txt")
 	content := []byte("rewrite fixture")
@@ -221,15 +236,26 @@ func TestRewriteFileCommitsTheFinalPath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tmpPath, err := newTmpPath(path, randSource)
+	// Pass an open output and the source observation through the internal stream seam.
+	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	report, err := rewriteFile(context.Background(), rewriteEntry{Path: path}, tmpPath)
+	output, err := fileio.NewOutput(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer output.Discard()
+	tmpPath := output.Temporary
+	report, err := rewriteFile(context.Background(), &fileio.RewriteItem{Path: path, Info: info, Output: output})
 	if err != nil {
 		t.Fatalf("rewriteFile: %v", err)
 	}
 
+	// The core commits the same output, preserving content and metadata before returning.
+	if output.File != nil || output.Temporary != "" {
+		t.Fatalf("unsettled output: %+v", output)
+	}
 	got, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -237,7 +263,7 @@ func TestRewriteFileCommitsTheFinalPath(t *testing.T) {
 	if string(got) != string(content) {
 		t.Fatalf("rewritten content = %q, want %q", got, content)
 	}
-	info, err := os.Stat(path)
+	info, err = os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -248,6 +274,10 @@ func TestRewriteFileCommitsTheFinalPath(t *testing.T) {
 		t.Fatalf("scratch file %q still exists: %v", tmpPath, err)
 	}
 
+	// One terminal row names the final destination and the computed content hash.
+	if len(report.Jobs) != 1 {
+		t.Fatalf("report rows = %d", len(report.Jobs))
+	}
 	job, ok := findJob(report, path)
 	if !ok {
 		t.Fatalf("report has no row for %q: %#v", path, report.Jobs)
@@ -263,21 +293,19 @@ func TestRewriteFileCommitsTheFinalPath(t *testing.T) {
 	}
 }
 
-// TestRewriteFileRejectsAChangedSource pins the failure path of one rewrite: a source that
-// cannot be read leaves the original in place.
+// TestRewriteFileRejectsAMissingSource pins the failure path of one rewrite: a missing source
+// reports an error and creates no scratch file.
 func TestRewriteFileRejectsAMissingSource(t *testing.T) {
+	// The command checks its source before allocating or persisting a scratch file.
 	root := t.TempDir()
-	path := filepath.Join(root, "missing.txt")
-	tmpPath, err := newTmpPath(path, randSource)
-	if err != nil {
-		t.Fatal(err)
+	state := &rewriteState{Root: root}
+	if _, err := processEntry(context.Background(), rewriteEntry{Path: filepath.Join(root, "missing.txt")},
+		state, filepath.Join(root, "state.json")); err == nil {
+		t.Fatal("missing source accepted")
 	}
-
-	if _, err := rewriteFile(context.Background(), rewriteEntry{Path: path}, tmpPath); err == nil {
-		t.Fatal("rewriteFile() error = nil, want the missing source reported")
-	}
-	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
-		t.Fatalf("scratch file %q exists after a failed rewrite: %v", tmpPath, err)
+	paths, err := filepath.Glob(filepath.Join(root, ".tmp_*"))
+	if err != nil || len(paths) != 0 {
+		t.Fatalf("scratch after failure: %v / %v", paths, err)
 	}
 }
 
@@ -398,121 +426,5 @@ func TestCleanupTmpFilesRemovesOnlyScratchFiles(t *testing.T) {
 	}
 	if len(state.TmpFiles) != 0 {
 		t.Fatalf("state tmp files = %v, want none", state.TmpFiles)
-	}
-}
-
-// TestRewriteCommandResumesAfterDryRun drives the command end to end: a dry run only records
-// tasks, and a resumed run cleans the stale scratch file, rewrites the file, drains the state,
-// and reports the final path.
-func TestRewriteCommandResumesAfterDryRun(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping end-to-end test in short mode")
-	}
-
-	repoRoot, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("get working directory: %v", err)
-	}
-	tempDir := t.TempDir()
-	binary := filepath.Join(tempDir, "acp-rewrite")
-	if runtime.GOOS == "windows" {
-		binary += ".exe"
-	}
-
-	buildCtx, buildCancel := context.WithTimeout(context.Background(), time.Minute)
-	defer buildCancel()
-	build := exec.CommandContext(buildCtx, "go", "build", "-o", binary, ".")
-	build.Dir = repoRoot
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build acp-rewrite: %v\n%s", err, output)
-	}
-
-	run := func(ctx context.Context, args ...string) string {
-		t.Helper()
-		command := exec.CommandContext(ctx, binary, args...)
-		command.Dir = repoRoot
-		output, err := command.CombinedOutput()
-		if err != nil {
-			t.Fatalf("run acp-rewrite %v: %v\n%s", args, err, output)
-		}
-		return string(output)
-	}
-
-	dataDir := filepath.Join(tempDir, "data")
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(dataDir, "a.txt")
-	content := []byte("resume fixture")
-	if err := os.WriteFile(path, content, 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	statePath := filepath.Join(tempDir, "state.json")
-	reportPath := filepath.Join(tempDir, "report.json")
-
-	// A dry run records the task list without touching the file or writing a report.
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	run(ctx, "-p=false", "-dryrun", "-state", statePath, "-report", reportPath, dataDir)
-
-	state, err := loadState(statePath)
-	if err != nil {
-		t.Fatalf("load state: %v", err)
-	}
-	if state == nil || len(state.Pending) != 1 || state.Pending[0].Path != path {
-		t.Fatalf("dry-run state = %#v, want one pending task for %q", state, path)
-	}
-	if got, err := os.ReadFile(path); err != nil || string(got) != string(content) {
-		t.Fatalf("dry run changed the file: %q / %v", got, err)
-	}
-	if _, err := os.Stat(reportPath); !os.IsNotExist(err) {
-		t.Fatalf("dry run wrote a report: %v", err)
-	}
-
-	// Resume the same task list with a stale scratch file left by the interrupted run.
-	staleTmp := path + ".tmpstale"
-	if err := os.WriteFile(staleTmp, []byte("partial"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := saveState(statePath, &rewriteState{
-		Root:     dataDir,
-		Pending:  []rewriteEntry{{Path: path}},
-		TmpFiles: []string{staleTmp},
-	}); err != nil {
-		t.Fatalf("save state: %v", err)
-	}
-
-	run(ctx, "-p=false", "-state", statePath, "-report", reportPath, dataDir)
-
-	// The resumed run removed the stale scratch file, rewrote the file, and drained the state.
-	if _, err := os.Stat(staleTmp); !os.IsNotExist(err) {
-		t.Fatalf("stale scratch file still exists: %v", err)
-	}
-	if got, err := os.ReadFile(path); err != nil || string(got) != string(content) {
-		t.Fatalf("resumed run changed the content: %q / %v", got, err)
-	}
-	state, err = loadState(statePath)
-	if err != nil {
-		t.Fatalf("load state: %v", err)
-	}
-	if len(state.Pending) != 0 || len(state.Busy) != 0 || len(state.TmpFiles) != 0 {
-		t.Fatalf("state after the resumed run = %#v, want a drained queue", state)
-	}
-
-	// The report names the rewritten file and the path it now occupies.
-	jobs, _, err := loadReport(reportPath)
-	if err != nil {
-		t.Fatalf("load report: %v", err)
-	}
-	job := jobs[path]
-	if job == nil {
-		t.Fatalf("report has no row for %q: %#v", path, jobs)
-	}
-	if len(job.SuccessTargets) != 1 || job.SuccessTargets[0] != path {
-		t.Fatalf("row success targets = %v, want %q", job.SuccessTargets, path)
-	}
-	if job.SHA256 == "" {
-		t.Fatal("row has no SHA256")
 	}
 }

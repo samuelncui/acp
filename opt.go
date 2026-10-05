@@ -13,6 +13,7 @@ import (
 // source is one enumerated source file: base is the directory the relative path is resolved
 // against, and path is the source-relative path that also maps onto a target directory.
 type source struct {
+	info os.FileInfo
 	base string
 	path string
 }

@@ -233,17 +233,15 @@ func newTestStream(t *testing.T, opts ...Option) *StreamCopyer {
 
 	device := t.TempDir()
 	return &StreamCopyer{
-		option:    option,
-		ctx:       context.Background(),
-		readCh:    make(chan *baseJob, option.readBuffer),
-		resultCh:  make(chan Result, option.resultBuffer),
-		eventCh:   make(chan Event, 256),
-		hardStop:  make(chan struct{}),
-		onResults: func([]Result) error { return nil },
-		getDevice: func(string) (string, error) { return device, nil },
-		getDiskUsageCache: func(string) *diskUsageCache {
-			return newDiskUsageCache(device, defaultDiskUsageFreshInterval)
-		},
+		option:         option,
+		ctx:            context.Background(),
+		readCh:         make(chan *baseJob, option.readBuffer),
+		resultCh:       make(chan Result, option.resultBuffer),
+		eventCh:        make(chan Event, 256),
+		hardStop:       make(chan struct{}),
+		onResults:      func([]Result) error { return nil },
+		getDevice:      func(string) (string, error) { return device, nil },
+		availableSpace: availableSpace,
 	}
 }
 
@@ -336,7 +334,6 @@ func TestForwardPreparedOrdersOnlyLinearTargets(t *testing.T) {
 		return newWriteJob(
 			&baseJob{order: order, path: path},
 			io.NopCloser(strings.NewReader("fixture")),
-			int64(len("fixture")),
 			false,
 		)
 	}
@@ -451,7 +448,7 @@ func TestStreamReportsSubmissionFailureAsRunError(t *testing.T) {
 
 func TestRunRejectsReuseOnlyPolicyForItemsWithTargets(t *testing.T) {
 	// A copy always reads its source and produces a computed hash, so a value that promises a
-	// stored hash cannot describe it. The policy is rejected as an option error for the item
+	// stored hash cannot describe it. The policy is rejected as an item error
 	// instead of silently reading.
 	for _, policy := range []HashPolicy{HashCachedOnly, HashCachedOrRead} {
 		t.Run(policy.String(), func(t *testing.T) {

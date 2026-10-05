@@ -73,11 +73,11 @@ func TestItemsOverrideTheStreamReadMode(t *testing.T) {
 			previous := openSourceContent
 			var lock sync.Mutex
 			opened := make(map[string]ReadMode)
-			openSourceContent = func(path string, mode ReadMode) (itemSource, error) {
+			openSourceContent = func(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
 				lock.Lock()
 				opened[path] = mode
 				lock.Unlock()
-				return previous(path, mode)
+				return previous(path, mode, info)
 			}
 			t.Cleanup(func() { openSourceContent = previous })
 
@@ -166,11 +166,12 @@ func TestItemReadModeFailureDoesNotStopTheRun(t *testing.T) {
 	}
 }
 
-// TestFailedResultBypassesTheResultBuffer pins error rule 1: a result that carries an error is
+// TestFailedResultsDoNotWaitForABatch pins error rule 1: a result that carries an error is
 // delivered immediately instead of waiting for a batch or the flush interval, so a caller can
 // persist it before it submits the next batch. Both error outlets count: the item's own error and
 // a requested target that was not written.
-func TestFailedResultBypassesTheResultBuffer(t *testing.T) {
+func TestFailedResultsDoNotWaitForABatch(t *testing.T) {
+	// Submit a success, an item failure and a target failure to the same run.
 	root := t.TempDir()
 	good := newFixtureItem(
 		writeSourceFile(t, root, "good.txt", []byte("fixture")),
@@ -184,8 +185,8 @@ func TestFailedResultBypassesTheResultBuffer(t *testing.T) {
 		filepath.Join(writeSourceFile(t, root, "not-a-directory", []byte("fixture")), "failed-target.txt"),
 	)
 
-	delivered := make(chan []Result, 4)
 	// An interval long enough that only the rules under test can deliver a success.
+	delivered := make(chan []Result, 4)
 	stream, err := NewStream(context.Background(), func(results []Result) error {
 		delivered <- append([]Result(nil), results...)
 		return nil
@@ -193,17 +194,21 @@ func TestFailedResultBypassesTheResultBuffer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = stream.Close() })
 	if err := stream.Submit(good, missing, failedTarget); err != nil {
 		t.Fatalf("Submit() error = %v", err)
 	}
 
 	// Both failures arrive as their own batch, in whatever order the pipeline completed them.
-	for _, want := range []Item{missing, failedTarget} {
+	pending := map[Item]bool{missing: true, failedTarget: true}
+	for received := 0; received < 2; received++ {
 		select {
 		case results := <-delivered:
-			if len(results) != 1 || results[0].Job != want {
-				t.Fatalf("delivered %#v, want %#v alone", results, want)
+			if len(results) != 1 || !pending[results[0].Job] {
+				t.Fatalf("delivered %#v, want one of the remaining failures %v", results, pending)
 			}
+			want := results[0].Job
+			delete(pending, want)
 			if want == Item(missing) && results[0].Err == nil {
 				t.Fatalf("delivered %#v, want the item error", results)
 			}
@@ -216,17 +221,18 @@ func TestFailedResultBypassesTheResultBuffer(t *testing.T) {
 				}
 			}
 		case <-time.After(5 * time.Second):
-			t.Fatalf("a failed result (%#v) waited for the result buffer", want)
+			t.Fatalf("failed results %v waited for a batch", pending)
 		}
 	}
 
 	// The successful result is still buffered at this point.
 	select {
 	case results := <-delivered:
-		t.Fatalf("a successful result was delivered before the buffer filled: %#v", results)
+		t.Fatalf("a successful result was delivered before the batch filled: %#v", results)
 	case <-time.After(50 * time.Millisecond):
 	}
 
+	// Closing flushes the remaining success after both failures have already arrived.
 	if err := stream.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
@@ -709,9 +715,9 @@ func TestEventHandlerSeesExactlyOneFinishedEvent(t *testing.T) {
 }
 
 // panickingItem fails when ACP describes it, which is the caller-code boundary the engine wraps.
-type panickingItem struct{}
+type panickingItem struct{ sourceCalls int }
 
-func (*panickingItem) Source() string    { panic("item source fixture") }
+func (i *panickingItem) Source() string  { i.sourceCalls++; panic("item source fixture") }
 func (*panickingItem) Targets() []string { return nil }
 
 // TestItemPanicBecomesThatItemsResultError pins the outlet of a panic in caller-owned item code:
@@ -734,6 +740,9 @@ func TestItemPanicBecomesThatItemsResultError(t *testing.T) {
 		t.Fatalf("Wait() error = %v, want nil: a panicking item is an item outcome", err)
 	}
 
+	if item.sourceCalls != 1 {
+		t.Fatalf("Source called %d times, want 1", item.sourceCalls)
+	}
 	got := batches()
 	if len(got) != 1 || len(got[0]) != 1 {
 		t.Fatalf("delivered %#v, want one batch of one result", got)

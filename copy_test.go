@@ -114,6 +114,15 @@ func trackChunkPool(t *testing.T) {
 // runWriteJob drives one prepared write Job through the copy and reporting stages. The caller
 // attaches the results callback it wants to observe.
 func runWriteJob(copyer *StreamCopyer, job *writeJob) error {
+	// Stage-level fixtures provide synthetic readers; prepare their target facts once here.
+	for _, name := range job.targets {
+		target, err := copyer.indexTarget(name, nil)
+		if err != nil {
+			job.fail(name, err)
+			continue
+		}
+		job.outputs = append(job.outputs, target)
+	}
 	prepared := make(chan *writeJob, 1)
 	prepared <- job
 	close(prepared)
@@ -178,27 +187,6 @@ func TestRunCopiesEmptyFile(t *testing.T) {
 	}
 }
 
-func TestWritePublishesASettledJob(t *testing.T) {
-	// Build a target-free write Job so only the worker-to-results handoff is exercised.
-	copyer := newTestStream(t)
-	job := newWriteJob(&baseJob{
-		copyer: copyer,
-		stat:   &stat{},
-	}, io.NopCloser(bytes.NewReader(nil)), 0, false)
-	completed := make(chan *baseJob, 1)
-
-	// The copy worker must finish all mutations before publishing ownership to the results
-	// stage, so the published job already carries the facts of the finished item.
-	copyer.write(context.Background(), job, completed, new(counter), mapset.NewSet[string]())
-	published := <-completed
-	if published.itemError != nil {
-		t.Fatalf("published job error = %v, want a completed item", published.itemError)
-	}
-	if result := published.result(); len(result.Targets) != 0 || result.Size != 0 || result.Err != nil {
-		t.Fatalf("published result = %#v, want a settled target-free item", result)
-	}
-}
-
 func TestWriteReportsTargetlessReadFailureAsItemFailure(t *testing.T) {
 	// Build a target-free hash item whose source fails on its first read.
 	readErr := errors.New("read failed")
@@ -211,7 +199,7 @@ func TestWriteReportsTargetlessReadFailureAsItemFailure(t *testing.T) {
 		item:   item,
 		path:   "source",
 		stat:   &stat{size: 1},
-	}, &failingReadCloser{err: readErr}, 1, false)
+	}, &failingReadCloser{err: readErr}, false)
 	completed := make(chan *baseJob, 1)
 
 	// An item with no target outcome to report could not be processed at all.
@@ -256,7 +244,7 @@ func TestWriteKeepsTargetOutcomesWhenTheReadAlsoFails(t *testing.T) {
 		path:    filepath.Join(root, "source"),
 		stat:    &stat{size: 1, mode: 0o644},
 		targets: []string{refused},
-	}, &failingReadCloser{err: readErr}, 1, false)
+	}, &failingReadCloser{err: readErr}, false)
 
 	if err := runWriteJob(copyer, job); err != nil {
 		t.Fatalf("pipeline failed: %v", err)
@@ -284,7 +272,7 @@ func TestWriteJobWaitConsumedEndsOnConsumptionOrHardStop(t *testing.T) {
 	// Model a linear source whose reader has already moved to the Copy stage. A stopped
 	// caller must not release the wait: the consumer owns the reader and is what reports the
 	// item, so only consumption ends the wait.
-	consumed := newWriteJob(&baseJob{copyer: copyer}, new(trackingReadCloser), 0, true)
+	consumed := newWriteJob(&baseJob{copyer: copyer}, new(trackingReadCloser), true)
 	consumed.finishSource()
 	if !consumed.waitConsumed() {
 		t.Fatal("waitConsumed() = false after the consumer took the reader")
@@ -292,7 +280,7 @@ func TestWriteJobWaitConsumedEndsOnConsumptionOrHardStop(t *testing.T) {
 
 	// A fatal pipeline failure is the other exit, so the wait can never deadlock a stop.
 	copyer.stopHard()
-	blocked := newWriteJob(&baseJob{copyer: copyer}, new(trackingReadCloser), 0, true)
+	blocked := newWriteJob(&baseJob{copyer: copyer}, new(trackingReadCloser), true)
 	if blocked.waitConsumed() {
 		t.Fatal("waitConsumed() = true after a fatal pipeline failure")
 	}
@@ -308,7 +296,7 @@ func TestCopyReportsPrefetchedItemsAfterCancellation(t *testing.T) {
 	item := newFixtureItem("source")
 	fixture := newStreamFixture(item)
 	copyer.onResults = fixture.onResults
-	job := newWriteJob(&baseJob{copyer: copyer, item: item, path: "source"}, reader, 0, true)
+	job := newWriteJob(&baseJob{copyer: copyer, item: item, path: "source"}, reader, true)
 	prepared := make(chan *writeJob, 1)
 	prepared <- job
 	close(prepared)
@@ -339,7 +327,7 @@ func TestWriteReturnsAfterHardStopWithoutPublishing(t *testing.T) {
 		copyer: copyer,
 		item:   newFixtureItem("source"),
 		stat:   &stat{},
-	}, reader, 0, false)
+	}, reader, false)
 	done := make(chan struct{})
 	go func() {
 		copyer.write(context.Background(), job, make(chan *baseJob), new(counter), mapset.NewSet[string]())
@@ -415,7 +403,7 @@ func TestWriteFailureDrainsBuffersAndTargets(t *testing.T) {
 		path:    filepath.Join(root, "source"),
 		stat:    &stat{size: batchSize, mode: 0o644},
 		targets: targets,
-	}, &failingContentReader{err: readErr, batches: 1}, batchSize, false)
+	}, &failingContentReader{err: readErr, batches: 1}, false)
 
 	// The pipeline must drain every writer, report exactly one outcome, and return.
 	done := make(chan error, 1)
@@ -449,93 +437,6 @@ func TestWriteFailureDrainsBuffersAndTargets(t *testing.T) {
 			t.Fatalf("failed target %q still exists: %v", outcome.Path, statErr)
 		}
 	}
-}
-
-func TestWriteReportsTheFactsItReadWhenTheSourceChanged(t *testing.T) {
-	// A source that changes while a run is in progress is out of scope: no change check may
-	// fail the item, and no completion may publish the facts recorded at indexing time.
-	content := []byte("changed while the run was in progress")
-
-	t.Run("source grew after indexing", func(t *testing.T) {
-		root := t.TempDir()
-		input := writeSourceFile(t, root, "source.txt", content)
-		target := filepath.Join(root, "target.txt")
-		info, err := os.Stat(input)
-		if err != nil {
-			t.Fatal(err)
-		}
-		stale, err := newStat(input, info)
-		if err != nil {
-			t.Fatal(err)
-		}
-		// Indexing recorded four bytes fewer than the reader will find.
-		stale.size = int64(len(content)) - 4
-
-		item := newFixtureItem(input, target)
-		copyer := newTestStream(t, WithHashPolicy(HashRead))
-		fixture := newStreamFixture(item)
-		copyer.onResults = fixture.onResults
-		job := newWriteJob(&baseJob{
-			copyer:  copyer,
-			item:    item,
-			path:    input,
-			stat:    stale,
-			targets: []string{target},
-		}, io.NopCloser(bytes.NewReader(content)), int64(len(content)), false)
-
-		if err := runWriteJob(copyer, job); err != nil {
-			t.Fatalf("pipeline failed: %v", err)
-		}
-		result, err := item.terminal(t)
-		if err != nil {
-			t.Fatalf("a changed source must not fail the item: %v", err)
-		}
-		wantHash := sha256.Sum256(content)
-		if result.Size != int64(len(content)) || !bytes.Equal(result.SHA256, wantHash[:]) {
-			t.Fatalf("result = size %d hash %x, want size %d hash %x", result.Size, result.SHA256, len(content), wantHash)
-		}
-		if len(result.Targets) != 1 || result.Targets[0].Err != nil {
-			t.Fatalf("targets = %#v, want %q written", result.Targets, target)
-		}
-		got, err := os.ReadFile(target)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(got, content) {
-			t.Fatalf("target content = %q, want %q", got, content)
-		}
-	})
-
-	t.Run("source shrank while reading", func(t *testing.T) {
-		// The reader stops early, which used to be a short-read failure. The item reports the
-		// bytes it read and the hash of those bytes instead.
-		short := []byte("short read")
-		copyer := newTestStream(t, WithHashPolicy(HashRead))
-		item := newFixtureItem("source")
-		fixture := newStreamFixture(item)
-		copyer.onResults = fixture.onResults
-		job := newWriteJob(&baseJob{
-			copyer: copyer,
-			item:   item,
-			path:   "source",
-			stat:   &stat{size: 4096, mode: 0o644},
-		}, io.NopCloser(bytes.NewReader(short)), 4096, false)
-
-		if err := runWriteJob(copyer, job); err != nil {
-			t.Fatalf("pipeline failed: %v", err)
-		}
-		result, err := item.terminal(t)
-		if err != nil {
-			t.Fatalf("a short read must not fail the item: %v", err)
-		}
-		wantHash := sha256.Sum256(short)
-		if result.Size != int64(len(short)) || !bytes.Equal(result.SHA256, wantHash[:]) {
-			t.Fatalf("result = size %d hash %x, want size %d hash %x", result.Size, result.SHA256, len(short), wantHash)
-		}
-		if len(result.Targets) != 0 {
-			t.Fatalf("targets = %#v, want none", result.Targets)
-		}
-	})
 }
 
 // panickingHash panics on its first write, which is how a broken hash implementation dies inside
@@ -590,10 +491,10 @@ func TestLinearTargetStopsWhenDiskUsageEstimateIsInsufficient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read disk usage: %v", err)
 	}
-	if usage.Available() > math.MaxInt64-defaultDiskUsageFreshInterval {
+	if usage.Available() > math.MaxInt64-(2<<30) {
 		t.Fatal("available disk space cannot be represented by the test Job size")
 	}
-	size := usage.Available() + defaultDiskUsageFreshInterval
+	size := usage.Available() + (2 << 30)
 	option, err := buildOption()
 	if err != nil {
 		t.Fatal(err)
@@ -601,15 +502,16 @@ func TestLinearTargetStopsWhenDiskUsageEstimateIsInsufficient(t *testing.T) {
 	copyer := &StreamCopyer{
 		option: option, ctx: context.Background(), readCh: make(chan *baseJob, option.readBuffer),
 		eventCh: make(chan Event, 8), hardStop: make(chan struct{}),
-		getDevice:         func(string) (string, error) { return root, nil },
-		getDiskUsageCache: func(string) *diskUsageCache { return newDiskUsageCache(root, defaultDiskUsageFreshInterval) },
+		getDevice:      func(string) (string, error) { return root, nil },
+		availableSpace: availableSpace,
 	}
 	copyer.toDevice.linear = true
 	item := newFixtureItem("source", target)
 	job := newWriteJob(&baseJob{
 		copyer: copyer, item: item, path: "source",
 		stat: &stat{size: size}, targets: []string{target},
-	}, io.NopCloser(bytes.NewReader(nil)), size, false)
+		outputs: []targetSpec{{name: target, path: target, device: root}},
+	}, io.NopCloser(bytes.NewReader(nil)), false)
 	completed := make(chan *baseJob, 1)
 
 	// The hardware-backed estimate must stop a linear target before the oversized write starts.

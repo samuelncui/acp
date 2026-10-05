@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -125,25 +123,34 @@ func (c *StreamCopyer) copy(ctx context.Context, prepared <-chan *writeJob) <-ch
 }
 
 func (c *StreamCopyer) write(ctx context.Context, job *writeJob, ch chan<- *baseJob, cntr *counter, noSpaceDevices mapset.Set[string]) {
-	// Release the source and publish ownership only after every consumer stops. A
-	// graceful stop still reports the item this stage finished.
+	// Register all lifetimes before starting consumers; a preparation panic must release their gates.
 	var wg sync.WaitGroup
+	var readErr error
+	chans := make([]chan *chunkBuffer, 0, len(job.targets)+1)
 	defer func() {
+		if value := recover(); value != nil {
+			readErr = panicError("copy item", value)
+			job.itemError = readErr
+			c.setError(readErr)
+			c.stopHard()
+		}
+		for _, ch := range chans {
+			close(ch)
+		}
 		wg.Wait()
-
-		// The item publishes its source's computed signature through the descriptor that read the
-		// content, before that descriptor closes and before the result is published. The source is
-		// not a file this run wrote, so the descriptor has to still show the facts the item
-		// observed for the entry to describe the bytes that were hashed.
-		c.refreshCacheEntry(job.source, job.path, job.baseJob, false)
-
-		job.finishSource()
+		// Source release also runs if cache publication panics inside this finalization scope.
+		func() {
+			defer func() {
+				if err := job.finishSource(); err != nil {
+					job.itemError = errors.Join(job.itemError, err)
+				}
+			}()
+			c.refreshCacheEntry(job.source, job.path, job.baseJob, false)
+		}()
 		c.publish(ch, job.baseJob)
 	}()
 
-	// Entering the copy stage records the write time and reports the source facts. A source
-	// that changed since it was indexed is out of scope: this run copies what it reads and
-	// never fails the item for it.
+	// Record the write time; source metadata remains the snapshot owned by indexing.
 	job.startWrite()
 	if job.skipContent {
 		atomic.AddInt64(&cntr.files, 1)
@@ -151,35 +158,12 @@ func (c *StreamCopyer) write(ctx context.Context, job *writeJob, ch chan<- *base
 	}
 	if job.cacheHit {
 		atomic.AddInt64(&cntr.files, 1)
-		atomic.AddInt64(&cntr.bytes, job.size)
+		atomic.AddInt64(&cntr.bytes, job.stat.size)
 		return
-	}
-
-	// Report every target failed when every requested target device is exhausted. A target
-	// whose device cannot be resolved is not exhausted; it fails on its own below.
-	if len(job.targets) > 0 {
-		exhausted := true
-		for _, target := range job.targets {
-			dev, err := c.getDevice(target)
-			if err != nil || !noSpaceDevices.Contains(dev) {
-				exhausted = false
-				break
-			}
-		}
-		if exhausted {
-			job.failAll(ErrTargetNoSpace)
-			return
-		}
 	}
 
 	// Track progress and close every consumer after the source reader finishes.
 	atomic.AddInt64(&cntr.files, 1)
-	chans := make([]chan *chunkBuffer, 0, len(job.targets)+1)
-	defer func() {
-		for _, ch := range chans {
-			close(ch)
-		}
-	}()
 
 	// cacheGate releases the target writers once the item's content hash is complete, so a target
 	// publishes its cache entry through its own descriptor before it finalises. It stays nil when
@@ -189,174 +173,19 @@ func (c *StreamCopyer) write(ctx context.Context, job *writeJob, ch chan<- *base
 		cacheGate = make(chan struct{})
 	}
 
-	// Open each viable target before reading the source once.
-	var readErr error
-	for _, target := range job.targets {
-		target := target
-
-		// Resolve the device before reserving capacity on it.
-		dev, err := c.getDevice(target)
-		if err != nil {
-			job.fail(target, fmt.Errorf("get target device fail, %w", err))
-			continue
-		}
-
-		// Reject exhausted targets before reserving capacity.
-		if noSpaceDevices.Contains(dev) {
-			job.fail(target, ErrTargetNoSpace)
-			continue
-		}
-
-		if err := c.getDiskUsageCache(dev).check(job.size); err != nil {
-			if errors.Is(err, ErrTargetNoSpace) {
-				noSpaceDevices.Add(dev)
-			}
-			c.endLinearTarget(err)
-
-			job.fail(target, fmt.Errorf("check disk usage have error, %w", err))
-			continue
-		}
-
-		// Prepare the target file before attaching its stream consumer.
-		if err := mappingError(os.MkdirAll(filepath.Dir(target), os.ModePerm)); err != nil {
-			if checkErrorAbort(err) {
-				noSpaceDevices.Add(dev)
-			}
-			c.endLinearTarget(err)
-
-			job.fail(target, fmt.Errorf("mkdir dst dir fail, %w", err))
-			continue
-		}
-
-		// Invalidate an existing cache before O_TRUNC can replace its content.
-		if c.createFlag&os.O_TRUNC != 0 {
-			c.invalidateSignaturePath(target)
-		}
-		file, err := os.OpenFile(target, c.createFlag, job.stat.mode)
-		if err = mappingError(err); err != nil {
-			if checkErrorAbort(err) {
-				noSpaceDevices.Add(dev)
-			}
-			c.endLinearTarget(err)
-
-			job.fail(target, fmt.Errorf("open dst file fail, %w", err))
-			continue
-		}
-		c.invalidateSignature(file, target)
-		if !job.copyer.toDevice.linear && job.size > 0 {
-			// Pre-allocation fails like any other target I/O: it must keep its error identity
-			// (an exhausted device is ErrTargetNoSpace), abort the device when the identity
-			// says so, and end a linear target, exactly like the paths above and below.
-			if err := mappingError(truncate(file, job.size)); err != nil {
-				_ = file.Close()
-				_ = os.Remove(target)
-				if checkErrorAbort(err) {
-					noSpaceDevices.Add(dev)
-				}
-				c.endLinearTarget(err)
-
-				job.fail(target, fmt.Errorf("truncate dst file fail, %w", err))
-				continue
-			}
-		}
-
-		// Consume source buffers in one managed writer for this target.
+	// Add hashing as another consumer of the shared source stream.
+	if c.hashPolicy.producesHash() {
 		ch := make(chan *chunkBuffer, 4)
 		chans = append(chans, ch)
 
 		wg.Add(1)
 		go c.wrap(ctx, func() {
 			defer wg.Done()
-
-			// Settle target status and discard any incomplete file before exiting.
-			var rerr error
 			defer func() {
-				if rerr == nil {
-					job.success(target)
-					return
-				}
-
-				rerr = mappingError(rerr)
-				if checkErrorAbort(rerr) {
-					noSpaceDevices.Add(dev)
-				}
-				c.endLinearTarget(rerr)
-
-				// avoid block channel
 				for chunk := range ch {
 					chunk.release()
 				}
-
-				job.fail(target, fmt.Errorf("write dst file fail, %w", rerr))
-				if err := os.Remove(target); err != nil {
-					c.reportError(job.path, target, fmt.Errorf("delete failed file has error, %w", err))
-				}
 			}()
-
-			// Write every source buffer before publishing the durability boundary.
-			defer func() {
-				if file != nil {
-					_ = file.Close()
-				}
-			}()
-			for chunk := range ch {
-				size := len(chunk.data)
-				n, err := file.Write(chunk.data)
-				chunk.release()
-				if err != nil {
-					rerr = fmt.Errorf("write fail, %w", err)
-					return
-				}
-				if size != n {
-					rerr = fmt.Errorf("write fail, unexpected writen bytes return, read= %d write= %d", size, n)
-					return
-				}
-			}
-
-			// A linear target publishes its durability boundary when the caller unmounts it.
-			if !c.toDevice.linear {
-				if err := file.Sync(); err != nil {
-					rerr = fmt.Errorf("sync dst file fail, %w", err)
-					return
-				}
-			}
-
-			// This target's content is complete, but the item's hash is only complete once the
-			// whole source was read. The writer waits for it and publishes the target's cache
-			// entry while it still owns the descriptor it wrote through. The target holds exactly
-			// the bytes that produced the hash and is stamped with the item's metadata after this
-			// publication, so its length is what the descriptor has to show.
-			if cacheGate != nil {
-				<-cacheGate
-			}
-			c.refreshCacheEntry(file, target, job.baseJob, true)
-
-			if err := file.Close(); err != nil {
-				file = nil
-				rerr = fmt.Errorf("close dst file fail, %w", err)
-				return
-			}
-			file = nil
-			if readErr != nil {
-				rerr = readErr
-				return
-			}
-		})
-	}
-	targetWriters := len(chans)
-
-	// Add hashing as another consumer of the shared source stream.
-	if c.hashPolicy.producesHash() {
-		sha := sha256Pool.Get().(hash.Hash)
-		sha.Reset()
-
-		ch := make(chan *chunkBuffer, 4)
-		chans = append(chans, ch)
-
-		wg.Add(1)
-		go c.wrap(ctx, func() {
-			defer wg.Done()
-			defer sha256Pool.Put(sha)
 
 			// The hash is complete, so the target writers may publish their cache entries. The
 			// release is deferred: a panic in the hasher must not leave a writer blocked on the
@@ -365,9 +194,19 @@ func (c *StreamCopyer) write(ctx context.Context, job *writeJob, ch chan<- *base
 				defer close(cacheGate)
 			}
 
+			defer func() {
+				if value := recover(); value != nil {
+					err := panicError("hash consumer", value)
+					c.setError(err)
+					c.stopHard()
+				}
+			}()
+
+			sha := sha256Pool.Get().(hash.Hash)
+			defer sha256Pool.Put(sha)
+			sha.Reset()
 			for chunk := range ch {
-				sha.Write(chunk.data)
-				chunk.release()
+				func() { defer chunk.release(); _, _ = sha.Write(chunk.data) }()
 			}
 
 			// A stopped read describes only part of the source, so it has no content hash.
@@ -379,17 +218,42 @@ func (c *StreamCopyer) write(ctx context.Context, job *writeJob, ch chan<- *base
 		})
 	}
 
+	// Open targets before reading once; each failed target leaves independent targets available.
+	targetWriters := 0
+	for _, target := range job.outputs {
+		if noSpaceDevices.Contains(target.device) {
+			job.fail(target.name, ErrTargetNoSpace)
+			continue
+		}
+		out, err := c.prepareTarget(job, target)
+		if err != nil {
+			c.targetFailed(job.baseJob, target.name, target.device, err, noSpaceDevices)
+			continue
+		}
+		func() {
+			transferred := false
+			defer func() {
+				if !transferred {
+					_ = out.Discard()
+				}
+			}()
+			chunks := make(chan *chunkBuffer, 4)
+			chans = append(chans, chunks)
+			wg.Add(1)
+			go c.wrap(ctx, func() {
+				defer wg.Done()
+				c.consumeTarget(job, target, out, chunks, cacheGate, &readErr, noSpaceDevices)
+			})
+			transferred = true
+			targetWriters++
+		}()
+	}
+
 	// Read the source only when at least one target or hash consumer needs it.
 	if len(chans) == 0 {
 		return
 	}
-	var copied int64
-	copied, readErr = c.streamCopy(chans, job.reader, &cntr.bytes)
-	if readErr == nil {
-		// The item reports what the read produced. A source that changes while a run is in
-		// progress is out of scope, so the read facts replace the indexed ones.
-		job.setSize(copied)
-	}
+	_, readErr = c.streamCopy(chans, job.reader, &cntr.bytes)
 	if readErr == nil && c.hashPolicy.producesHash() {
 		job.validateHash()
 	}
@@ -403,50 +267,40 @@ func (c *StreamCopyer) write(ctx context.Context, job *writeJob, ch chan<- *base
 // streamCopy reads the source once and hands every chunk to each consumer. A graceful
 // stop finishes the item in flight; only a pipeline failure ends the read early.
 func (c *StreamCopyer) streamCopy(dsts []chan *chunkBuffer, src io.ReadCloser, bytes *int64) (int64, error) {
+	// Each iteration owns one producer reference, with no deferred resources accumulating in the loop.
 	var copied int64
 	for {
-		chunk := acquireChunk()
-
-		n, err := io.ReadFull(src, chunk.data)
-		if err != nil {
-			if !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
-				chunk.release()
-				return copied, fmt.Errorf("slice mmap fail, %w", err)
-			}
-		}
-
-		// Every consumer releases its own reference; the producer releases the last one
-		// after the size is captured, because the buffer may be reused immediately. A stage
-		// that stopped consuming after a fatal failure must not leave this handoff blocked,
-		// so the reference the send would have handed over is released instead.
-		chunk.data = chunk.data[:n]
-		stopped := false
-		for _, ch := range dsts {
-			receipt := chunk.retain()
-			select {
-			case ch <- receipt:
-			case <-c.hardStop:
-				receipt.release()
-				stopped = true
-			}
-			if stopped {
-				break
-			}
-		}
+		n, err := c.streamChunk(dsts, src)
 		copied += int64(n)
 		atomic.AddInt64(bytes, int64(n))
-		chunk.release()
-		if stopped {
-			return copied, fmt.Errorf("copy stopped by pipeline failure")
+		if err != nil {
+			return copied, err
 		}
 		if n < batchSize {
 			return copied, nil
 		}
+	}
+}
 
+func (c *StreamCopyer) streamChunk(dsts []chan *chunkBuffer, src io.Reader) (int, error) {
+	// Acquire and release in the same scope, including a panic in an injected reader.
+	chunk := acquireChunk()
+	defer chunk.release()
+	n, err := io.ReadFull(src, chunk.data)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return 0, fmt.Errorf("read source failed, %w", err)
+	}
+
+	// Every successful handoff transfers exactly one reference to a consumer.
+	chunk.data = chunk.data[:n]
+	for _, ch := range dsts {
+		receipt := chunk.retain()
 		select {
+		case ch <- receipt:
 		case <-c.hardStop:
-			return copied, fmt.Errorf("copy stopped by pipeline failure")
-		default:
+			receipt.release()
+			return n, fmt.Errorf("copy stopped by pipeline failure")
 		}
 	}
+	return n, nil
 }

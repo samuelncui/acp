@@ -12,7 +12,7 @@ import (
 func TestFS(t *testing.T) {
 	// Resolve a real file to the mount point that contains it.
 	root := t.TempDir()
-	resolve, err := getMountpointCache()
+	resolve, err := getMountpointResolver()
 	if err != nil {
 		t.Fatalf("get mount point cache: %v", err)
 	}
@@ -46,7 +46,7 @@ func TestFS(t *testing.T) {
 		t.Fatalf("mount point %q does not contain %q", mount, absolute)
 	}
 
-	// The cache resolves one path once and keeps reporting the same mount point.
+	// Repeated resolution uses the same run-level mount list.
 	again, err := resolve(path)
 	if err != nil {
 		t.Fatalf("resolve %q again: %v", path, err)
@@ -63,7 +63,7 @@ func TestGetMountpointReportsAbsFailure(t *testing.T) {
 	absPath = func(string) (string, error) { return "", errors.New("abs failed") }
 	t.Cleanup(func() { absPath = previous })
 
-	resolve, err := getMountpointCache()
+	resolve, err := getMountpointResolver()
 	if err != nil {
 		t.Fatalf("get mount point cache: %v", err)
 	}

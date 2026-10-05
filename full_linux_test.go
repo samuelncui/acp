@@ -74,7 +74,7 @@ func TestDeviceFullWriteFailureDrainsQueuedBuffers(t *testing.T) {
 		path:    filepath.Join(root, "source"),
 		stat:    &stat{size: size, mode: 0o644},
 		targets: []string{target},
-	}, &failingContentReader{err: readErr, batches: 4}, size, false)
+	}, &failingContentReader{err: readErr, batches: 4}, false)
 
 	// The writer must fail, release its queued buffers, and let the pipeline return.
 	done := make(chan error, 1)
@@ -101,9 +101,10 @@ func TestDeviceFullWriteFailureDrainsQueuedBuffers(t *testing.T) {
 
 // TestNonLinearTargetOnRefusingDeviceReportsATargetFailure pins the pre-allocation path of a
 // non-linear target against a device that refuses `fallocate`: the failure is that target's
-// outcome, it must not claim the device is out of space, and the file it could not create is
-// removed. It needs no privileges, so it always runs on Linux.
+// outcome, it must not claim the device is out of space, and the pre-existing target remains.
+// It needs no privileges, so it always runs on Linux.
 func TestNonLinearTargetOnRefusingDeviceReportsATargetFailure(t *testing.T) {
+	// Exercise preallocation through an overwrite target whose path the run does not own.
 	root := t.TempDir()
 	input := writeSourceFile(t, root, "source", []byte("fixture"))
 	target := filepath.Join(root, "target")
@@ -112,6 +113,7 @@ func TestNonLinearTargetOnRefusingDeviceReportsATargetFailure(t *testing.T) {
 	}
 	item := newFixtureItem(input, target)
 
+	// The device refusal stays a target failure and must not be reclassified as exhausted space.
 	err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, Overwrite(true))
 	if err != nil {
 		t.Fatalf("runFixture() error = %v, want nil: a refused target is an item outcome", err)
@@ -127,13 +129,15 @@ func TestNonLinearTargetOnRefusingDeviceReportsATargetFailure(t *testing.T) {
 		t.Fatalf("target outcome = %v, want the device's own refusal: %v reports no space, and a "+
 			"device that cannot pre-allocate is not out of space", result.Targets[0].Err, ErrTargetNoSpace)
 	}
-	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("a target that could not be pre-allocated must be removed, stat error = %v", err)
+
+	// Failed overwrite cleanup preserves the existing link instead of removing an unowned path.
+	if destination, err := os.Readlink(target); err != nil || destination != "/dev/full" {
+		t.Fatalf("pre-existing target link = %q, error = %v; want /dev/full", destination, err)
 	}
 }
 
 // TestFullVolumePreallocationReportsNoSpace pins the pre-allocation failure of a non-linear
-// target: a volume that fills up after the disk-usage snapshot must still report
+// target: a full volume must still report
 // ErrTargetNoSpace and remove the file it could not create. It needs a real ENOSPC, so it mounts a
 // small tmpfs and skips when the host refuses that.
 func TestFullVolumePreallocationReportsNoSpace(t *testing.T) {
@@ -153,15 +157,7 @@ func TestFullVolumePreallocationReportsNoSpace(t *testing.T) {
 	item := newFixtureItem(input, target)
 
 	copyer := newTestStream(t, Overwrite(true))
-	// Warm the disk-usage estimate while the volume is still empty, so the run's own check sees
-	// room for this item instead of refusing it before the pre-allocation can fail.
-	cache := newDiskUsageCache(volume, defaultDiskUsageFreshInterval)
-	if err := cache.check(size); err != nil {
-		t.Fatalf("warm the disk usage estimate: %v", err)
-	}
-	copyer.getDiskUsageCache = func(string) *diskUsageCache { return cache }
-
-	// Fill the volume after the estimate was taken.
+	// Fill the disposable volume so actual preallocation reports ENOSPC.
 	filler, err := os.Create(filepath.Join(volume, "filler"))
 	if err != nil {
 		t.Fatal(err)
@@ -187,7 +183,7 @@ func TestFullVolumePreallocationReportsNoSpace(t *testing.T) {
 		path:    input,
 		stat:    &stat{size: size, mode: 0o644},
 		targets: []string{target},
-	}, io.NopCloser(bytes.NewReader(make([]byte, size))), size, false)
+	}, io.NopCloser(bytes.NewReader(make([]byte, size))), false)
 
 	// A refused target is an item outcome, not a pipeline failure.
 	if err := runWriteJob(copyer, job); err != nil {

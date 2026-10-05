@@ -71,6 +71,7 @@ type Report struct {
 
 // ToJSONString renders the report. Indentation is two spaces, because a JSON encoder accepts
 // nothing else and a report writer must never panic while it is producing a document.
+// It returns an empty string on encoding failure; use json.Marshal to inspect the error.
 func (r *Report) ToJSONString(indent bool) string {
 	if indent {
 		buf, _ := json.MarshalIndent(r, "", "  ")

@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"runtime"
 )
 
 // ReaderAt reads a memory-mapped file.
@@ -92,36 +91,7 @@ func (r *ReaderAt) Slice(off, limit int64) ([]byte, error) {
 	return buf[:n], nil
 }
 
-// Open opens the named file for reading. The reader owns the descriptor it opened: Close closes
-// it, and this platform reads through the descriptor instead of a mapping.
-func Open(filename string) (*ReaderAt, error) {
-	f, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	fi, err := f.Stat()
-	if err != nil {
-		_ = f.Close()
-		return nil, err
-	}
-
-	size := fi.Size()
-	if size < 0 {
-		_ = f.Close()
-		return nil, fmt.Errorf("mmap: file %q has negative size", filename)
-	}
-	if size != int64(int(size)) {
-		_ = f.Close()
-		return nil, fmt.Errorf("mmap: file %q is too large", filename)
-	}
-
-	r := &ReaderAt{
-		file: f,
-		len:  int(fi.Size()),
-	}
-
-	// A reader that is abandoned without Close releases its descriptor on collection, exactly like
-	// the mapping-backed platforms, so this fallback cannot leak one either.
-	runtime.SetFinalizer(r, (*ReaderAt).Close)
-	return r, nil
+// mapFile reads through the descriptor on platforms without a mapping implementation.
+func mapFile(f *os.File, size int) (*ReaderAt, error) {
+	return &ReaderAt{file: f, len: size}, nil
 }

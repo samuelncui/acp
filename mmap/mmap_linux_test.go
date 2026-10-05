@@ -29,10 +29,7 @@ func recordPrefetch(t *testing.T, fail error) *[]int {
 // these are values, not flag bits, so passing `MADV_SEQUENTIAL|MADV_WILLNEED` keeps only the
 // prefetch and silently drops the sequential hint, which is why the two hints are two calls.
 func TestPrefetchIssuesEveryAdvice(t *testing.T) {
-	if syscall.MADV_SEQUENTIAL|syscall.MADV_WILLNEED != syscall.MADV_WILLNEED {
-		t.Fatalf("this test assumes the two constants are not flag bits on this platform")
-	}
-
+	// Observe advice calls when opening a small mapping.
 	advices := recordPrefetch(t, nil)
 	reader, err := Open(writeFixture(t, "prefetch.bin", []byte("0123456789")))
 	if err != nil {
@@ -40,12 +37,14 @@ func TestPrefetchIssuesEveryAdvice(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = reader.Close() })
 
-	if len(*advices) != len(linuxPrefetchAdvice) {
-		t.Fatalf("prefetch issued advice %v, want %v", *advices, linuxPrefetchAdvice)
+	// Require the documented hints independently of the implementation's advice list.
+	want := []int{syscall.MADV_SEQUENTIAL, syscall.MADV_WILLNEED}
+	if len(*advices) != len(want) {
+		t.Fatalf("prefetch issued advice %v, want %v", *advices, want)
 	}
-	for index, want := range linuxPrefetchAdvice {
-		if (*advices)[index] != want {
-			t.Fatalf("prefetch issued advice %v, want %v", *advices, linuxPrefetchAdvice)
+	for index, advice := range want {
+		if (*advices)[index] != advice {
+			t.Fatalf("prefetch issued advice %v, want %v", *advices, want)
 		}
 	}
 }

@@ -29,6 +29,7 @@ func walkTestEntries(t *testing.T, sources, targets []string) []*compatItem {
 }
 
 func TestWalkWildcardMapsSourcesOntoTargets(t *testing.T) {
+	// Enumerate a tree with regular, empty and nested files plus an empty directory.
 	root := t.TempDir()
 	source := filepath.Join(root, "source")
 	writeSourceFile(t, source, "plain.txt", []byte("plain"))
@@ -45,9 +46,8 @@ func TestWalkWildcardMapsSourcesOntoTargets(t *testing.T) {
 		}
 	}
 
+	// Directories are not items; paths stay in platform order and map onto every target.
 	entries := walkTestEntries(t, []string{source}, targets)
-
-	// Directories are not entries, and the platform's path order covers the result.
 	want := []string{
 		"empty.txt",
 		filepath.Join("nested", "data"),
@@ -76,22 +76,6 @@ func TestWalkWildcardMapsSourcesOntoTargets(t *testing.T) {
 			}
 		}
 	}
-
-	// The same enumeration drives a real run, so every mapped target also lands on disk.
-	copyer, err := New(context.Background(), WildcardJob(Source(source), Target(targets...)))
-	if err != nil {
-		t.Fatalf("new: %v", err)
-	}
-	if err := copyer.WaitErr(); err != nil {
-		t.Fatalf("run: %v", err)
-	}
-	for _, entry := range entries {
-		for _, target := range entry.targets {
-			if _, err := os.Stat(target); err != nil {
-				t.Fatalf("copied file %q: %v", target, err)
-			}
-		}
-	}
 }
 
 func TestWalkWildcardMapsASingleFileOntoTargets(t *testing.T) {
@@ -113,6 +97,33 @@ func TestWalkWildcardMapsASingleFileOntoTargets(t *testing.T) {
 	}
 	if len(entry.targets) != 1 || entry.targets[0] != filepath.Join(target, "plain.txt") {
 		t.Fatalf("targets = %v", entry.targets)
+	}
+}
+
+func TestWildcardPreservesWhitespaceInFileAndDirectoryNames(t *testing.T) {
+	// Spaces are filename content in both Source and Target options.
+	root := t.TempDir()
+	source := writeSourceFile(t, root, " name ", []byte("content"))
+	target := filepath.Join(root, " target ")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	handler, report := NewReportGetter()
+	copyer, err := New(context.Background(), WildcardJob(Source(source), Target(target)), WithEventHandler(handler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := copyer.WaitErr(); err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(target, " name ")
+	data, err := os.ReadFile(want)
+	if err != nil || string(data) != "content" {
+		t.Fatalf("literal name copy=%q / %v", data, err)
+	}
+	rows := report().Jobs
+	if len(rows) != 1 || len(rows[0].SuccessTargets) != 1 || rows[0].SuccessTargets[0] != want {
+		t.Fatalf("unexpected report: %+v", rows)
 	}
 }
 
@@ -171,5 +182,28 @@ func TestNewRejectsInvalidInput(t *testing.T) {
 				t.Fatal("New() error = nil")
 			}
 		})
+	}
+}
+
+func TestRelativeSourceReportCoordinatesAgree(t *testing.T) {
+	// Resolve a relative tree from a temporary working directory, preserving target-relative paths.
+	root := t.TempDir()
+	writeSourceFile(t, root, filepath.Join("tree", "nested", "data"), []byte("relative"))
+	target := filepath.Join(root, "target")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(root)
+	entries := walkTestEntries(t, []string{"tree"}, []string{target})
+	if len(entries) != 1 {
+		t.Fatalf("entries=%v", entries)
+	}
+	entry := entries[0]
+	resolved := filepath.Join(append([]string{entry.base}, entry.path...)...)
+	if !filepath.IsAbs(entry.base) || resolved != entry.source || entry.source != filepath.Join(root, "tree", "nested", "data") {
+		t.Fatalf("coordinates: base=%q path=%v full=%q", entry.base, entry.path, entry.source)
+	}
+	if entry.targets[0] != filepath.Join(target, "tree", "nested", "data") {
+		t.Fatal(entry.targets)
 	}
 }

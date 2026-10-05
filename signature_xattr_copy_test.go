@@ -70,6 +70,9 @@ func TestManagedSignatureIsNotOrdinaryCopiedXattr(t *testing.T) {
 	carried := false
 	for _, xattr := range restored {
 		if xattr.key == controlXattrName {
+			if string(xattr.value) != "carried" {
+				t.Fatalf("ordinary attribute value = %q, want %q", xattr.value, "carried")
+			}
 			carried = true
 		}
 	}

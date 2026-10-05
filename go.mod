@@ -10,7 +10,7 @@ require (
 	github.com/samuelncui/godf v0.0.0-20231004032257-e436410ad5a0
 	github.com/schollz/progressbar/v3 v3.13.1
 	github.com/sirupsen/logrus v1.9.3
-	golang.org/x/sys v0.12.0
+	golang.org/x/sys v0.48.0
 )
 
 require (

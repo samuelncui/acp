@@ -23,16 +23,15 @@ type prepareResult struct {
 type itemSource struct {
 	file   *os.File
 	reader io.ReadCloser
-	size   int64
 }
 
 // openSourceContent opens the single descriptor an item owns, together with the reader that
 // delivers its content. It is a variable so a test can observe which descriptor an item's cache
 // read and cache write use.
-var openSourceContent = func(path string, mode ReadMode) (itemSource, error) {
+var openSourceContent = func(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
 	// Only a caller that asks for it reads through a mapping, which retains its descriptor.
 	if mode == ReadMapped {
-		readerAt, err := mmap.Open(path)
+		readerAt, err := mmap.OpenWithInfo(path, info)
 		if err != nil {
 			return itemSource{}, fmt.Errorf("open src file by mmap fail, %w", err)
 		}
@@ -40,7 +39,6 @@ var openSourceContent = func(path string, mode ReadMode) (itemSource, error) {
 		return itemSource{
 			file:   readerAt.File(),
 			reader: mmap.NewReader(readerAt),
-			size:   int64(readerAt.Len()),
 		}, nil
 	}
 
@@ -49,12 +47,7 @@ var openSourceContent = func(path string, mode ReadMode) (itemSource, error) {
 	if err != nil {
 		return itemSource{}, fmt.Errorf("open src file fail, %w", err)
 	}
-	info, err := file.Stat()
-	if err != nil {
-		_ = file.Close()
-		return itemSource{}, fmt.Errorf("get src file stat fail, %w", err)
-	}
-	return itemSource{file: file, reader: file, size: info.Size()}, nil
+	return itemSource{file: file, reader: file}, nil
 }
 
 // prepareItem opens the one descriptor an item owns and reads its stored hash through it. That
@@ -76,7 +69,7 @@ func (c *StreamCopyer) prepareItem(job *baseJob) *writeJob {
 	if !needsContent {
 		mode = ReadBuffered
 	}
-	source, err := openSourceContent(job.path, mode)
+	source, err := openSourceContent(job.path, mode, job.stat.info)
 	if err != nil {
 		// A reuse-only item owns its descriptor for the stored hash alone, so a source it cannot
 		// open is a cache miss with a warning instead of an item failure.
@@ -92,22 +85,34 @@ func (c *StreamCopyer) prepareItem(job *baseJob) *writeJob {
 		// reporting stage instead of a side channel.
 		c.logf(logrus.ErrorLevel, "prepare source failed, source= %q, %v", job.path, err)
 		job.itemError = err
-		return newWriteJob(job, nil, 0, false)
+		return newWriteJob(job, nil, false)
 	}
 
-	// Enter preparation through the descriptor the item already owns: a stored hash is reused only
-	// where the policy allows it.
+	// Retain ownership until the prepared job takes it, including a cache lookup panic.
+	defer func() {
+		if source.reader != nil {
+			_ = source.reader.Close()
+		}
+	}()
+
+	// Read the source entry once. Reuse accounts for misses and warnings; refresh-only reads
+	// silently replace unusable entries, preserving that policy's existing diagnostics.
 	reused := false
 	if reuses {
 		if hash, ok := c.signatures.lookup(source.file, job.path, job.stat); ok {
 			job.setCachedHash(hash)
-			source.size = job.stat.size
 			reused = true
+		}
+	} else if c.signatures != nil && c.hashPolicy.refreshesCache() {
+		if signature, status, err := readCachedSignatureInfo(source.file, job.stat.info); err == nil && status == signatureReadHit {
+			job.cachedSignature = &signature
 		}
 	}
 
-	wj := newWriteJob(job, source.reader, source.size, c.fromDevice.linear)
+	// Transfer the descriptor and indexed facts to the content stage.
+	wj := newWriteJob(job, source.reader, c.fromDevice.linear)
 	wj.source = source.file
+	source.reader = nil
 	if !needsContent && !reused {
 		// An item that reused no stored hash has no hash at all and is not a cache hit. Its
 		// descriptor still closes with the item, which owns it for its whole lifecycle.
@@ -121,7 +126,7 @@ func (c *StreamCopyer) prepareItem(job *baseJob) *writeJob {
 // without reading anything, and it is neither a cache hit nor a hash this run computed.
 func (c *StreamCopyer) noContentJob(job *baseJob) *writeJob {
 	job.setHash(nil)
-	wj := newWriteJob(job, nil, 0, c.fromDevice.linear)
+	wj := newWriteJob(job, nil, c.fromDevice.linear)
 	wj.skipContent = true
 	return wj
 }
@@ -156,7 +161,7 @@ func (c *StreamCopyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-c
 			for job := range indexed {
 				// An item that was already rejected while indexing needs no source.
 				if c.markUnstarted(ctx, job) {
-					if !c.sendPrepareResult(completed, prepareResult{order: job.order, job: newWriteJob(job, nil, 0, false)}) {
+					if !c.sendPrepareResult(completed, prepareResult{order: job.order, job: newWriteJob(job, nil, false)}) {
 						return
 					}
 					continue

@@ -50,39 +50,43 @@ func TestAccurateTargetUsesItsTargets(t *testing.T) {
 // pipeline failure is a failure, and a clean run is not. The collector is event-driven, so each
 // case feeds it the terminal row event the shell publishes.
 func TestReportFailureDecision(t *testing.T) {
+	// A completed target has no failure even when it produced a report row.
 	clean := newReport()
 	clean.handleEvent(&acp.EventUpdateJob{Job: &acp.Job{
 		FullPath:       "/source/a.txt",
 		Status:         acp.JobStatusFinished,
 		SuccessTargets: []string{"/target/a.txt"},
 	}})
-	if clean.hasFailure() {
+	if hasFailure(clean.getter()) {
 		t.Fatal("hasFailure() = true for a completed target")
 	}
 
+	// A target refusal makes the command fail while remaining a per-target outcome.
 	refused := newReport()
 	refused.handleEvent(&acp.EventUpdateJob{Job: &acp.Job{
 		FullPath:    "/source/a.txt",
 		Status:      acp.JobStatusFinished,
 		FailTargets: map[string]error{"/target/a.txt": errors.New("file exists")},
 	}})
-	if !refused.hasFailure() {
+	if !hasFailure(refused.getter()) {
 		t.Fatal("hasFailure() = false for a failed target")
 	}
 
+	// Item failures use the empty target key and also make the command fail.
 	failed := newReport()
 	failed.handleEvent(&acp.EventUpdateJob{Job: &acp.Job{
 		FullPath:    "/source/a.txt",
 		Status:      acp.JobStatusFinished,
 		FailTargets: map[string]error{"": errors.New("source missing")},
 	}})
-	if !failed.hasFailure() {
+	if !hasFailure(failed.getter()) {
 		t.Fatal("hasFailure() = false for an item failure")
 	}
 
+	// A pipeline failure is sufficient even without a failed file row.
 	pipeline := newReport()
-	pipeline.errors = append(pipeline.errors, &acp.Error{Src: "src", Err: errors.New("pipeline")})
-	if !pipeline.hasFailure() {
+	pipeline.handleEvent(&acp.EventReportError{Error: &acp.Error{Src: "src", Err: errors.New("pipeline")}})
+	if !hasFailure(pipeline.getter()) {
 		t.Fatal("hasFailure() = false for a pipeline error")
 	}
 }
@@ -90,6 +94,7 @@ func TestReportFailureDecision(t *testing.T) {
 // TestStoreReportWritesTheFailureDocument pins the report file: it is written for a failed run,
 // under a two-space indent, and stays readable by the standard library.
 func TestStoreReportWritesTheFailureDocument(t *testing.T) {
+	// Collect an item failure under the empty target key.
 	collector := newReport()
 	collector.handleEvent(&acp.EventUpdateJob{Job: &acp.Job{
 		FullPath:    "/source/a.txt",
@@ -97,11 +102,14 @@ func TestStoreReportWritesTheFailureDocument(t *testing.T) {
 		FailTargets: map[string]error{"": errors.New("source missing")},
 	}})
 
+	// Persist the captured report with the requested indentation.
+	snapshot := collector.getter()
 	path := filepath.Join(t.TempDir(), "report.json")
-	if err := storeReport(collector, path, true); err != nil {
+	if err := storeReport(snapshot, path, true); err != nil {
 		t.Fatalf("storeReport: %v", err)
 	}
 
+	// Read the actual document to check its indentation and failure shape.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read report: %v", err)
@@ -109,7 +117,6 @@ func TestStoreReportWritesTheFailureDocument(t *testing.T) {
 	if bytes.Contains(data, []byte("\t")) {
 		t.Fatalf("indented report contains a tab:\n%s", data)
 	}
-
 	var shape reportShape
 	if err := json.Unmarshal(data, &shape); err != nil {
 		t.Fatalf("decode stored report: %v\n%s", err, data)
@@ -122,7 +129,7 @@ func TestStoreReportWritesTheFailureDocument(t *testing.T) {
 	}
 
 	// A run without a report path stores nothing.
-	if err := storeReport(collector, "", false); err != nil {
+	if err := storeReport(snapshot, "", false); err != nil {
 		t.Fatalf("storeReport without a path: %v", err)
 	}
 }

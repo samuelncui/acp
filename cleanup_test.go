@@ -1,6 +1,7 @@
 package acp
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -8,48 +9,24 @@ import (
 )
 
 func TestCleanupRemovesTargetAfterMetadataFailure(t *testing.T) {
-	// Use a dangling symlink so metadata restoration fails while removal remains possible.
+	// Refuse metadata after a real copy; the exclusive output must disappear before the result.
 	root := t.TempDir()
-	sourcePath := writeSourceFile(t, root, "source", []byte("fixture"))
-	info, err := os.Stat(sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stat, err := newStat(sourcePath, info)
-	if err != nil {
-		t.Fatal(err)
-	}
+	source := writeSourceFile(t, root, "source", []byte("fixture"))
 	target := filepath.Join(root, "target")
-	if err := os.Symlink(filepath.Join(root, "missing"), target); err != nil {
-		t.Skipf("create test symlink: %v", err)
-	}
-
-	// The results stage must discard the failed target before publishing its final result.
-	copyer := newTestStream(t)
-	item := newFixtureItem(sourcePath, target)
+	sentinel := errors.New("metadata refused")
+	previous := restoreTarget
+	restoreTarget = func(string, *stat) error { return sentinel }
+	t.Cleanup(func() { restoreTarget = previous })
+	item := newFixtureItem(source, target)
 	fixture := newStreamFixture(item)
-	copyer.onResults = fixture.onResults
-	job := &baseJob{
-		copyer:         copyer,
-		item:           item,
-		path:           sourcePath,
-		stat:           stat,
-		targets:        []string{target},
-		successTargets: []string{target},
-	}
-	copyed := make(chan *baseJob, 1)
-	copyed <- job
-	close(copyed)
-	runResults(copyer, copyed)
-
-	if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("stat failed target error = %v, want %v", err, os.ErrNotExist)
+	if err := runFixture(context.Background(), fixture, []Item{item}); err != nil {
+		t.Fatal(err)
 	}
 	result, terminalErr := item.terminal(t)
-	if terminalErr != nil {
-		t.Fatalf("a metadata failure is a target outcome, not an item failure: %v", terminalErr)
+	if terminalErr != nil || len(result.Targets) != 1 || !errors.Is(result.Targets[0].Err, sentinel) {
+		t.Fatalf("result=%+v err=%v", result, terminalErr)
 	}
-	if len(result.Targets) != 1 || !errors.Is(result.Targets[0].Err, os.ErrNotExist) {
-		t.Fatalf("target outcome = %#v, want %v", result.Targets, os.ErrNotExist)
+	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed output still exists: %v", err)
 	}
 }

@@ -6,10 +6,10 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 
 	"github.com/klauspost/cpuid/v2"
 	"github.com/samuelncui/acp"
+	"github.com/samuelncui/acp/internal/fileio"
 	"github.com/sirupsen/logrus"
 )
 
@@ -33,9 +33,12 @@ func init() {
 	})
 }
 
-func main() {
+func main() { os.Exit(run()) }
+
+func run() int {
 	// Parse the command and establish its cancellation context.
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
 	cpuid.Flags()
 	flag.Parse()
 	cpuid.Detect()
@@ -43,9 +46,9 @@ func main() {
 	// An index has no destinations even when -target was also supplied.
 	sources := flag.Args()
 	if len(sources) == 0 {
-		logrus.Fatalf("cannot found source path")
+		logrus.Error("source path required")
+		return 2
 	}
-
 	if *noTarget {
 		targetPaths = nil
 	} else if len(targetPaths) == 0 {
@@ -53,20 +56,9 @@ func main() {
 		sources = sources[:len(sources)-1]
 	}
 	if len(sources) == 0 {
-		logrus.Fatalf("cannot found source path")
+		logrus.Error("source path required")
+		return 2
 	}
-
-	// Interrupts stop the feed while the pipeline drains accepted work.
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt)
-	go func() {
-		for sig := range signals {
-			if sig != os.Interrupt {
-				continue
-			}
-			cancel()
-		}
-	}()
 
 	// Collect the report and configure the requested copy or index operation.
 	report := newReport()
@@ -110,43 +102,46 @@ func main() {
 	// Drain the run before deciding its status or writing the report.
 	copyer, err := acp.New(ctx, opts...)
 	if err != nil {
-		logrus.Fatalf("unexpected exit: %s", err)
+		report.handleEvent(&acp.EventReportError{Error: &acp.Error{Err: err}})
 	}
-	runErr := copyer.WaitErr()
+	runErr := err
+	if copyer != nil {
+		runErr = copyer.WaitErr()
+	}
+	return report.finish(runErr, *reportPath, *reportIndent)
+}
+
+// finish captures one terminal report for storage, diagnostics and exit status after the run drains.
+func (r *report) finish(runErr error, path string, indent bool) int {
+	// Capture the terminal rows once; a run error remains separate from item and target outcomes.
+	snapshot := r.getter()
 	if runErr != nil {
 		logrus.Errorf("copy failed, %s", runErr)
 	}
 
 	// The report is stored even when the run failed, so a batch can be inspected after the
 	// command told its caller that something went wrong.
-	reportErr := storeReport(report, *reportPath, *reportIndent)
+	reportErr := storeReport(snapshot, path, indent)
 	if reportErr != nil {
-		logrus.Warnf("open report fail, path= '%s', err= %s", *reportPath, reportErr)
-		logrus.Infof("report= %q", report.getter().ToJSONString(false))
+		logrus.Warnf("open report fail, path= '%s', err= %s", path, reportErr)
+		logrus.Infof("report= %q", snapshot.ToJSONString(false))
 	}
 
 	// A copy that did not finish is not a success: an item ACP could not process, a target
 	// that was not written, a pipeline failure or an unsaved requested report all exit non-zero.
-	if runErr != nil || reportErr != nil || report.hasFailure() {
-		os.Exit(1)
+	if runErr != nil || reportErr != nil || hasFailure(snapshot) {
+		return 1
 	}
+	return 0
 }
 
 // storeReport writes the JSON report when the caller asked for one.
-func storeReport(collector *report, path string, indent bool) error {
+func storeReport(snapshot *acp.Report, path string, indent bool) error {
 	if path == "" {
 		return nil
 	}
 
-	file, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	if _, err := file.WriteString(collector.getter().ToJSONString(indent)); err != nil {
-		_ = file.Close()
-		return err
-	}
-	return file.Close()
+	return fileio.WriteJSON(path, snapshot, indent)
 }
 
 // accurateTarget reports whether one source path copies to one exact target path instead
@@ -166,7 +161,7 @@ func accurateTarget(sources, targets []string) bool {
 		return !dstStat.IsDir()
 	}
 	if !os.IsNotExist(err) {
-		logrus.Fatalf("stat dst path fail, %s", err)
+		return false
 	}
 
 	srcStat, err := os.Stat(src)
@@ -174,55 +169,29 @@ func accurateTarget(sources, targets []string) bool {
 		return srcStat.Mode().IsRegular()
 	}
 
-	logrus.Fatalf("stat src path fail, %s", err)
+	// Let option validation report the source error and still write the requested report.
 	return false
 }
 
-// report collects the terminal row of every item and the pipeline-level errors for the JSON
-// report. Item and target failures travel inside the item's own row, so a single failure is
-// never counted twice.
+// report uses the shared collector and finalizes the command after the run drains.
 type report struct {
-	lock   sync.Mutex
-	jobs   []*acp.Job
-	errors []*acp.Error
+	handleEvent acp.EventHandler
+	getter      acp.ReportGetter
 }
 
 func newReport() *report {
-	return new(report)
+	handler, getter := acp.NewReportGetter()
+	return &report{handleEvent: handler, getter: getter}
 }
 
-func (r *report) handleEvent(event acp.Event) {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-
-	switch e := event.(type) {
-	case *acp.EventUpdateJob:
-		r.jobs = append(r.jobs, e.Job)
-	case *acp.EventReportError:
-		r.errors = append(r.errors, e.Error)
-	}
-}
-
-// hasFailure reports whether the run left a failure behind: a pipeline problem, an item ACP
-// could not process, or a target that was not written.
-func (r *report) hasFailure() bool {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-
-	if len(r.errors) > 0 {
+func hasFailure(snapshot *acp.Report) bool {
+	if len(snapshot.Errors) > 0 {
 		return true
 	}
-	for _, job := range r.jobs {
+	for _, job := range snapshot.Jobs {
 		if len(job.FailTargets) > 0 {
 			return true
 		}
 	}
 	return false
-}
-
-func (r *report) getter() *acp.Report {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-
-	return &acp.Report{Jobs: r.jobs, Errors: r.errors}
 }
