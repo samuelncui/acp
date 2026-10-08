@@ -329,28 +329,32 @@ func TestRunCopiesItemsToLinearTarget(t *testing.T) {
 	}
 }
 
-func TestForwardPreparedOrdersOnlyLinearTargets(t *testing.T) {
+func TestForwardPreparedPreservesRequiredOrder(t *testing.T) {
+	// Deliver preparation completions in a different order from their source requests.
 	newJob := func(order uint64, path string) *writeJob {
 		return newWriteJob(
 			&baseJob{order: order, path: path},
 			io.NopCloser(strings.NewReader("fixture")),
-			false,
 		)
 	}
 	tests := []struct {
-		name    string
-		linear  bool
-		wantIDs []string
+		name                   string
+		fromLinear, toLinear   bool
+		fromThreads, toThreads int
+		wantIDs                []string
 	}{
-		{name: "linear request order", linear: true, wantIDs: []string{"1", "3"}},
-		{name: "random completion order", wantIDs: []string{"3", "1"}},
+		{name: "linear target", toLinear: true, fromThreads: 3, toThreads: 1, wantIDs: []string{"1", "3"}},
+		{name: "linear source", fromLinear: true, fromThreads: 1, toThreads: 3, wantIDs: []string{"1", "3"}},
+		{name: "serial random devices", fromThreads: 1, toThreads: 1, wantIDs: []string{"1", "3"}},
+		{name: "parallel source serial target", fromThreads: 3, toThreads: 1, wantIDs: []string{"3", "1"}},
+		{name: "serial source parallel target", fromThreads: 1, toThreads: 3, wantIDs: []string{"3", "1"}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			// Deliver later preparation results first; a failed or skipped middle request has no write Job.
 			copyer := &StreamCopyer{option: &option{
-				fromDevice: &deviceOption{threads: 3},
-				toDevice:   &deviceOption{linear: test.linear},
+				fromDevice: &deviceOption{threads: test.fromThreads, linear: test.fromLinear},
+				toDevice:   &deviceOption{threads: test.toThreads, linear: test.toLinear},
 			}}
 			completed := make(chan prepareResult, 3)
 			completed <- prepareResult{order: 2, job: newJob(2, "3")}
@@ -359,7 +363,7 @@ func TestForwardPreparedOrdersOnlyLinearTargets(t *testing.T) {
 			close(completed)
 			prepared := make(chan *writeJob, 3)
 
-			// Forwarding must reorder only the serialized target path.
+			// Preserve former serial behavior while concurrent random preparation may complete out of order.
 			copyer.forwardPrepared(completed, prepared)
 			close(prepared)
 			var ids []string
@@ -1092,7 +1096,7 @@ func TestRunAppliesBoundedBackpressure(t *testing.T) {
 	input := writeSourceFile(t, root, "source.txt", nil)
 
 	const (
-		total       = int64(256)
+		total       = int64(2048)
 		readBuffer  = 8
 		consumedMax = total / 2
 	)
@@ -1218,7 +1222,8 @@ func TestRunDoesNotReportAStopAfterACompleteRun(t *testing.T) {
 }
 
 func TestRunCancellationDrainsPrefetchedItems(t *testing.T) {
-	// Feed work until the pipeline is busy, so cancellation occurs with an active pipeline.
+	// Feed work until the pipeline holds prepared content, then cancel with buffers still queued.
+	trackChunkPool(t)
 	root := t.TempDir()
 	input := writeSourceFile(t, root, "source.txt", []byte("fixture"))
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1229,7 +1234,8 @@ func TestRunCancellationDrainsPrefetchedItems(t *testing.T) {
 		produced []*fixtureItem
 	)
 	fixture := newStreamFixture()
-	stream, err := NewStream(ctx, fixture.onResults, SetToDevice(LinearDevice(true)), WithResultBuffer(1), WithResultBatch(1))
+	stream, err := NewStream(ctx, fixture.onResults, SetToDevice(LinearDevice(true)),
+		WithHashPolicy(HashReadRefresh), WithResultBuffer(1), WithResultBatch(1))
 	if err != nil {
 		t.Fatal(err)
 	}

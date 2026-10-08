@@ -51,8 +51,10 @@ type StreamCopyer struct {
 	getDevice         func(in string) (string, error)
 	availableSpace    func(mountPoint string) (int64, error)
 	targetDirs        map[string]string // Indexed parent paths; Submit is their sole owner.
+	linearSpace       spaceEstimate     // Owned by the single linear writer.
 	linearTargetEnded uint32
 	signatures        *signatureCache
+	filesystem        transferFilesystem
 
 	// order numbers submitted items; a single submitter keeps it race-free.
 	order uint64
@@ -198,8 +200,8 @@ func (c *StreamCopyer) Submit(items ...Item) error {
 	return nil
 }
 
-// Close ends the feed and drains the run: every item already submitted finishes, its cache entry
-// is published before its descriptor closes, the remaining results are flushed, and the run's
+// Close ends the feed and drains the run: every item already submitted finishes
+// and all dependent cache and Close work settle, the remaining results are flushed, and the run's
 // cache summary is reported. It returns the flush error, and it is safe to call more than once.
 func (c *StreamCopyer) Close() error {
 	c.closeOnce.Do(func() {
@@ -373,7 +375,7 @@ func (c *StreamCopyer) setError(err error) {
 }
 
 func (c *StreamCopyer) endLinearTarget(err error) {
-	if !c.toDevice.linear || !checkErrorAbort(err) {
+	if !c.toDevice.linear || !checkErrorAbort(mappingError(err)) {
 		return
 	}
 	atomic.StoreUint32(&c.linearTargetEnded, 1)
@@ -406,6 +408,7 @@ func (c *StreamCopyer) run(ctx context.Context) error {
 	}
 	for job := range prepared {
 		job.finishSource()
+		job.releaseSlot()
 	}
 	for range copyed {
 	}

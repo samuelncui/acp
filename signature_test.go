@@ -326,6 +326,7 @@ func TestRunSignatureCacheAccessCounts(t *testing.T) {
 
 				// Track the one source descriptor and every cache access, including target writers.
 				previousOpen, previousRead, previousWrite := openSourceContent, readManagedXattr, writeManagedXattr
+				previousPathWrite := writeManagedPathXattr
 				var lock sync.Mutex
 				var sourceFile *os.File
 				var opens, reads, sourceWrites, targetWrites int
@@ -376,8 +377,20 @@ func TestRunSignatureCacheAccessCounts(t *testing.T) {
 					}
 					return nil
 				}
+				writeManagedPathXattr = func(path string, value []byte) error {
+					// The asynchronous source cache describes the same stable file after Close.
+					got, err := DecodeCachedSignature(value)
+					if path != input || err != nil || got != want {
+						t.Errorf("path cache = %q / %#v / %v", path, got, err)
+					}
+					lock.Lock()
+					sourceWrites++
+					lock.Unlock()
+					return nil
+				}
 				t.Cleanup(func() {
 					openSourceContent, readManagedXattr, writeManagedXattr = previousOpen, previousRead, previousWrite
+					writeManagedPathXattr = previousPathWrite
 				})
 
 				// Wait for the full item so the counts include publication and descriptor release.
@@ -816,12 +829,13 @@ func TestRunSignatureCacheIsBestEffortForReadOnlyFile(t *testing.T) {
 // cache failure. A real xattr failure is still reported.
 func TestRunIgnoresUnsupportedSignatureXattr(t *testing.T) {
 	// Simulate a filesystem without the managed namespace, regardless of this host's support.
-	previousRead, previousWrite := readManagedXattr, writeManagedXattr
+	previousRead, previousWrite, previousPath := readManagedXattr, writeManagedXattr, writeManagedPathXattr
 	t.Cleanup(func() {
-		readManagedXattr, writeManagedXattr = previousRead, previousWrite
+		readManagedXattr, writeManagedXattr, writeManagedPathXattr = previousRead, previousWrite, previousPath
 	})
 	readManagedXattr = func(*os.File) ([]byte, error) { return nil, errSignatureXattrUnsupported }
 	writeManagedXattr = func(*os.File, []byte) error { return errSignatureXattrUnsupported }
+	writeManagedPathXattr = func(string, []byte) error { return errSignatureXattrUnsupported }
 
 	// Keep an existing target so replacement also exercises the no-cache policy.
 	root := t.TempDir()
@@ -869,6 +883,7 @@ func TestRunIgnoresUnsupportedSignatureXattr(t *testing.T) {
 
 	// A broken attribute is still a failure, so the no-op policy cannot swallow real ones.
 	writeManagedXattr = func(*os.File, []byte) error { return errors.New("xattr is broken") }
+	writeManagedPathXattr = func(string, []byte) error { return errors.New("xattr is broken") }
 	if _, summary := run(); summary.Failures == 0 {
 		t.Fatalf("summary = %#v, want the broken attribute recorded", summary)
 	}
@@ -941,10 +956,9 @@ func TestRunReadsTheStoredHashThroughTheItemDescriptor(t *testing.T) {
 	}
 }
 
-// TestRunWritesTheComputedHashThroughTheItemDescriptor pins where a computed hash is published:
-// through the descriptor that read the content, so the entry always describes the bytes this item
-// read, before that descriptor closes.
-func TestRunWritesTheComputedHashThroughTheItemDescriptor(t *testing.T) {
+// TestRunWritesComputedCacheAfterSourceClose pins where a computed hash is published:
+// through the stable source path after the content descriptor has closed.
+func TestRunWritesComputedCacheAfterSourceClose(t *testing.T) {
 	for _, mode := range []ReadMode{ReadBuffered, ReadMapped} {
 		t.Run(mode.String(), func(t *testing.T) {
 			// A stored entry that differs from the computed hash requires one source publication.
@@ -953,8 +967,8 @@ func TestRunWritesTheComputedHashThroughTheItemDescriptor(t *testing.T) {
 			input := writeSourceFile(t, t.TempDir(), "source.txt", content)
 			seedStaleSignature(t, input, []byte("stale stored value"))
 
-			// Observe publication through the original descriptor while the file stays stable.
-			previousOpen, previousWrite := openSourceContent, writeManagedXattr
+			// Observe one content open and path publication after descriptor closure.
+			previousOpen, previousWrite := openSourceContent, writeManagedPathXattr
 			var opened *os.File
 			var opens, writes int
 			openSourceContent = func(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
@@ -963,14 +977,17 @@ func TestRunWritesTheComputedHashThroughTheItemDescriptor(t *testing.T) {
 				opened = source.file
 				return source, err
 			}
-			writeManagedXattr = func(file *os.File, value []byte) error {
+			writeManagedPathXattr = func(path string, value []byte) error {
 				writes++
-				if file != opened {
-					t.Errorf("cache write descriptor = %p, want the source descriptor %p", file, opened)
+				if path != input {
+					t.Errorf("cache path = %q, want %q", path, input)
 				}
-				return previousWrite(file, value)
+				if _, err := opened.Stat(); !errors.Is(err, os.ErrClosed) {
+					t.Errorf("cache publication preceded source Close: %v", err)
+				}
+				return previousWrite(path, value)
 			}
-			t.Cleanup(func() { openSourceContent, writeManagedXattr = previousOpen, previousWrite })
+			t.Cleanup(func() { openSourceContent, writeManagedPathXattr = previousOpen, previousWrite })
 
 			// Run a content refresh and retain the aggregate warning and write counts.
 			var summary SignatureCacheSummary
@@ -1120,7 +1137,7 @@ func TestRunPublishesTargetCacheThroughTheOpenTargetDescriptor(t *testing.T) {
 	// item computed from the whole source.
 	lock.Lock()
 	defer lock.Unlock()
-	if len(publications) != len(targets)+1 {
+	if len(publications) != len(targets) {
 		t.Fatalf("published %d cache entries, want one per file: %#v", len(publications), publications)
 	}
 	var sourcePublished, targetsPublished int
@@ -1151,8 +1168,8 @@ func TestRunPublishesTargetCacheThroughTheOpenTargetDescriptor(t *testing.T) {
 		}
 		targetsPublished++
 	}
-	if sourcePublished != 1 || targetsPublished != len(targets) {
-		t.Fatalf("publications = %#v, want one source entry and one per target", publications)
+	if sourcePublished != 0 || targetsPublished != len(targets) {
+		t.Fatalf("publications = %#v, want one descriptor publication per target", publications)
 	}
 
 	// Every entry describes its own file afterwards, which is the whole point of publishing it.
@@ -1172,8 +1189,7 @@ type blockingHash struct {
 	started chan struct{}
 	release chan struct{}
 
-	startOnce   sync.Once
-	releaseOnce sync.Once
+	startOnce *sync.Once
 }
 
 func (h *blockingHash) Write(p []byte) (int, error) {
@@ -1189,28 +1205,18 @@ func (h *blockingHash) Write(p []byte) (int, error) {
 func holdContentHash(t *testing.T) (started <-chan struct{}, released <-chan struct{}, release func()) {
 	t.Helper()
 
-	// Empty the shared pool, so the next hash consumer must take the blocked one.
+	// Every concurrent file owns its own digest; only the observation and release gates are shared.
 	previous := sha256Pool
-	previousNew := previous.New
-	previous.New = nil
-	for previous.Get() != nil {
-	}
-	previous.New = previousNew
+	first, gate := make(chan struct{}), make(chan struct{})
+	var startOnce sync.Once
+	sha256Pool = &sync.Pool{New: func() interface{} {
+		return &blockingHash{Hash: sha256.New(), started: first, release: gate, startOnce: &startOnce}
+	}}
 
-	blocked := &blockingHash{
-		Hash:    sha256.New(),
-		started: make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	sha256Pool = &sync.Pool{New: func() interface{} { return blocked }}
-
-	unblock := func() { blocked.releaseOnce.Do(func() { close(blocked.release) }) }
-	t.Cleanup(func() {
-		unblock()
-		sha256Pool = previous
-	})
-
-	return blocked.started, blocked.release, unblock
+	// Restore the original pool only after tests have joined their transfer workers.
+	unblock := onceRelease(gate)
+	t.Cleanup(func() { unblock(); sha256Pool = previous })
+	return first, gate, unblock
 }
 
 // TestRunHoldsTargetCacheUntilTheHashIsComplete pins the ordering a target's cache entry depends

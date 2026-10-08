@@ -37,7 +37,7 @@ func (c *StreamCopyer) indexTarget(name string, source os.FileInfo) (targetSpec,
 	}
 	if info != nil && info.Mode()&os.ModeSymlink != 0 {
 		// An existing link keeps its identity: only its live referent can be replaced.
-		target.path, err = filepath.EvalSymlinks(name)
+		target.path, err = resolveOutputPath(name)
 		if err != nil {
 			return target, fmt.Errorf("resolve target link failed, %w", err)
 		}
@@ -68,6 +68,8 @@ func (c *StreamCopyer) indexTarget(name string, source os.FileInfo) (targetSpec,
 		}
 		target.path = filepath.Join(dir, base)
 	}
+
+	// Refuse source aliases and unsupported target types before any output is created.
 	if info != nil {
 		if source != nil && os.SameFile(source, info) {
 			return target, fmt.Errorf("source and target are the same file")
@@ -80,6 +82,8 @@ func (c *StreamCopyer) indexTarget(name string, source os.FileInfo) (targetSpec,
 			return target, fmt.Errorf("target is not a regular file or device")
 		}
 	}
+
+	// Retain the mount observation alongside the canonical destination identity.
 	target.device, err = c.getDevice(target.path)
 	if err != nil {
 		return target, fmt.Errorf("get target device failed, %w", err)
@@ -112,6 +116,22 @@ func resolveOutputPath(path string) (string, error) {
 		path = parent
 	}
 
+	// Anchor relative paths without cleaning away link/.. before the symlink walk.
+	// Windows drive-relative paths use that drive's cwd; root-relative paths use its volume.
+	if !filepath.IsAbs(path) {
+		volume := filepath.VolumeName(path)
+		base, err := filepath.Abs(volume + ".")
+		if err != nil {
+			return "", err
+		}
+		path = path[len(volume):]
+		if len(path) > 0 && os.IsPathSeparator(path[0]) {
+			path = filepath.VolumeName(base) + path
+		} else {
+			path = base + string(filepath.Separator) + path
+		}
+	}
+
 	// Resolve once, then retain missing descendants beneath that physical directory.
 	resolved, err := resolveDirectory(path)
 	if err != nil {
@@ -124,14 +144,10 @@ func resolveOutputPath(path string) (string, error) {
 }
 
 func (c *StreamCopyer) prepareTarget(job *writeJob, target targetSpec) (out *fileio.Output, err error) {
-	// Linear media cannot preallocate. Check their current free space immediately before writing.
-	if c.toDevice.linear && job.stat.size > 0 {
-		available, err := c.availableSpace(target.device)
-		if err != nil {
+	// Linear media cannot preallocate; reject insufficient estimated space before output creation.
+	if c.toDevice.linear {
+		if err := c.checkLinearSpace(job, target); err != nil {
 			return nil, err
-		}
-		if job.stat.size > available {
-			return nil, fmt.Errorf("%w, want=%d have=%d", ErrTargetNoSpace, job.stat.size, available)
 		}
 	}
 
@@ -182,76 +198,6 @@ func (c *StreamCopyer) targetFailed(job *baseJob, path, dev string, err error, e
 	}
 	c.endLinearTarget(err)
 	job.fail(path, err)
-}
-
-func (c *StreamCopyer) consumeTarget(job *writeJob, target targetSpec, out *fileio.Output, chunks <-chan *chunkBuffer,
-	cacheGate <-chan struct{}, readErr *error, exhausted mapset.Set[string]) {
-	// The output owns its descriptor and temporary until commit or cleanup. Every failure is
-	// reported against the requested path, and every queued buffer is released.
-	var err error
-	defer func() {
-		if value := recover(); value != nil {
-			err = panicError("target writer", value)
-			c.setError(err)
-			c.stopHard()
-		}
-		err = errors.Join(err, out.Discard())
-		if err != nil {
-			c.targetFailed(job.baseJob, target.name, target.device, err, exhausted)
-		} else {
-			job.success(target.name)
-		}
-		for chunk := range chunks {
-			chunk.release()
-		}
-	}()
-
-	// Write each source chunk once before completing metadata and the content signature.
-	for chunk := range chunks {
-		if err = writeChunk(out.File, chunk); err != nil {
-			return
-		}
-	}
-	if *readErr != nil {
-		err = *readErr
-		return
-	}
-	if cacheGate != nil {
-		<-cacheGate
-	}
-	select {
-	case <-c.hardStop:
-		err = fmt.Errorf("target stopped by pipeline failure")
-		return
-	default:
-	}
-	if !target.direct {
-		// Publish the managed attribute while the owned temporary is still writable.
-		c.refreshCacheEntry(out.File, target.name, job.baseJob, true)
-		if err = restoreTarget(out.Temporary, job.stat); err != nil {
-			err = fmt.Errorf("restore target metadata failed, %w", err)
-			return
-		}
-	}
-	if !c.toDevice.linear {
-		if err = out.File.Sync(); err != nil {
-			err = fmt.Errorf("sync target failed, %w", err)
-			return
-		}
-	}
-
-	// Rewrite replaces its own source. Release its descriptor and mapping before rename.
-	if target.output != nil {
-		if err = job.finishSource(); err != nil {
-			err = fmt.Errorf("close rewrite source failed, %w", err)
-			return
-		}
-	}
-
-	// Only a complete, closed output replaces the final path; failure leaves the old file intact.
-	if err = commitTarget(out, c.createFlag&os.O_TRUNC != 0); err != nil {
-		err = fmt.Errorf("commit target failed, %w", err)
-	}
 }
 
 func writeChunk(writer io.Writer, chunk *chunkBuffer) error {

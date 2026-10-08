@@ -169,12 +169,12 @@ class RepositoryTest(RepositoryFixture, unittest.TestCase):
                 result = json.loads((directory / "comparison.json").read_text())
                 self.assertEqual(comparison, result)
                 self.assertEqual(result["flagged"], flagged)
-                self.assertEqual(len(result["metrics"]), 24)
+                self.assertEqual(len(result["metrics"]), len(release.BENCHMARKS) * len(release.METRICS))
                 row = result["metrics"][0]
                 self.assertEqual(row["baseline"], 100)
                 self.assertEqual(row["candidate"], changes.get("time", 100))
                 self.assertAlmostEqual(row["delta_percent"], changes.get("time", 100) - 100)
-                self.assertEqual(sum(row["flagged"] for row in result["metrics"]), 8 if flagged else 0)
+                self.assertEqual(sum(row["flagged"] for row in result["metrics"]), len(release.BENCHMARKS) if flagged else 0)
                 for row in result["metrics"]:
                     self.assertIn(row["benchmark"] + "\t" + row["metric"], stdout.getvalue())
 
@@ -220,7 +220,7 @@ class RepositoryTest(RepositoryFixture, unittest.TestCase):
                 directory, _ = self.evidence(benchmark_text(cpu=cpu, iterations=1234), cpu=cpu)
                 result = release.performance_check(self.repo, directory, self.base, self.candidate, self.base)
                 self.assertFalse(result["flagged"])
-                self.assertEqual(len(result["metrics"]), 24)
+                self.assertEqual(len(result["metrics"]), len(release.BENCHMARKS) * len(release.METRICS))
 
     def test_documentation_and_checker_changes_retain_original_measurements_and_source_identity(self):
         directory, record = self.evidence()
@@ -283,7 +283,7 @@ class RepositoryTest(RepositoryFixture, unittest.TestCase):
                 self.assertEqual((Path(args.out) / (side + ".bench")).read_bytes(), outputs[side])
             result = json.loads((Path(args.out) / "comparison.json").read_text())
             self.assertEqual(result["flagged"], time == 111)
-            self.assertEqual(len(result["metrics"]), 24)
+            self.assertEqual(len(result["metrics"]), len(release.BENCHMARKS) * len(release.METRICS))
 
     def test_collector_keeps_incomplete_output_unaccepted(self):
         args = SimpleNamespace(idle=True, cpu=4, baseline=self.base, candidate=self.candidate,
@@ -324,7 +324,7 @@ class RepositoryTest(RepositoryFixture, unittest.TestCase):
                     mock.patch.object(release.Path, "cwd", return_value=self.repo), mock.patch.object(release.os, "umask"), \
                     contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(io.StringIO()) as stderr:
                 self.assertEqual(release.main(), 0)
-            self.assertEqual(sum(line.startswith(release.BENCHMARKS) for line in stdout.getvalue().splitlines()), 24)
+            self.assertEqual(sum(line.startswith(release.BENCHMARKS) for line in stdout.getvalue().splitlines()), len(release.BENCHMARKS) * len(release.METRICS))
             self.assertEqual(stderr.getvalue(), "")
             if time == 111:
                 self.assertIn("investigate this benchmark", stdout.getvalue())
@@ -389,7 +389,7 @@ class RepositoryTest(RepositoryFixture, unittest.TestCase):
             report = json.loads((output / "acceptance.json").read_text())
             self.assertEqual(report["performance"], json.loads((directory / "comparison.json").read_text()))
             self.assertEqual(report["performance"]["flagged"], time == 111)
-            self.assertEqual(len(report["performance"]["metrics"]), 24)
+            self.assertEqual(len(report["performance"]["metrics"]), len(release.BENCHMARKS) * len(release.METRICS))
             self.assertFalse(report["publication_approved"])
             final = stdout.getvalue().splitlines()[-1]
             self.assertIn("publication approval is still required", final)
@@ -478,7 +478,7 @@ class PureGateTest(unittest.TestCase):
         for cpu in (1, 4):
             _, values = release.parse_benchmarks(benchmark_text(cpu=cpu), cpu)
             self.assertEqual(set(values), set(release.BENCHMARKS))
-            self.assertEqual(sum(len(row) for row in values.values()), 24)
+            self.assertEqual(sum(len(row) for row in values.values()), len(release.BENCHMARKS) * len(release.METRICS))
             self.assertEqual(values[release.BENCHMARKS[0]], {"ns/op": 100, "B/op": 100, "allocs/op": 10})
         for text, cpu in ((benchmark_text(cpu=4), 1), (benchmark_text(cpu=1), 4),
                           (benchmark_text(cpu=2), 4), (benchmark_text().replace("-4\t", "-1\t"), 1)):
@@ -495,7 +495,8 @@ class PureGateTest(unittest.TestCase):
             self.assertIn(b"<home>/file.go", log.read_bytes())
 
     def test_benchmark_inventory_and_go_test_completion_are_required(self):
-        for text in (benchmark_text(benchmarks=release.BENCHMARKS[:-1]),
+        for text in (benchmark_text(benchmarks=release.BENCHMARKS[:8]),
+                     benchmark_text(benchmarks=release.BENCHMARKS[:-1]),
                      benchmark_text(benchmarks=release.BENCHMARKS + (release.BENCHMARKS[0],)),
                      benchmark_text() * 2, benchmark_text().replace("PASS", "SKIP", 1),
                      benchmark_text().replace("PASS\n", ""), benchmark_text().split("ok  \t")[0],

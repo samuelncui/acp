@@ -15,6 +15,11 @@ Use the existing entrypoints below for tests, regressions and performance work: 
 repeated manual agent steps. Recurring regressions belong in checked-in tests or harnesses with
 fixtures under the existing owner; extend those before adding another runner or script.
 
+Keep reusable release, test and benchmark scripts and synthetic or public fixtures in this
+repository. Supply machine-specific hosts, paths and private inputs through arguments or
+environment variables. Keep credentials, real backups, deployment configuration and sensitive
+results outside tracked source and public artifacts.
+
 Maintain tests, harnesses and fixtures with the implementation. Update or remove obsolete
 assertions and unsupported scenarios in the same change. Test meaningful behavior and failure
 boundaries; avoid duplicate checks at the same boundary or assertions that merely mirror code.
@@ -25,6 +30,22 @@ Record the source, exact commands, passes, failures, skips and unrun checks with
 Use the [performance policy](#performance-comparisons) for timings. Existing native-device
 acceptance and human content/consumer review remain required where applicable; record manual
 steps, their results and why automation cannot establish that outcome.
+
+### Check scope and reuse
+
+During development, check changed behavior and affected callers with the native commands below.
+A documentation-only edit does not require Go tests or benchmarks. After a failure, diagnose it
+and rerun the failing boundary and affected callers; a preparation failure resumes that stage and
+its dependents. Do not restart unchanged successful stages. Finish related edits before expensive
+runs, and remove obsolete or duplicate requirements when their protected behavior no longer applies.
+
+A new commit alone does not invalidate independent results. Compare relevant source, dependencies,
+configuration, fixtures and environment; reuse unchanged evidence with its original identity and a
+short explanation. Unknown impact requires broader checks. Native output and concise command/results
+are sufficient for routine checks; release and performance evidence use the existing report tools.
+Choose one final full gate for the clean integrated release source instead of duplicating the same
+suite locally and in CI. New artifacts still need identity, content and checksum checks and smoke
+coverage; repeat changed runtime workflows only where affected.
 
 ## Standard checks
 
@@ -107,7 +128,7 @@ GOMAXPROCS=4 make bench
 ```
 
 Run one ordinary Go benchmark invocation per source with `-benchtime=1s -count=1 -benchmem`
-across the eight existing workloads. Go calibrates iterations; do not force equal iteration
+across the fourteen maintained benchmark cases. Go calibrates iterations; do not force equal iteration
 counts or repeated whole-suite samples.
 Compare time, bytes/op and allocations/op, recording all raw values and percentage deltas.
 
@@ -132,6 +153,53 @@ benefit or makes the relevant workload worse; do not accumulate ineffective alte
 Release collection and evidence validation use `make performance-collect` and
 `make performance-check` below. Ordinary `make check` and `make bench` require no release inputs.
 
+## Bounded pipeline and LTFS model
+
+`pipeline_b_test.go`, `pipeline_liveness_test.go`, `ltfs_mock_test.go`, `tape_drive_test.go` and `tape_speed_test.go` exercise the private filesystem
+seam, shared content credits, ordered head admission, parallel hash/target consumers and independent
+source/target Close. Keep EOF, cancellation, late no-space, same-path publication, cache and
+multi-target outcomes in semantic coverage; do not assert the removed small-file prehash threshold.
+
+The LTFS model separates three byte ledgers: application/host acceptance, driver acceptance and
+physical tape completion. Close can wait for driver acceptance while physical bytes remain pending;
+model Finalize drains and checks the physical ledger. ACP completion alone is not physical durability.
+A single FUSE dispatcher models the observed LTFS `-s` mount: asynchronous application Close does
+not imply concurrent execution inside FUSE. Host and drive buffers, minimum streaming rate,
+startup, seek, restart/backhitch and injected errors are explicit scenario inputs.
+
+The vendor-range scenario uses a 47 MB/s minimum and 140 MB/s maximum; the 100/140 MB/s scenario
+is a deliberately stricter supply stress case. HP documents adaptive speed matching but does not publish the firmware control law. The mock
+updates from actual drive-buffer arrivals at physical service boundaries at least 100 ms apart,
+smooths over 1 s, targets 60% occupancy with a 2 s correction horizon, and limits speed changes to 20 MB/s per second with a 1 MB/s deadband.
+These are explicit simulation assumptions. Physical consumption runs independently: an empty
+buffer before final drain triggers the assumed 2.5 s backhitch, with no starvation grace. The
+fixed-rate controls use the same full-size buffer to verify this invariant. Use ledger consistency and bounded
+ownership to interpret simulated throughput; simulation cannot establish physical Tape gains.
+
+Run the pipeline benchmark with one complete measured operation per scenario:
+
+```sh
+go test -run '^$' -bench '^BenchmarkLTFSPipeline$' -benchtime=1x -benchmem -count=1 .
+```
+
+Set `ACP_MOCK_REPORT_DIR` to retain per-operation physical-byte and buffer-occupancy CSV curves
+and JSON parameters. Benchmarks retain the full 1 GiB LTFS cache and 256,000,000-byte drive buffer
+and transfer 2 GiB to exceed combined cache absorption. The file-barrier reference waits for each item result; it is a scheduling control,
+not a historical ACP version. Native historical comparisons use the common harness above.
+`dev/ltfs_compare.py --baseline 4d5dbd0b8c06c5d53f369820ac9cff20e779821f --candidate <full-sha> --harness <full-sha> --out <new-directory> --idle`
+compares the same model against published v0.2.3. The explicit reviewed harness supplies the native
+smoke benchmark on both sources; its commit and file hashes are recorded with the candidate's model
+hashes. The helper records the small I/O adapter patch connecting v0.2.3 to the private seam,
+preserves its original scheduling and completion, checks native fallback, and saves all seven
+measured cases and curves. `--scenario read-delay` selects a separate
+synthetic sensitivity: 2,048 files of 1 MiB, a 20 ms first-Read delay per file, and four source
+threads. This stresses content-read overlap while retaining the full physical buffers. The latency is a declared synthetic input, not a calibration
+of the hardware regression. This is an instrumented historical
+comparison, not an unmodified historical binary.
+
+Retain scenario flags, model assumptions and raw results. Apply the existing matched-performance
+policy and physical validation before making a hardware throughput claim.
+
 ## Platform and environment limits
 
 Tests requiring xattrs, symlinks or permission refusal must probe host support and report skips.
@@ -141,6 +209,15 @@ for unsupported attributes. See [platform behavior](README.md#platform-behavior)
 Run Linux device and filled-volume tests on Linux. The filled-volume test uses disposable tmpfs
 and skips if mounting is refused. Use actual device/allocation errors to verify error mapping and
 owned-output cleanup. Check the linear space estimate at the write-entry boundary.
+`copy_test.go` retains the insufficient-capacity check; `target_test.go` covers exact capacity,
+zero-size query avoidance and observation failure. `linear_space_test.go` covers bounded sample
+reuse, logical debits, mount changes and fresh observations at capacity boundaries.
+`full_linux_test.go` supplies an optimistic
+estimate before real `/dev/full` ENOSPC and checks that later prefetched items remain unprocessed.
+`cleanup_test.go` checks joined write, close and removal errors through the target result, while
+`internal/fileio/output_test.go` owns descriptor and temporary-path cleanup checks. These bounded
+fixtures verify the [current estimate limitation](README.md#target-completion), not how much
+payload fits on physical media.
 Linux invalid-UTF-8 filename tests cover the native filesystem boundary; portable state/report
 tests cover JSON validation. Record which of these host-dependent tests ran.
 
@@ -198,13 +275,14 @@ later local improvements belong to a subsequent release.
    moves, reconcile and review again. Freeze the version/tag and exact commit with a clean working
    tree; confirm `go.mod` retains the intended module identity. Use an isolated checkout of that
    commit with the workspace isolation above so ignored local files cannot become release inputs.
-4. **Run gates and finish review.** Run `make release-check` with the explicit inputs below. It runs
-   `make check` and `make race` on an isolated exact source snapshot, including the
-   command/library integration tests without `-short`. Follow the
-   [platform and environment limits](#platform-and-environment-limits); cross-builds are not foreign
-   runtime acceptance, and host-dependent skips remain explicit. Review and fix until no unresolved,
-   unaccepted finding remains. A source fix requires a new clean commit and verification of the
-   final source; record exact passes, failures and unrun gates rather than inheriting old results.
+4. **Finish review, then run the final source gate.** Review and fix with affected checks until no
+   unresolved, unaccepted finding remains, following [check scope and reuse](#check-scope-and-reuse).
+   Run `make release-check` once on the clean integrated source with the explicit inputs below. It
+   runs `make check` and `make race` on an isolated snapshot, including command/library integration
+   without `-short`. Follow the [platform and environment limits](#platform-and-environment-limits);
+   cross-builds are not foreign runtime acceptance, and host-dependent skips remain explicit.
+   Record passes, failures, reused evidence and unrun gates against their actual inputs. A fix after
+   this gate refreshes the affected checks; a reviewed independent diff can retain unrelated passes.
 5. **Approve publication.** Review the final diff, commit message, tag target and Release text.
    Inspect and scan any distributed binaries or archives for contents, licenses and private-path leakage,
    and record their checksums. Include shipped generated code and dependency sources in content
@@ -269,6 +347,21 @@ tests are removed from those temporary benchmark builds. The collector measures 
 then the candidate, on the same temporary filesystem under the [performance comparison policy](#performance-comparisons).
 Fixture setup and cleanup add to elapsed time beyond the benchmark duration.
 
+`BenchmarkCopyWorkload` retains ordinary one-target and three-target disk workloads and adds
+linear-target small (256 files of 256 KiB), large (one 64 MiB file), and mixed (128 files
+of 256 KiB interleaved with four 8 MiB files) workloads in buffered and mapped source modes.
+Linear cases use YATM Archive's `HashReadRefresh` policy and serialized target scheduling.
+Every iteration reads and hashes the source content. Source fixtures remain in place across
+Go calibration and measured iterations, so filesystem caches and existing signature xattrs
+may be warm; unchanged signature entries avoid redundant cache writes. These are warm-cache
+overhead comparisons, not cold-source measurements.
+These local filesystem measurements expose ACP overhead; they do not measure Tape throughput,
+repositions, LTFS finalization or Restore. Select affected cases with Go's `-bench` filter during
+investigation; the paired release collector requires the complete maintained inventory.
+Keep a change only when throughput or reposition activity clearly improves with no confirmed
+regression in the other metric or correctness. Inconclusive changes are reverted; stop when no
+evidence-backed simple candidate remains or the remaining constraint belongs to LTFS/hardware.
+
 The defaults are four CPUs, CGO disabled and Go's normal GC. `--cpu` accepts a positive CPU count;
 Go's unsuffixed benchmark names for `--cpu 1` are accepted. The read fixtures contain exactly
 64 MiB and the refresh fixtures exactly 4 KiB; fixture creation verifies those sizes before
@@ -291,7 +384,7 @@ Any other changed file requires matching measurements; this exception never chan
 Each source log must contain one completed row for every workload, with `ns/op`, `B/op` and
 `allocs/op`, followed by Go's successful `PASS` and package `ok` summary. Missing or duplicate rows,
 missing metrics, failed or unfinished commands, changed identities and modified output fail
-validation. The comparison saves `comparison.json` and prints all 24 raw metric pairs, percentage
+validation. The comparison saves `comparison.json` and prints all 42 raw metric pairs, percentage
 deltas and review flags. Apply the [same review policy](#performance-comparisons) locally and in
 CI, retaining the original report and any investigation output outside maintained documentation.
 

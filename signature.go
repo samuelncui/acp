@@ -23,8 +23,9 @@ var errSignatureXattrUnsupported = errors.New("signature xattr is unsupported")
 // The managed-xattr operations are indirected so a test can exercise the missing, unsupported
 // and failing paths on a file system that accepts the attribute.
 var (
-	readManagedXattr  = readSignatureXattr
-	writeManagedXattr = writeSignatureXattr
+	readManagedXattr      = readSignatureXattr
+	writeManagedXattr     = writeSignatureXattr
+	writeManagedPathXattr = writeSignaturePathXattr
 )
 
 // signatureXattrIgnorable reports whether an xattr error leaves the cache in a well-defined
@@ -212,25 +213,45 @@ func (c *signatureCache) lookup(file *os.File, path string, indexed *stat) ([]by
 // Sources and paths stay stable during a run. Preparation retained the source's stored entry;
 // targets use fresh temporary files, so neither publication needs another metadata or xattr read.
 func (c *StreamCopyer) refreshCacheEntry(file *os.File, path string, job *baseJob, target bool) {
-	// Only a completed content hash under a refresh policy can publish an entry.
-	if file == nil || c.signatures == nil || !c.hashPolicy.refreshesCache() {
+	// A missing descriptor means this item never opened the named file.
+	if file == nil {
 		return
+	}
+
+	// Share policy and snapshot decisions with publication after descriptor closure.
+	if signature, ok := c.cacheEntry(path, job, target); ok {
+		c.signatures.write(file, path, signature)
+	}
+}
+
+// refreshCachePath publishes through a stable, caller-owned path after its descriptor closes.
+// The caller keeps the path unchanged until publication and any target replacement finish.
+func (c *StreamCopyer) refreshCachePath(path string, job *baseJob, target bool) {
+	if signature, ok := c.cacheEntry(path, job, target); ok {
+		c.signatures.recordWrite(path, writeManagedPathXattr(path, encodeCachedSignature(signature)))
+	}
+}
+
+func (c *StreamCopyer) cacheEntry(path string, job *baseJob, target bool) (CachedSignature, bool) {
+	// Only a completed content hash under a refresh policy can publish an entry.
+	if c.signatures == nil || !c.hashPolicy.refreshesCache() {
+		return CachedSignature{}, false
 	}
 	hash, ok := job.computedHash()
 	if !ok {
-		return
+		return CachedSignature{}, false
 	}
 	signature, err := newCachedSignature(hash, job.stat)
 	if err != nil {
 		c.signatures.recordFailure(path, err)
-		return
+		return CachedSignature{}, false
 	}
 
-	// Avoid rewriting an equal source entry; a fresh target has no stored entry to inspect.
+	// Preparation retained the source entry; fresh targets have no equal entry to skip.
 	if !target && job.cachedSignature != nil && *job.cachedSignature == signature {
-		return
+		return CachedSignature{}, false
 	}
-	c.signatures.write(file, path, signature)
+	return signature, true
 }
 
 // write publishes one computed signature through the descriptor that owns the file. The snapshot
@@ -239,10 +260,12 @@ func (c *StreamCopyer) refreshCacheEntry(file *os.File, path string, job *baseJo
 // bind the hash to a version it never described. Every failure is an aggregate warning, because a
 // cache that cannot store an entry never fails the item that computed it.
 func (c *signatureCache) write(file *os.File, path string, signature CachedSignature) {
-	// Publish the item's facts directly; unsupported attributes remain a no-op.
-	if err := writeManagedXattr(file, encodeCachedSignature(signature)); err != nil {
-		// A file system without the managed attribute namespace cannot hold the cache at all:
-		// that is a no-op, not a failure of this run.
+	c.recordWrite(path, writeManagedXattr(file, encodeCachedSignature(signature)))
+}
+
+func (c *signatureCache) recordWrite(path string, err error) {
+	// Descriptor and path publication share unsupported handling and aggregate warnings.
+	if err != nil {
 		if signatureXattrIgnorable(err) {
 			return
 		}

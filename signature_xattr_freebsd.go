@@ -44,6 +44,16 @@ func writeSignatureXattr(file *os.File, value []byte) error {
 	return err
 }
 
+func writeSignaturePathXattr(path string, value []byte) error {
+	// Keep the same user namespace and bounded encoded value as descriptor publication.
+	var data uintptr
+	if len(value) > 0 {
+		data = uintptr(unsafe.Pointer(&value[0]))
+	}
+	_, err := unix.ExtattrSetFile(path, unix.EXTATTR_NAMESPACE_USER, signatureXattrName, data, len(value))
+	return err
+}
+
 func isSignatureXattrMissing(err error) bool {
 	return errors.Is(err, unix.ENOATTR)
 }

@@ -169,6 +169,7 @@ func TestReportKeepsFailuresInsideTheFileRow(t *testing.T) {
 }
 
 func TestReportAccountsForEveryEntryAfterAGracefulStop(t *testing.T) {
+	// Select more work than the bounded data, result and event queues can finish before delivery.
 	root := t.TempDir()
 	sourceDir := filepath.Join(root, "source")
 	targetDir := filepath.Join(root, "target")
@@ -176,18 +177,17 @@ func TestReportAccountsForEveryEntryAfterAGracefulStop(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const total = 24
+	// Tiny files must still leave a backlog when asynchronous reporting delivers its first row.
+	const total = 1024
 	sources := make([]string, 0, total)
 	for index := 0; index < total; index++ {
 		name := fmt.Sprintf("%02d.txt", index)
 		sources = append(sources, writeEntryFile(t, sourceDir, name, []byte(strings.Repeat(name, 32))))
 	}
 
+	// The first terminal report cancels admission while bounded queues still retain later files.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	// The shell emits terminal rows only, so the stop trigger is the first row: one completed
-	// file has its row published while later files are still queued in the pipeline.
 	var once sync.Once
 	stopOnFirstRow := func(event acp.Event) {
 		if _, ok := event.(*acp.EventUpdateJob); ok {
@@ -195,8 +195,8 @@ func TestReportAccountsForEveryEntryAfterAGracefulStop(t *testing.T) {
 		}
 	}
 
-	// One result per delivery publishes every completed row immediately, and one writer
-	// serializes the copies, so the stop lands while the run is still working.
+	// Per-row delivery cancels while bounded admission still leaves queued work; asynchronous
+	// completion may already have admitted multiple files even with one data writer.
 	collector, runErr := runJobs(
 		t,
 		ctx,
@@ -220,6 +220,7 @@ func TestReportAccountsForEveryEntryAfterAGracefulStop(t *testing.T) {
 		t.Fatalf("report files = %d, want %d", len(shape.Files), len(sources))
 	}
 
+	// Every selected source has exactly one completed or abandoned row.
 	stopped, completed := 0, 0
 	rows := make(map[string]int, len(shape.Files))
 	for _, row := range shape.Files {

@@ -51,8 +51,7 @@ var openSourceContent = func(path string, mode ReadMode, info os.FileInfo) (item
 }
 
 // prepareItem opens the one descriptor an item owns and reads its stored hash through it. That
-// descriptor serves the whole item: the stored hash is read through it, the content is read
-// through it, and the computed hash is published through it before it closes.
+// descriptor supplies cached metadata and content once; computed cache refresh can follow closure by path.
 func (c *StreamCopyer) prepareItem(job *baseJob) *writeJob {
 	// An item needs its source when it writes somewhere or hashes content, and a targetless item
 	// reads its stored hash only where the policy reuses one.
@@ -69,7 +68,7 @@ func (c *StreamCopyer) prepareItem(job *baseJob) *writeJob {
 	if !needsContent {
 		mode = ReadBuffered
 	}
-	source, err := openSourceContent(job.path, mode, job.stat.info)
+	source, err := c.fs().Open(job.path, mode, job.stat.info)
 	if err != nil {
 		// A reuse-only item owns its descriptor for the stored hash alone, so a source it cannot
 		// open is a cache miss with a warning instead of an item failure.
@@ -85,7 +84,7 @@ func (c *StreamCopyer) prepareItem(job *baseJob) *writeJob {
 		// reporting stage instead of a side channel.
 		c.logf(logrus.ErrorLevel, "prepare source failed, source= %q, %v", job.path, err)
 		job.itemError = err
-		return newWriteJob(job, nil, false)
+		return newWriteJob(job, nil)
 	}
 
 	// Retain ownership until the prepared job takes it, including a cache lookup panic.
@@ -110,8 +109,9 @@ func (c *StreamCopyer) prepareItem(job *baseJob) *writeJob {
 	}
 
 	// Transfer the descriptor and indexed facts to the content stage.
-	wj := newWriteJob(job, source.reader, c.fromDevice.linear)
+	wj := newWriteJob(job, source.reader)
 	wj.source = source.file
+	wj.sourcePath = job.path
 	source.reader = nil
 	if !needsContent && !reused {
 		// An item that reused no stored hash has no hash at all and is not a cache hit. Its
@@ -126,7 +126,7 @@ func (c *StreamCopyer) prepareItem(job *baseJob) *writeJob {
 // without reading anything, and it is neither a cache hit nor a hash this run computed.
 func (c *StreamCopyer) noContentJob(job *baseJob) *writeJob {
 	job.setHash(nil)
-	wj := newWriteJob(job, nil, c.fromDevice.linear)
+	wj := newWriteJob(job, nil)
 	wj.skipContent = true
 	return wj
 }
@@ -139,11 +139,9 @@ func (c *StreamCopyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-c
 	// never release a reader before its consumer owns it.
 	drained := context.WithoutCancel(ctx)
 
-	// Disable read-ahead when a linear source must wait for each consumer.
+	// Bound opened sources through their complete transfer lifetime, independently of data lanes.
 	chanLen := 32
-	if c.fromDevice.linear {
-		chanLen = 0
-	}
+	slots := make(chan struct{}, transferLimit)
 
 	// Collect every preparation outcome so skipped jobs can still advance linear ordering.
 	completed := make(chan prepareResult, chanLen)
@@ -151,34 +149,50 @@ func (c *StreamCopyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-c
 	var workers sync.WaitGroup
 
 	// Prepare source readers with the configured source-device concurrency.
-	for idx := 0; idx < c.fromDevice.threads; idx++ {
+	for idx := 0; idx < min(max(c.fromDevice.threads, 8), transferLimit); idx++ {
 		workers.Add(1)
 		go c.wrap(drained, func() {
 			defer workers.Done()
 
 			// Consume indexed jobs until source exhaustion. A stopped pipeline drains its
 			// input, so no accepted item is dropped.
-			for job := range indexed {
-				// An item that was already rejected while indexing needs no source.
-				if c.markUnstarted(ctx, job) {
-					if !c.sendPrepareResult(completed, prepareResult{order: job.order, job: newWriteJob(job, nil, false)}) {
-						return
-					}
-					continue
-				}
-
-				result := prepareResult{order: job.order}
-				if c.toDevice.linear {
-					result.release = make(chan struct{})
-				}
-
-				// Transfer the prepared item to the ordering stage before waiting on a linear
-				// source.
-				result.job = c.prepareItem(job)
-				if !c.sendPrepareResult(completed, result) {
+			for {
+				// Reserve admission before dequeue so an earlier job cannot wait behind later jobs.
+				select {
+				case slots <- struct{}{}:
+				case <-c.hardStop:
 					return
 				}
-				if !result.job.waitConsumed() {
+				// An idle reservation owns no job and must return its slot on exhaustion or failure.
+				var job *baseJob
+				select {
+				case next, ok := <-indexed:
+					if !ok {
+						<-slots
+						return
+					}
+					job = next
+				case <-c.hardStop:
+					<-slots
+					return
+				}
+				result := prepareResult{order: job.order, release: make(chan struct{})}
+				transferred := false
+				func() {
+					defer func() {
+						if !transferred {
+							<-slots
+						}
+					}()
+					if c.markUnstarted(ctx, job) {
+						result.job = newWriteJob(job, nil)
+					} else {
+						result.job = c.prepareItem(job)
+					}
+					result.job.release = func() { <-slots }
+					transferred = true
+				}()
+				if !c.sendPrepareResult(completed, result) {
 					return
 				}
 			}
@@ -226,6 +240,7 @@ func (result prepareResult) releaseWorker() {
 func (result prepareResult) finish() {
 	if result.job != nil {
 		result.job.finishSource()
+		result.job.releaseSlot()
 	}
 	result.releaseWorker()
 }
@@ -243,14 +258,16 @@ func (c *StreamCopyer) forwardPrepared(
 		}
 	}()
 
-	// Random targets retain completion-order concurrency.
-	if !c.toDevice.linear {
+	// Concurrent random devices retain completion-order preparation.
+	serial := c.fromDevice.threads == 1 && c.toDevice.threads == 1
+	if !c.toDevice.linear && !c.fromDevice.linear && !serial {
 		for result := range completed {
 			if result.job == nil {
 				continue
 			}
 			select {
 			case prepared <- result.job:
+				result.releaseWorker()
 			case <-c.hardStop:
 				result.finish()
 				return
@@ -259,7 +276,7 @@ func (c *StreamCopyer) forwardPrepared(
 		return
 	}
 
-	// A bounded reorder buffer feeds the linear writer in original request order.
+	// A bounded reorder buffer retains the request order of formerly serialized devices.
 	next := uint64(0)
 	pending := make(map[uint64]prepareResult, c.fromDevice.threads)
 	defer func() {

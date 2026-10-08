@@ -25,6 +25,10 @@ func writeSignatureXattr(file *os.File, value []byte) error {
 	return unix.Fsetxattr(int(file.Fd()), signatureXattrName, value, 0)
 }
 
+func writeSignaturePathXattr(path string, value []byte) error {
+	return unix.Setxattr(path, signatureXattrName, value, 0)
+}
+
 func isSignatureXattrMissing(err error) bool {
 	return isNoAttrErr(err)
 }

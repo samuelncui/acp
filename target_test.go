@@ -12,6 +12,82 @@ import (
 	"time"
 )
 
+func TestLinearTargetCapacityEstimateBoundaries(t *testing.T) {
+	observationErr := errors.New("capacity observation failed")
+	for _, tt := range []struct {
+		name      string
+		content   string
+		available int64
+		queryErr  error
+		wantCalls int
+	}{
+		{name: "equal capacity", content: "data", available: 4, wantCalls: 1},
+		{name: "empty file", queryErr: observationErr},
+		{name: "observation failure", content: "data", queryErr: observationErr, wantCalls: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			// Observe capacity before creating even the target directory, without allocating large fixtures.
+			root := t.TempDir()
+			source := writeSourceFile(t, root, "source", []byte(tt.content))
+			parent := filepath.Join(root, "destination")
+			target := filepath.Join(parent, "target")
+			item := newFixtureItem(source, target)
+			copyer, err := NewStream(context.Background(), newStreamFixture(item).onResults,
+				SetToDevice(LinearDevice(true)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			copyer.getDevice = func(string) (string, error) { return root, nil }
+			calls := 0
+			copyer.availableSpace = func(device string) (int64, error) {
+				calls++
+				if device != root {
+					t.Errorf("capacity device = %q, want %q", device, root)
+				}
+				if _, err := os.Stat(parent); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("target directory exists before capacity observation: %v", err)
+				}
+				return tt.available, tt.queryErr
+			}
+
+			// Use real source metadata so permitted writes complete through the ordinary target lifecycle.
+			if err := copyer.Submit(item); err != nil {
+				t.Error(err)
+			}
+			if err := copyer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := copyer.Wait(); err != nil {
+				t.Fatal(err)
+			}
+
+			// Equal capacity and empty files complete; observation errors retain their original identity.
+			result, err := item.terminal(t)
+			if err != nil || len(result.Targets) != 1 || result.Targets[0].Path != target {
+				t.Fatalf("unexpected result: %+v / %v", result, err)
+			}
+			if calls != tt.wantCalls || copyer.linearTargetStopped() {
+				t.Fatalf("capacity calls = %d, want %d; stopped = %t", calls, tt.wantCalls, copyer.linearTargetStopped())
+			}
+			if tt.queryErr != nil && tt.wantCalls > 0 {
+				if !errors.Is(result.Targets[0].Err, observationErr) || errors.Is(result.Targets[0].Err, ErrTargetNoSpace) {
+					t.Fatalf("observation error = %v", result.Targets[0].Err)
+				}
+				if _, err := os.Stat(parent); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("observation failure created output directory: %v", err)
+				}
+				return
+			}
+			if result.Targets[0].Err != nil {
+				t.Fatal(result.Targets[0].Err)
+			}
+			if content, err := os.ReadFile(target); err != nil || string(content) != tt.content {
+				t.Fatalf("target content = %q / %v, want %q", content, err, tt.content)
+			}
+		})
+	}
+}
+
 func TestCopyRejectsSourceAliasesBeforeModification(t *testing.T) {
 	for _, mode := range []ReadMode{ReadBuffered, ReadMapped} {
 		for _, alias := range []string{"same path", "hardlink", "symlink"} {
@@ -150,7 +226,7 @@ func TestSourceDescriptorClosesWhenCacheOperationPanics(t *testing.T) {
 			// Inject a panic after the item has acquired its real source descriptor.
 			root := t.TempDir()
 			source := writeSourceFile(t, root, "source", []byte("cache panic fixture"))
-			oldRead, oldWrite := readManagedXattr, writeManagedXattr
+			oldRead, oldWrite := readManagedXattr, writeManagedPathXattr
 			sentinel := errors.New("cache operation panic")
 			var opened *os.File
 			policy := HashCachedOnly
@@ -158,10 +234,10 @@ func TestSourceDescriptorClosesWhenCacheOperationPanics(t *testing.T) {
 				readManagedXattr = func(file *os.File) ([]byte, error) { opened = file; panic(sentinel) }
 			} else {
 				policy = HashReadRefresh
-				readManagedXattr = func(file *os.File) ([]byte, error) { return nil, errSignatureXattrUnsupported }
-				writeManagedXattr = func(file *os.File, value []byte) error { opened = file; panic(sentinel) }
+				readManagedXattr = func(file *os.File) ([]byte, error) { opened = file; return nil, errSignatureXattrUnsupported }
+				writeManagedPathXattr = func(string, []byte) error { panic(sentinel) }
 			}
-			t.Cleanup(func() { readManagedXattr, writeManagedXattr = oldRead, oldWrite })
+			t.Cleanup(func() { readManagedXattr, writeManagedPathXattr = oldRead, oldWrite })
 			item := newFixtureItem(source)
 			err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, WithHashPolicy(policy))
 			if !errors.Is(err, sentinel) {

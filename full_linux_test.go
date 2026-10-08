@@ -48,24 +48,24 @@ func TestRunMapsDeviceFullToTargetNoSpace(t *testing.T) {
 }
 
 func TestDeviceFullWriteFailureDrainsQueuedBuffers(t *testing.T) {
-	// A refusing device fails the target while the producer still feeds the writer, which is the
-	// path that must release every queued read buffer.
+	// A refusing device fails despite an optimistic estimate while the producer still feeds buffers.
 	trackChunkPool(t)
-
 	root := t.TempDir()
 	target := filepath.Join(root, "target")
 	if err := os.Symlink("/dev/full", target); err != nil {
 		t.Fatal(err)
 	}
 
+	// A linear target writes without preallocation; only the actual write discovers ENOSPC.
 	size := int64(batchSize) * 4
 	readErr := errors.New("read failed")
 	item := newFixtureItem(filepath.Join(root, "source"), target)
-	// A linear target writes without pre-allocating, so the device's ENOSPC arrives while the
-	// producer still has buffers queued, which is the path under test.
 	copyer := newTestStream(t, Overwrite(true), SetToDevice(LinearDevice(true)))
-	// The push engine reports every outcome through the results callback, so the fixture is the
-	// observer of this stage-level run.
+	queries := 0
+	copyer.availableSpace = func(string) (int64, error) {
+		queries++
+		return size * 2, nil
+	}
 	fixture := newStreamFixture(item)
 	copyer.onResults = fixture.onResults
 	job := newWriteJob(&baseJob{
@@ -74,12 +74,38 @@ func TestDeviceFullWriteFailureDrainsQueuedBuffers(t *testing.T) {
 		path:    filepath.Join(root, "source"),
 		stat:    &stat{size: size, mode: 0o644},
 		targets: []string{target},
-	}, &failingContentReader{err: readErr, batches: 4}, false)
+	}, &failingContentReader{err: readErr, batches: 4})
 
-	// The writer must fail, release its queued buffers, and let the pipeline return.
+	// Queue later prepared items before starting the copy stage, avoiding scheduler-dependent prefetch.
+	jobs := []*writeJob{job}
+	var readers []*failingContentReader
+	for _, name := range []string{"later-1", "later-2"} {
+		later := newFixtureItem(filepath.Join(root, name+"-source"), filepath.Join(root, name))
+		fixture.add(later)
+		reader := &failingContentReader{err: readErr}
+		readers = append(readers, reader)
+		jobs = append(jobs, newWriteJob(&baseJob{
+			copyer: copyer, item: later, path: later.source,
+			stat: &stat{size: 1, mode: 0o644}, targets: later.targets,
+		}, reader))
+	}
+	prepared := make(chan *writeJob, len(jobs))
+	for _, job := range jobs {
+		spec, err := copyer.indexTarget(job.targets[0], nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		job.outputs = []targetSpec{spec}
+		prepared <- job
+	}
+	close(prepared)
+
+	// The writer must fail, release queued buffers, and report every accepted item exactly once.
 	done := make(chan error, 1)
 	go func() {
-		done <- runWriteJob(copyer, job)
+		copyed := copyer.copy(context.Background(), prepared)
+		runResults(copyer, copyed)
+		done <- copyer.Wait()
 	}()
 	select {
 	case err := <-done:
@@ -90,12 +116,28 @@ func TestDeviceFullWriteFailureDrainsQueuedBuffers(t *testing.T) {
 		t.Fatal("the pipeline deadlocked while draining a full target")
 	}
 
+	// The estimate is not a guarantee: retain ENOSPC and stop before any later reader or output starts.
 	result, terminalErr := item.terminal(t)
 	if terminalErr != nil {
 		t.Fatalf("an item whose targets failed must still complete: %v", terminalErr)
 	}
-	if len(result.Targets) != 1 || !errors.Is(result.Targets[0].Err, ErrTargetNoSpace) {
-		t.Fatalf("target outcome = %#v, want %v", result.Targets, ErrTargetNoSpace)
+	if len(result.Targets) != 1 || !errors.Is(result.Targets[0].Err, ErrTargetNoSpace) ||
+		!errors.Is(result.Targets[0].Err, syscall.ENOSPC) {
+		t.Fatalf("target outcome = %#v, want ENOSPC and %v", result.Targets, ErrTargetNoSpace)
+	}
+	if queries != 1 || !copyer.linearTargetStopped() {
+		t.Fatalf("capacity queries = %d; stopped = %t", queries, copyer.linearTargetStopped())
+	}
+	for i, later := range jobs[1:] {
+		if _, err := later.item.(*fixtureItem).terminal(t); !errors.Is(err, ErrTargetNoSpace) {
+			t.Errorf("prefetched item error = %v, want %v", err, ErrTargetNoSpace)
+		}
+		if later.reader != nil || !later.writeTime.IsZero() {
+			t.Errorf("prefetched item was started or retained its reader: reads=%d, job=%+v", readers[i].reads, later)
+		}
+		if _, err := os.Stat(later.targets[0]); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("prefetched target was created: %v", err)
+		}
 	}
 }
 
@@ -183,7 +225,7 @@ func TestFullVolumePreallocationReportsNoSpace(t *testing.T) {
 		path:    input,
 		stat:    &stat{size: size, mode: 0o644},
 		targets: []string{target},
-	}, io.NopCloser(bytes.NewReader(make([]byte, size))), false)
+	}, io.NopCloser(bytes.NewReader(make([]byte, size))))
 
 	// A refused target is an item outcome, not a pipeline failure.
 	if err := runWriteJob(copyer, job); err != nil {

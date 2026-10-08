@@ -19,17 +19,54 @@ changes. Files may change between runs.
 | Stage | Responsibility |
 | --- | --- |
 | `index` | Evaluate each needed `Item` method once, collect source facts (reusing available enumeration metadata), and resolve target paths and devices. Validate source/target aliases and overwrite rules before any target mutation. Pass the source facts unchanged to later stages. |
-| `prepare` | Open the source once when content or a cached hash is needed. Read the stored signature as required by the hash policy through that descriptor. |
+| `prepare` | Open the source once when content or a cached hash is needed. Read the stored signature as required by the hash policy through that descriptor. Reserve a bounded file lifetime before dequeue; preparation does not read content ahead itself. |
 | `copy` | Read content once and, when enabled, compute one hash while fanning out to the targets. Complete ordinary-file metadata, cache work, synchronization and closure before final replacement; device nodes use direct output. |
 | `results` | Form one `Result` per accepted item and deliver it through one callback goroutine. Fatal pipeline failures are the exception to per-item completion; see [delivery and lifecycle](#delivery-and-lifecycle). |
 
 Indexed source facts are immutable; content-byte progress is tracked separately.
 
+Content streams through shared immutable chunks. Hashing and writing consume independent
+references in parallel; each source is read once and each enabled digest is computed once.
+Random targets have independent bounded consumers of the same bytes. Linear source data reads
+remain ordered through EOF, then source Close runs independently of the next read. A linear
+target has one application Write lane: the next file may start after the previous file's last
+Write, while target Close, hash completion and metadata/publication settle asynchronously.
+This permits application overlap; the filesystem and device still decide physical scheduling.
+
+The per-run pool allocates lazily, with at most 512 backing buffers of 1 MiB (512 MiB of content
+backing, not a total RSS limit). After all consumers and completion workers exit, backing returns
+to the shared reusable pool with no reference to the completed stream. Eight credits are reserved for the ordered foreground file.
+For linear targets, reads stay within the next 512 MiB from the writer's consumed frontier;
+this is an upper bound, not a guarantee that the window fills. Each tiny file still occupies a
+1 MiB backing, and the 256 full file lifetimes also include pending completion and result delivery.
+Hash queues and each random-target queue hold four chunk references; file write queues hold
+references sized to the file prefix, at most 512. References share the global backing budget.
+
+Configured source threads bound actual Read calls; configured target threads bound concurrent
+file data writers. Linear devices force their corresponding thread count to one. Preparation
+uses `min(max(source threads, 8), 256)` workers. Ordered reads reserve an opportunity for the
+earliest unfinished source; that reservation advances at source EOF independently of Write and
+Close, including with one source thread. Workers release Read permits before waiting on queues.
+Random-target files reserve their writer permit in dispatch order before reading, so future files
+cannot consume all backing while the active writers need it. File-lifetime admission is reserved before
+job dequeue, so later preparation cannot take the required head's slot. Open descriptors scale
+with admitted files and their target counts, rather than with Read permits alone.
+`WithReadBuffer` continues to count input items, independently of these content limits.
+
 ### Target completion
 
+Random ordinary outputs complete metadata, Sync and Close before rename. Linear outputs omit
+per-file Sync and Close independently after data writing; metadata/cache work on their owned
+temporary paths follows closure. Distinct paths may publish concurrently; linear outputs to the
+same resolved path preserve publication order, including equivalent relative and absolute names.
+Results keep the caller's original target names, and the exclusive-rename fallback remains in force.
+A late linear Close or metadata error stops future admission once observed; it cannot retract
+already started writes. Results retain each started item's actual outcome, and completion waits
+for all source/target Close, hash, cache and publication dependencies.
+
 Ordinary targets use an exclusively created `.tmp_*` file beside the resolved final path. The
-old target remains in place while ACP writes the new file; the rename happens only after the
-copy stage completes its other work. Success is reported after replacement, using the final
+old target remains in place while ACP writes the new file; the rename happens only after that
+file's content, hash, metadata and required closure complete. Success is reported after replacement, using the final
 target path. A failed copy cleans up only its owned temporary file and retains cleanup errors
 alongside the primary error. ACP never deletes the original to work around a rename failure.
 
@@ -54,7 +91,14 @@ Device nodes are written directly, without rename or metadata/cache changes, and
 partial output after failure. Linear writers retain request order and perform neither
 preallocation nor per-file sync. Ordinary non-linear files retain the allocation and sync
 policy described under [platform behavior](#platform-behavior), with no free-space estimate.
-A positive-size linear target gets one fresh free-space estimate immediately before writing.
+Linear targets check an advisory free-space estimate before output creation. One observation
+can cover at most 64 consecutive single-output files of at most 1 MiB each on the same mount;
+each admission debits its logical size, without crediting failed-output cleanup. Below 64 MiB
+of estimated remaining space, or for larger files and multiple outputs, each positive-size
+target gets a fresh observation. Empty targets skip the query and invalidate the sample.
+Equality permits the write. An observation failure fails that target without creating output.
+This estimate reserves nothing and cannot account for filesystem or media overhead, so a
+passing estimate does not guarantee that the write will fit.
 Actual no-space and read-only errors stop the affected device and retain `ErrTargetNoSpace` and
 `ErrTargetDropToReadonly`; `ErrTargetIO` remains an individual target failure.
 
@@ -280,8 +324,11 @@ when refresh is enabled, without reading or invalidating an old one.
 The target entry is written before restoring restrictive permissions; all metadata is complete
 before replacement.
 
-Cache operations use the descriptors that read or wrote the content, finish before those
-descriptors close, and never reopen a path. The managed key is excluded from ordinary xattr
+Source cache lookup uses its content descriptor. Source refresh runs after hash and source Close
+through the stable source path; a closed linear output uses its owned temporary path. Random
+output cache work uses its still-open descriptor before Sync and Close. Platforms may reopen
+these paths for metadata operations without rereading content. Rewrite waits for source cache
+and closure before replacing its source. The managed key is excluded from ordinary xattr
 copying. Cache diagnostics are aggregated in `EventSignatureCacheSummary`; they never become
 copy or `Wait` errors. A filesystem without the managed attribute namespace stores nothing:
 reads miss and writes are silent no-ops.

@@ -361,7 +361,7 @@ func TestACPCommandStopsGracefullyWithACompleteReport(t *testing.T) {
 	// One file large enough that its copy is still in flight when the signal arrives, and
 	// many files behind it, so the stop has to account for queued work.
 	large := "0000-large.bin"
-	if err := os.WriteFile(filepath.Join(source, large), bytes.Repeat([]byte{'x'}, 16<<20), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(source, large), bytes.Repeat([]byte{'x'}, 64<<20), 0o644); err != nil {
 		t.Fatalf("write large source file: %v", err)
 	}
 	const small = 40
@@ -385,12 +385,11 @@ func TestACPCommandStopsGracefullyWithACompleteReport(t *testing.T) {
 	}
 	defer func() { _ = command.Process.Kill() }()
 
-	// The target file exists as soon as the copy stage owns the first item, so waiting for it
-	// proves the run has started and the signal lands while the copy is still in flight.
-	copied := filepath.Join(target, filepath.Base(source), large)
+	// A private staging file proves copying started before publication and completion.
+	copied := filepath.Join(target, filepath.Base(source), ".tmp_*")
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		if _, err := os.Stat(copied); err == nil {
+		if staged, _ := filepath.Glob(copied); len(staged) > 0 {
 			break
 		}
 		if time.Now().After(deadline) {

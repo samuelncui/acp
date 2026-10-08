@@ -31,6 +31,9 @@ BENCHMARKS = (
     "BenchmarkRefreshSignatureUnchanged", "BenchmarkRefreshSignatureChanged",
     "BenchmarkCopyWorkload/LargeOneTarget", "BenchmarkCopyWorkload/LargeThreeTargets",
     "BenchmarkCopyWorkload/SmallOneTarget", "BenchmarkCopyWorkload/SmallThreeTargets",
+    "BenchmarkCopyWorkload/LinearSmallBuffered", "BenchmarkCopyWorkload/LinearSmallMapped",
+    "BenchmarkCopyWorkload/LinearLargeBuffered", "BenchmarkCopyWorkload/LinearLargeMapped",
+    "BenchmarkCopyWorkload/LinearMixedBuffered", "BenchmarkCopyWorkload/LinearMixedMapped",
 )
 METRICS = ("ns/op", "B/op", "allocs/op")
 SIDES = ("baseline", "candidate")

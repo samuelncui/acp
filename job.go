@@ -173,48 +173,32 @@ type writeJob struct {
 	*baseJob
 	reader io.ReadCloser
 
-	// source is the descriptor this item owns: the reader that closes it, and the file the item
-	// reads its stored hash through and publishes its computed one through. It is nil for a job
-	// that opened no source.
-	source *os.File
+	release  func()
+	slotOnce sync.Once
 
-	consumed   chan struct{}
+	// source is the descriptor this item owns: the reader that closes it, and the file the item
+	// reads its stored hash through. Computed cache publication can follow Close by path. It is nil for a job
+	// that opened no source.
+	source     *os.File
+	sourcePath string
+
 	sourceOnce sync.Once
 	sourceErr  error
-
-	// hardStop ends the wait for a consumer when the pipeline fails fatally.
-	hardStop <-chan struct{}
 
 	// skipContent marks an item whose policy never reads the source content.
 	skipContent bool
 }
 
-func newWriteJob(job *baseJob, src io.ReadCloser, waitConsumed bool) *writeJob {
-	// The write stage adds resource ownership; all source facts remain with the indexed job.
-	j := &writeJob{
-		baseJob: job,
-		reader:  src,
-	}
-	if job != nil && job.copyer != nil {
-		j.hardStop = job.copyer.hardStop
-	}
-
-	// Linear sources hand their next reader over only after this one is consumed.
-	if waitConsumed {
-		j.consumed = make(chan struct{})
-	}
-	return j
+func newWriteJob(job *baseJob, src io.ReadCloser) *writeJob {
+	return &writeJob{baseJob: job, reader: src}
 }
 
 func (wj *writeJob) finishSource() error {
-	// Clear descriptor ownership before closing, and notify a linear producer exactly once.
+	// Clear descriptor ownership and close exactly once, independently of the data lane.
 	wj.sourceOnce.Do(func() {
 		reader := wj.reader
 		wj.reader = nil
 		wj.source = nil
-		if wj.consumed != nil {
-			defer close(wj.consumed)
-		}
 		if reader != nil {
 			wj.sourceErr = reader.Close()
 		}
@@ -222,19 +206,12 @@ func (wj *writeJob) finishSource() error {
 	return wj.sourceErr
 }
 
-// waitConsumed waits until the copy stage owns the reader. A graceful stop never releases the
-// wait, because the consumer is what reports the item; only a fatal pipeline failure ends it.
-func (wj *writeJob) waitConsumed() bool {
-	if wj.consumed == nil {
-		return true
-	}
-
-	select {
-	case <-wj.consumed:
-		return true
-	case <-wj.hardStop:
-		return false
-	}
+func (wj *writeJob) releaseSlot() {
+	wj.slotOnce.Do(func() {
+		if wj.release != nil {
+			wj.release()
+		}
+	})
 }
 
 // Job is one report row in the af05f05c shape: Base is the directory the source-relative Path

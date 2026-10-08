@@ -18,6 +18,10 @@ func writeSignatureXattr(*os.File, []byte) error {
 	return errSignatureXattrUnsupported
 }
 
+func writeSignaturePathXattr(string, []byte) error {
+	return errSignatureXattrUnsupported
+}
+
 func isSignatureXattrMissing(err error) bool {
 	return false
 }

@@ -134,6 +134,20 @@ func runWriteJob(copyer *StreamCopyer, job *writeJob) error {
 	return copyer.Wait()
 }
 
+// write drives one synthetic reader through the same transfer implementation as the stream.
+func (c *StreamCopyer) write(ctx context.Context, job *writeJob, out chan<- *baseJob, cntr *counter, exhausted mapset.Set[string]) {
+	t := newTransfer(c, job, newReadAhead(c), 0)
+	t.reservePublications(newPublicationOrder())
+	t.run(ctx, out, make(chan struct{}, 1), cntr, exhausted)
+}
+
+// acquireChunk supplies a standalone consumer fixture without a second production pool path.
+func acquireChunk() *chunkBuffer {
+	chunk := chunkPool.New().(*chunkBuffer)
+	chunk.refs = 1
+	return chunk
+}
+
 func TestRunCopiesEmptyFile(t *testing.T) {
 	tests := []struct {
 		name string
@@ -199,7 +213,7 @@ func TestWriteReportsTargetlessReadFailureAsItemFailure(t *testing.T) {
 		item:   item,
 		path:   "source",
 		stat:   &stat{size: 1},
-	}, &failingReadCloser{err: readErr}, false)
+	}, &failingReadCloser{err: readErr})
 	completed := make(chan *baseJob, 1)
 
 	// An item with no target outcome to report could not be processed at all.
@@ -244,7 +258,7 @@ func TestWriteKeepsTargetOutcomesWhenTheReadAlsoFails(t *testing.T) {
 		path:    filepath.Join(root, "source"),
 		stat:    &stat{size: 1, mode: 0o644},
 		targets: []string{refused},
-	}, &failingReadCloser{err: readErr}, false)
+	}, &failingReadCloser{err: readErr})
 
 	if err := runWriteJob(copyer, job); err != nil {
 		t.Fatalf("pipeline failed: %v", err)
@@ -266,26 +280,6 @@ func TestWriteKeepsTargetOutcomesWhenTheReadAlsoFails(t *testing.T) {
 	}
 }
 
-func TestWriteJobWaitConsumedEndsOnConsumptionOrHardStop(t *testing.T) {
-	copyer := newTestStream(t)
-
-	// Model a linear source whose reader has already moved to the Copy stage. A stopped
-	// caller must not release the wait: the consumer owns the reader and is what reports the
-	// item, so only consumption ends the wait.
-	consumed := newWriteJob(&baseJob{copyer: copyer}, new(trackingReadCloser), true)
-	consumed.finishSource()
-	if !consumed.waitConsumed() {
-		t.Fatal("waitConsumed() = false after the consumer took the reader")
-	}
-
-	// A fatal pipeline failure is the other exit, so the wait can never deadlock a stop.
-	copyer.stopHard()
-	blocked := newWriteJob(&baseJob{copyer: copyer}, new(trackingReadCloser), true)
-	if blocked.waitConsumed() {
-		t.Fatal("waitConsumed() = true after a fatal pipeline failure")
-	}
-}
-
 func TestCopyReportsPrefetchedItemsAfterCancellation(t *testing.T) {
 	// Queue one prefetched reader before starting an already-canceled Copy stage.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -296,7 +290,7 @@ func TestCopyReportsPrefetchedItemsAfterCancellation(t *testing.T) {
 	item := newFixtureItem("source")
 	fixture := newStreamFixture(item)
 	copyer.onResults = fixture.onResults
-	job := newWriteJob(&baseJob{copyer: copyer, item: item, path: "source"}, reader, true)
+	job := newWriteJob(&baseJob{copyer: copyer, item: item, path: "source"}, reader)
 	prepared := make(chan *writeJob, 1)
 	prepared <- job
 	close(prepared)
@@ -309,9 +303,6 @@ func TestCopyReportsPrefetchedItemsAfterCancellation(t *testing.T) {
 	}
 	if reader.closed != 1 {
 		t.Fatalf("reader closed %d times, want 1", reader.closed)
-	}
-	if !job.waitConsumed() {
-		t.Fatal("linear source was not notified that the reader was consumed")
 	}
 	if result, err := item.terminal(t); !errors.Is(err, context.Canceled) {
 		t.Fatalf("terminal outcome = %#v / %v, want %v", result, err, context.Canceled)
@@ -327,7 +318,7 @@ func TestWriteReturnsAfterHardStopWithoutPublishing(t *testing.T) {
 		copyer: copyer,
 		item:   newFixtureItem("source"),
 		stat:   &stat{},
-	}, reader, false)
+	}, reader)
 	done := make(chan struct{})
 	go func() {
 		copyer.write(context.Background(), job, make(chan *baseJob), new(counter), mapset.NewSet[string]())
@@ -403,7 +394,7 @@ func TestWriteFailureDrainsBuffersAndTargets(t *testing.T) {
 		path:    filepath.Join(root, "source"),
 		stat:    &stat{size: batchSize, mode: 0o644},
 		targets: targets,
-	}, &failingContentReader{err: readErr, batches: 1}, false)
+	}, &failingContentReader{err: readErr, batches: 1})
 
 	// The pipeline must drain every writer, report exactly one outcome, and return.
 	done := make(chan error, 1)
@@ -511,7 +502,7 @@ func TestLinearTargetStopsWhenDiskUsageEstimateIsInsufficient(t *testing.T) {
 		copyer: copyer, item: item, path: "source",
 		stat: &stat{size: size}, targets: []string{target},
 		outputs: []targetSpec{{name: target, path: target, device: root}},
-	}, io.NopCloser(bytes.NewReader(nil)), false)
+	}, io.NopCloser(bytes.NewReader(nil)))
 	completed := make(chan *baseJob, 1)
 
 	// The hardware-backed estimate must stop a linear target before the oversized write starts.
@@ -583,27 +574,25 @@ func TestSubmitRejectsANilItem(t *testing.T) {
 // TestStreamCopyReleasesAChunkHandoffAfterHardStop pins the fatal-failure rule for the read
 // handoff: a stage that stopped consuming cannot leave the reader blocked on a chunk.
 func TestStreamCopyReleasesAChunkHandoffAfterHardStop(t *testing.T) {
+	// A real transfer producer must relinquish its borrowed buffer when its receiver stops.
 	trackChunkPool(t)
-
 	copyer := newTestStream(t)
-	// The consumer never drains, so the reader blocks on its handoff until the hard stop.
-	consumers := []chan *chunkBuffer{make(chan *chunkBuffer)}
-	done := make(chan error, 1)
-	go func() {
-		_, err := copyer.streamCopy(consumers, io.NopCloser(strings.NewReader("fixture")), new(int64))
-		done <- err
-	}()
-
+	job := newWriteJob(&baseJob{copyer: copyer, stat: &stat{size: 7}}, io.NopCloser(strings.NewReader("fixture")))
+	transfer := newTransfer(copyer, job, newReadAhead(copyer), 0)
+	transfer.chunks = make(chan *chunkBuffer)
+	go copyer.wrap(context.Background(), transfer.readContent)
 	time.Sleep(50 * time.Millisecond)
 	copyer.stopHard()
 
+	// Both content completion and asynchronous source closure must finish before inspection.
 	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("streamCopy() error = nil, want the pipeline failure")
-		}
+	case <-transfer.readDone:
 	case <-time.After(5 * time.Second):
-		t.Fatal("streamCopy stayed blocked on a chunk handoff after a hard stop")
+		t.Fatal("source stayed blocked on a chunk handoff")
+	}
+	<-transfer.sourceDone
+	if transfer.readErr == nil {
+		t.Fatal("missing hard-stop read error")
 	}
 }
 
