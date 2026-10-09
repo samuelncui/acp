@@ -50,8 +50,8 @@ type StreamCopyer struct {
 	callbackStopErr   error
 	getDevice         func(in string) (string, error)
 	availableSpace    func(mountPoint string) (int64, error)
-	targetDirs        map[string]string // Indexed parent paths; Submit is their sole owner.
-	linearSpace       spaceEstimate     // Owned by the single linear writer.
+	targetDirs        map[string]string         // Indexed parent paths; Submit is their sole owner.
+	linearSpace       map[string]*spaceEstimate // Owned by the single linear writer until shutdown.
 	linearTargetEnded uint32
 	signatures        *signatureCache
 	filesystem        transferFilesystem

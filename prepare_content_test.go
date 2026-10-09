@@ -140,7 +140,8 @@ func TestLinearCopyPreservesHashWhenTargetsRejectPreparation(t *testing.T) {
 		t.Fatal(err)
 	}
 	sentinel := errors.New("capacity observation failed")
-	copyer.availableSpace = func(string) (int64, error) { return 0, sentinel }
+	copyer.getDevice = func(string) (string, error) { return root, nil }
+	copyer.linearSpace = map[string]*spaceEstimate{root: {err: sentinel}}
 
 	// Fail before output creation and still finish the ordinary source lifecycle.
 	if err := copyer.Submit(item); err != nil {

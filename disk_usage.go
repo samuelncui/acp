@@ -1,11 +1,15 @@
 package acp
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/samuelncui/godf"
+	"github.com/sirupsen/logrus"
 )
 
 var (
@@ -31,51 +35,118 @@ type errorPair struct {
 	to   error
 }
 
-// A sample covers at most 64 single-output files of at most one copy chunk each.
-// Below that logical headroom, each positive-size target gets a fresh observation.
-const spaceSampleFiles = 64
+const spaceRefreshInterval = 5 * time.Second
 
+// The ordered writer owns the monitor map; each monitor shares only its cached observation.
+// No filesystem call runs while lock is held.
 type spaceEstimate struct {
-	device    string
+	lock      sync.Mutex
 	available int64
-	files     int
+	debited   int64
+	known     bool
+	err       error
+	stop      chan struct{}
+	done      chan struct{}
+}
+
+func (s *spaceEstimate) admit(size int64) error {
+	// Unknown capacity permits writing; a completed observation retains its failure identity.
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	if s.known && size > s.available {
+		return fmt.Errorf("%w, want=%d have=%d", ErrTargetNoSpace, size, s.available)
+	}
+
+	// Never refund failed output cleanup or lose admissions made during an in-flight query.
+	s.debited += size
+	if s.known {
+		s.available -= size
+	}
+	return nil
+}
+
+func (s *spaceEstimate) refresh(query func() (int64, error)) error {
+	// Start charging overlapping admissions before the blocking observation, outside the writer's lock.
+	s.lock.Lock()
+	s.debited = 0
+	s.lock.Unlock()
+	available, err := query()
+
+	// Publish one coherent result, conservatively charging admissions overlapping the query.
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	s.available = max(0, available-s.debited)
+	s.known, s.err = err == nil, err
+	return err
 }
 
 func (c *StreamCopyer) checkLinearSpace(job *writeJob, target targetSpec) error {
-	// Only consecutive small single-output items can reuse the last mount's estimate.
+	// Empty files neither need an observation nor consume another file's estimate.
 	size := job.stat.size
-	reuse := size > 0 && size <= batchSize && len(job.outputs) == 1
-	if !reuse {
-		c.linearSpace = spaceEstimate{}
-	}
 	if size <= 0 {
 		return nil
 	}
 
-	// Bound stale observations by both admitted file count and debited logical bytes.
-	sample := c.linearSpace
-	fresh := sample.files == 0 || sample.device != target.device ||
-		sample.files >= spaceSampleFiles || sample.available < spaceSampleFiles*batchSize
-	if fresh {
-		c.linearSpace = spaceEstimate{}
-		available, err := c.availableSpace(target.device)
-		if err != nil {
-			return err
-		}
-		sample = spaceEstimate{device: target.device, available: available}
+	// Each encountered mount has one serial polling worker for this stream's lifetime.
+	if c.linearSpace == nil {
+		c.linearSpace = make(map[string]*spaceEstimate)
 	}
-	if size > sample.available {
-		return fmt.Errorf("%w, want=%d have=%d", ErrTargetNoSpace, size, sample.available)
+	sample := c.linearSpace[target.device]
+	if sample == nil {
+		sample = &spaceEstimate{stop: make(chan struct{}), done: make(chan struct{})}
+		c.linearSpace[target.device] = sample
+		go c.pollSpace(target.device, sample)
 	}
+	return sample.admit(size)
+}
 
-	// Admission consumes estimated space even if the output later fails; never credit cleanup.
-	// This advisory logical estimate cannot account for allocation or metadata overhead.
-	if reuse {
-		sample.available -= size
-		sample.files++
-		c.linearSpace = sample
+func (c *StreamCopyer) pollSpace(device string, sample *spaceEstimate) {
+	// Completion follows panic recovery, so Wait also observes a failed polling worker.
+	defer close(sample.done)
+	c.wrap(context.Background(), func() {
+		// One query at a time bounds work even when statfs takes longer than the interval.
+		ticker := time.NewTicker(spaceRefreshInterval)
+		defer ticker.Stop()
+		query := func() (int64, error) { return c.availableSpace(device) }
+		for {
+			if err := sample.refresh(query); err != nil {
+				c.logf(logrus.WarnLevel, "refresh target capacity failed, mount=%q, err=%v", device, err)
+			}
+			select {
+			case <-sample.stop:
+				return
+			case <-c.hardStop:
+				return
+			case <-ticker.C:
+			}
+			// A pending tick must not start another query after shutdown was requested.
+			select {
+			case <-sample.stop:
+				return
+			case <-c.hardStop:
+				return
+			default:
+			}
+		}
+	})
+}
+
+func (c *StreamCopyer) stopSpaceMonitors() {
+	// Writers have drained before shutdown; stop every ticker before joining any blocked query.
+	for _, sample := range c.linearSpace {
+		if sample.stop != nil {
+			close(sample.stop)
+		}
 	}
-	return nil
+	for _, sample := range c.linearSpace {
+		if sample.done != nil {
+			<-sample.done
+		}
+	}
+	c.linearSpace = nil
 }
 
 // availableSpace reads filesystem capacity; ordinary targets rely on real allocation errors.

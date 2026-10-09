@@ -13,6 +13,7 @@ import (
 )
 
 func TestLinearTargetCapacityEstimateBoundaries(t *testing.T) {
+	// Completed observations keep admission and failure semantics independent of polling latency.
 	observationErr := errors.New("capacity observation failed")
 	for _, tt := range []struct {
 		name      string
@@ -48,6 +49,13 @@ func TestLinearTargetCapacityEstimateBoundaries(t *testing.T) {
 					t.Errorf("target directory exists before capacity observation: %v", err)
 				}
 				return tt.available, tt.queryErr
+			}
+
+			// Seed a finished observation to exercise cached admission deterministically.
+			if tt.content != "" {
+				sample := new(spaceEstimate)
+				_ = sample.refresh(func() (int64, error) { return copyer.availableSpace(root) })
+				copyer.linearSpace = map[string]*spaceEstimate{root: sample}
 			}
 
 			// Use real source metadata so permitted writes complete through the ordinary target lifecycle.

@@ -91,14 +91,18 @@ Device nodes are written directly, without rename or metadata/cache changes, and
 partial output after failure. Linear writers retain request order and perform neither
 preallocation nor per-file sync. Ordinary non-linear files retain the allocation and sync
 policy described under [platform behavior](#platform-behavior), with no free-space estimate.
-Linear targets check an advisory free-space estimate before output creation. One observation
-can cover at most 64 consecutive single-output files of at most 1 MiB each on the same mount;
-each admission debits its logical size, without crediting failed-output cleanup. Below 64 MiB
-of estimated remaining space, or for larger files and multiple outputs, each positive-size
-target gets a fresh observation. Empty targets skip the query and invalidate the sample.
-Equality permits the write. An observation failure fails that target without creating output.
-This estimate reserves nothing and cannot account for filesystem or media overhead, so a
-passing estimate does not guarantee that the write will fit.
+Linear targets check an advisory cached free-space estimate before output creation. Each mount
+gets an independent goroutine that samples immediately and refreshes every five seconds, with
+at most one query in flight. Writing never waits for a capacity query, including the first one:
+unknown capacity permits writing and relies on actual filesystem errors. Each positive-size
+admission debits its logical size; admissions overlapping a query are also deducted from the
+new observation. Empty targets skip the check, and equality permits the write. A completed
+observation failure fails subsequent positive-size targets until a successful refresh; the worker
+also logs that failure. Cleanup does not refund the estimate.
+This estimate reserves nothing and cannot account for ongoing writes, filesystem allocation,
+media buffering or overhead, so a passing estimate does not guarantee that the write will fit.
+`Close`/`Wait` stop and join the polling workers after copying drains. An in-flight filesystem
+capacity call cannot be cancelled and can delay shutdown, but never holds the cache lock.
 Actual no-space and read-only errors stop the affected device and retain `ErrTargetNoSpace` and
 `ErrTargetDropToReadonly`; `ErrTargetIO` remains an individual target failure.
 

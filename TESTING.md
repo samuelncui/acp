@@ -79,7 +79,7 @@ Use this inventory to select or update coverage; it is not a record of tests run
 | Metadata, hash policies, between-run cache staleness, cache warnings and descriptor use | `signature_test.go`, `signature_xattr_copy_test.go`, `cleanup_test.go` | Real cache copies in those tests; metadata and report hashes in library/command E2E |
 | Results, batching, cancellation, backpressure, linear ordering and event delivery | `item_test.go`, `stream_test.go`, `copy_test.go`, `opt_test.go` | Command interrupt, report and progress tests in `e2e_test.go` |
 | Panic handling, channel completion and resource release | `recover_test.go`, `copy_test.go`, `stream_test.go` | Caller callback/handler panic tests driving a real stream |
-| Independent cache initialization and filesystem error identities | `cache_test.go`, `fs_test.go`, `disk_usage_test.go`, `full_linux_test.go` | Real copies and Linux device/filled-volume cases |
+| Independent cache initialization, asynchronous capacity polling and filesystem error identities | `cache_test.go`, `fs_test.go`, `disk_usage_test.go`, `linear_space_test.go`, `full_linux_test.go` | Real copies with blocked capacity queries and Linux device/filled-volume cases |
 | JSON round trips, report keys, native path bytes and persisted input validation | `report_test.go`, `report_paths_test.go`, `cmd/acp/report_test.go`, `cmd/acp-rewrite/load_test.go`, rewrite path tests | Command report, exit-status and invalid-input tests |
 | Rewrite selection, hardlinks, pending work, saved history, persistence failure and resume | `cmd/acp-rewrite/main_test.go`, `cmd/acp-rewrite/repair_test.go` | `cmd/acp-rewrite/e2e_test.go` |
 | Mapped reader lifetime, EOF, bounds and platform advice | `mmap/mmap_test.go`, `mmap/mmap_linux_test.go` | Buffered/mapped copies and native platform runs |
@@ -210,8 +210,9 @@ Run Linux device and filled-volume tests on Linux. The filled-volume test uses d
 and skips if mounting is refused. Use actual device/allocation errors to verify error mapping and
 owned-output cleanup. Check the linear space estimate at the write-entry boundary.
 `copy_test.go` retains the insufficient-capacity check; `target_test.go` covers exact capacity,
-zero-size query avoidance and observation failure. `linear_space_test.go` covers bounded sample
-reuse, logical debits, mount changes and fresh observations at capacity boundaries.
+zero-size query avoidance and observation failure. `linear_space_test.go` covers nonblocking
+initial and periodic observations, logical debits, independent mounts, polling failures and
+worker shutdown.
 `full_linux_test.go` supplies an optimistic
 estimate before real `/dev/full` ENOSPC and checks that later prefetched items remain unprocessed.
 `cleanup_test.go` checks joined write, close and removal errors through the target result, while

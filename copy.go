@@ -75,6 +75,7 @@ func (c *StreamCopyer) copy(ctx context.Context, prepared <-chan *writeJob) <-ch
 			// Return backing only after all data, completion and cleanup owners have exited.
 			children.Wait()
 			ahead.close()
+			c.stopSpaceMonitors()
 			close(done)
 			<-reported
 			close(out)

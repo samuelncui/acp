@@ -136,6 +136,8 @@ func runWriteJob(copyer *StreamCopyer, job *writeJob) error {
 
 // write drives one synthetic reader through the same transfer implementation as the stream.
 func (c *StreamCopyer) write(ctx context.Context, job *writeJob, out chan<- *baseJob, cntr *counter, exhausted mapset.Set[string]) {
+	// Match the copy dispatcher's ownership of capacity workers for this standalone transfer.
+	defer c.stopSpaceMonitors()
 	t := newTransfer(c, job, newReadAhead(c), 0)
 	t.reservePublications(newPublicationOrder())
 	t.run(ctx, out, make(chan struct{}, 1), cntr, exhausted)
@@ -497,6 +499,7 @@ func TestLinearTargetStopsWhenDiskUsageEstimateIsInsufficient(t *testing.T) {
 		availableSpace: availableSpace,
 	}
 	copyer.toDevice.linear = true
+	copyer.linearSpace = map[string]*spaceEstimate{root: {known: true, available: usage.Available()}}
 	item := newFixtureItem("source", target)
 	job := newWriteJob(&baseJob{
 		copyer: copyer, item: item, path: "source",
@@ -505,7 +508,7 @@ func TestLinearTargetStopsWhenDiskUsageEstimateIsInsufficient(t *testing.T) {
 	}, io.NopCloser(bytes.NewReader(nil)))
 	completed := make(chan *baseJob, 1)
 
-	// The hardware-backed estimate must stop a linear target before the oversized write starts.
+	// A completed filesystem observation must stop a linear target before the oversized write starts.
 	copyer.write(context.Background(), job, completed, new(counter), mapset.NewSet[string]())
 	result := (<-completed).result()
 	if len(result.Targets) != 1 || !errors.Is(result.Targets[0].Err, ErrTargetNoSpace) {
