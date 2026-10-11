@@ -57,8 +57,13 @@ with admitted files and their target counts, rather than with Read permits alone
 
 Random ordinary outputs complete metadata, Sync and Close before rename. Linear outputs omit
 per-file Sync and Close independently after data writing; metadata/cache work on their owned
-temporary paths follows closure. Distinct paths may publish concurrently; linear outputs to the
-same resolved path preserve publication order, including equivalent relative and absolute names.
+temporary paths follows closure. Linear sources, linear targets and single-writer targets preserve
+publication order for the same resolved path, including equivalent relative and absolute names.
+Their completion keys also group case-folded, canonically equivalent Unicode names conservatively,
+so case or normalization aliases keep the same winner. On a case-sensitive filesystem this may
+order otherwise distinct outputs; their actual names and contents remain distinct. This key is
+not a filesystem identity test for every vendor-specific naming rule. Other keys publish independently;
+the copy data flow does not wait for these ordinary-file completion dependencies.
 Results keep the caller's original target names, and the exclusive-rename fallback remains in force.
 A late linear Close or metadata error stops future admission once observed; it cannot retract
 already started writes. Results retain each started item's actual outcome, and completion waits

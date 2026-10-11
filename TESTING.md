@@ -76,6 +76,7 @@ Use this inventory to select or update coverage; it is not a record of tests run
 | Input-method evaluation, reused source facts, target resolution and alias/overwrite validation | `item_test.go`, `stream_test.go`, `fs_test.go`, `target_test.go` | Public stream and shell copies in `library_e2e_test.go` |
 | Source ownership, one content pass/hash, read modes, empty files and multiple targets | `copy_test.go`, `item_test.go`, `fs_test.go` | Library and command E2E |
 | Staged replacement, failure preservation, final-path outcomes and owned temporary cleanup | `staged_target_test.go`, `target_test.go`, `internal/fileio/output_test.go`, `internal/fileio/temp_test.go` | Library/command E2E and rewrite failure/resume tests |
+| Ordered completion of native path aliases without blocking independent outputs | `publication_serial_test.go`, `pipeline_liveness_test.go` | Native case/decomposition and relative/absolute copies in `target_identity_test.go` |
 | Metadata, hash policies, between-run cache staleness, cache warnings and descriptor use | `signature_test.go`, `signature_xattr_copy_test.go`, `cleanup_test.go` | Real cache copies in those tests; metadata and report hashes in library/command E2E |
 | Results, batching, cancellation, backpressure, linear ordering and event delivery | `item_test.go`, `stream_test.go`, `copy_test.go`, `opt_test.go` | Command interrupt, report and progress tests in `e2e_test.go` |
 | Panic handling, channel completion and resource release | `recover_test.go`, `copy_test.go`, `stream_test.go` | Caller callback/handler panic tests driving a real stream |
@@ -131,6 +132,10 @@ Run one ordinary Go benchmark invocation per source with `-benchtime=1s -count=1
 across the fourteen maintained benchmark cases. Go calibrates iterations; do not force equal iteration
 counts or repeated whole-suite samples.
 Compare time, bytes/op and allocations/op, recording all raw values and percentage deltas.
+
+For changes to completion ordering, `go test -run '^$' -bench '^BenchmarkPublicationOrder$'
+-benchmem -count=1 .` isolates per-file key/dependency overhead for ASCII and Unicode names.
+It complements the copy workloads; it does not measure filesystem or Tape throughput.
 
 For rewrite persistence changes, also run `GOMAXPROCS=4 make bench-rewrite` once per source.
 Its 100-entry and 1,000-entry fixtures measure one state/report checkpoint pair using the same

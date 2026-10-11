@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"slices"
 	"sync"
 	"syscall"
 	"testing"
@@ -116,15 +117,15 @@ func TestSerialRandomTargetPreservesConflictingPublicationOrder(t *testing.T) {
 }
 
 func TestPublicationReleasesFailedAliasesAfterSourceCache(t *testing.T) {
-	// Failed outputs before and after a rewrite output retain their shared-path dependency chain.
+	// Case and decomposition aliases retain their failure chain around a rewrite output.
 	synctest.Test(t, func(t *testing.T) {
 		c := newTestStream(t, WithHashPolicy(HashOff), SetToDevice(DeviceThreads(1)))
 		job := preparedFixture(c, 0, 4096, "same-target", &generatedReader{remaining: 4096})
 		job.targets = []string{"first", "rewrite", "last"}
 		job.outputs = []targetSpec{
-			{name: "first", path: "same-target", device: "fixture"},
-			{name: "rewrite", path: "same-target", device: "fixture", output: &fileio.Output{}},
-			{name: "last", path: "same-target", device: "fixture"},
+			{name: "first", path: "CAF\u00c9", device: "fixture"},
+			{name: "rewrite", path: "cafe\u0301", device: "fixture", output: &fileio.Output{}},
+			{name: "last", path: "Caf\u00e9", device: "fixture"},
 		}
 		committed := false
 		c.filesystem = pipelineFilesystem{create: func(_ *writeJob, spec targetSpec) (transferOutput, error) {
@@ -147,13 +148,142 @@ func TestPublicationReleasesFailedAliasesAfterSourceCache(t *testing.T) {
 			targets := result.result().Targets
 			if len(targets) != 3 || targets[1].Err != nil ||
 				!errors.Is(targets[0].Err, ErrTargetIO) || !errors.Is(targets[2].Err, ErrTargetIO) {
-				t.Fatalf("alias outcomes: %+v", targets)
+				t.Errorf("alias outcomes: %+v", targets)
 			}
 		}
 		if count != 1 || !committed {
 			t.Fatalf("unfinished alias chain: count=%d committed=%t", count, committed)
 		}
 	})
+}
+
+func TestDirectAliasesWithinItemWaitOnlyForPrecedingItem(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		firstDirect bool
+		failFirst   bool
+	}{
+		{name: "ordinary-first"},
+		{name: "direct-first", firstDirect: true},
+		{name: "ordinary-create-failure", failFirst: true},
+		{name: "direct-create-failure", firstDirect: true, failFirst: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				// Keep an earlier device lifetime outstanding while the next item prepares aliases.
+				c := newTestStream(t, WithHashPolicy(HashOff), Overwrite(true),
+					SetFromDevice(LinearDevice(true)), SetToDevice(DeviceThreads(3)))
+				gate, holding := make(chan struct{}), make(chan struct{})
+				release := onceRelease(gate)
+				defer release()
+				created, committed := make(chan string, 3), make(chan string, 3)
+				c.filesystem = pipelineFilesystem{create: func(job *writeJob, spec targetSpec) (transferOutput, error) {
+					// Creation failures must release their ticket without stranding the direct sibling.
+					created <- spec.name
+					if spec.name == "first" && test.failFirst {
+						return nil, syscall.EIO
+					}
+					written := 0
+					return &serialPublicationOutput{
+						pipelineOutput: &pipelineOutput{write: func(data []byte) (int, error) {
+							written += len(data)
+							return len(data), nil
+						}},
+						sync: func() error {
+							if job.order == 0 {
+								close(holding)
+								<-gate
+							}
+							return nil
+						},
+						publish: func(bool) error {
+							if written != 4096 {
+								t.Errorf("target %q published %d bytes, want 4096", spec.name, written)
+							}
+							committed <- spec.name
+							return nil
+						},
+					}, nil
+				}}
+				preceding := preparedFixture(c, 0, 4096, "preceding", &generatedReader{remaining: 4096})
+				preceding.outputs[0].path, preceding.outputs[0].direct = "CAF\u00c9", true
+				siblings := preparedFixture(c, 1, 4096, "first", &generatedReader{remaining: 4096})
+				siblings.targets = []string{"first", "second"}
+				siblings.outputs = []targetSpec{
+					{name: "first", path: "cafe\u0301", device: "fixture", direct: test.firstDirect},
+					{name: "second", path: "Caf\u00e9", device: "fixture", direct: true},
+				}
+				prepared := make(chan *writeJob, 2)
+				prepared <- preceding
+				prepared <- siblings
+				close(prepared)
+				out := c.copy(context.Background(), prepared)
+				synctest.Wait()
+
+				// Ordinary creation can overlap, but neither direct sibling may open ahead of the predecessor.
+				select {
+				case <-holding:
+				default:
+					t.Error("preceding output did not reach its held completion")
+				}
+				creates := make(map[string]int)
+				for len(created) > 0 {
+					creates[<-created]++
+				}
+				wantFirst := 1
+				if test.firstDirect {
+					wantFirst = 0
+				}
+				if creates["preceding"] != 1 || creates["first"] != wantFirst || creates["second"] != 0 || len(committed) != 0 {
+					t.Errorf("premature direct creation or publication: creates=%v commits=%d", creates, len(committed))
+				}
+
+				// Once the prior item settles, both siblings must finish without waiting on their own item.
+				release()
+				synctest.Wait()
+				want := []string{"preceding", "first", "second"}
+				if test.failFirst {
+					want = []string{"preceding", "second"}
+				}
+				if len(committed) != len(want) {
+					t.Errorf("siblings stalled after predecessor release: commits=%d, want %d", len(committed), len(want))
+					c.stopHard()
+				}
+				count := 0
+				for job := range out {
+					count++
+					result := job.result()
+					if result.Err != nil || len(result.Targets) != len(job.targets) {
+						t.Errorf("unexpected item outcome: %+v", result)
+					}
+					for _, target := range result.Targets {
+						if target.Path == "first" && test.failFirst {
+							if !errors.Is(target.Err, ErrTargetIO) {
+								t.Errorf("first creation error=%v, want I/O failure", target.Err)
+							}
+							continue
+						}
+						if target.Err != nil {
+							t.Errorf("target %q failed: %v", target.Path, target.Err)
+						}
+					}
+				}
+				close(created)
+				for name := range created {
+					creates[name]++
+				}
+				close(committed)
+				var publications []string
+				for name := range committed {
+					publications = append(publications, name)
+				}
+				if count != 2 || creates["preceding"] != 1 || creates["first"] != 1 || creates["second"] != 1 ||
+					!slices.Equal(publications, want) {
+					t.Errorf("unfinished aliases: results=%d creates=%v publications=%v, want %v", count, creates, publications, want)
+				}
+			})
+		})
+	}
 }
 
 func TestLinearSourceKeepsConflictingDirectOutputsExclusive(t *testing.T) {

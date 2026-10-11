@@ -1201,7 +1201,8 @@ func (h *blockingHash) Write(p []byte) (int, error) {
 
 // holdContentHash makes the run's hash consumer wait on the returned release function before it
 // hashes its first chunk. It reports when the consumer has started, so a test knows the item's hash
-// is being held back, and it restores the pool when the test ends.
+// is being held back, and it restores the pool when the test ends. Callers must register later
+// cleanup that releases the gates and joins their run before this helper restores the global pool.
 func holdContentHash(t *testing.T) (started <-chan struct{}, released <-chan struct{}, release func()) {
 	t.Helper()
 
@@ -1220,12 +1221,12 @@ func holdContentHash(t *testing.T) (started <-chan struct{}, released <-chan str
 }
 
 // TestRunHoldsTargetCacheUntilTheHashIsComplete pins the ordering a target's cache entry depends
-// on: the writer keeps its descriptor open until the item's hash is complete, so the entry always
-// describes the whole content. The run is held back at the hash, and an item that completed anyway
+// on: publication waits until the item's hash is complete, so the entry always describes the
+// whole content. The run is held back at the hash, and an item that completed anyway
 // would have published an entry it could not describe.
 func TestRunHoldsTargetCacheUntilTheHashIsComplete(t *testing.T) {
+	// Hold a real file's digest while its linear target advances independently.
 	requireSignatureXattrSupport(t)
-
 	content := bytes.Repeat([]byte{'c'}, 4096)
 	root := t.TempDir()
 	input := writeSourceFile(t, root, "source.txt", content)
@@ -1235,9 +1236,12 @@ func TestRunHoldsTargetCacheUntilTheHashIsComplete(t *testing.T) {
 	// A linear target skips the durability sync, so its writer has nothing left to do but publish
 	// by the time the hash is held back.
 	item := newFixtureItem(input, target)
-	done := make(chan error, 1)
+	done := make(chan struct{})
+	var runErr error
+	t.Cleanup(func() { release(); <-done })
 	go func() {
-		done <- runFixture(
+		defer close(done)
+		runErr = runFixture(
 			context.Background(),
 			newStreamFixture(item),
 			[]Item{item},
@@ -1246,6 +1250,7 @@ func TestRunHoldsTargetCacheUntilTheHashIsComplete(t *testing.T) {
 		)
 	}()
 
+	// Confirm the hash gate is occupied before checking target completion.
 	select {
 	case <-started:
 	case <-time.After(10 * time.Second):
@@ -1255,8 +1260,8 @@ func TestRunHoldsTargetCacheUntilTheHashIsComplete(t *testing.T) {
 	// The item cannot finish while its hash is unknown, and the writer must be waiting instead of
 	// publishing the entry it cannot describe yet.
 	select {
-	case err := <-done:
-		t.Fatalf("the run finished while the item's hash was held back: %v", err)
+	case <-done:
+		t.Fatalf("the run finished while the item's hash was held back: %v", runErr)
 	case <-time.After(250 * time.Millisecond):
 	}
 	select {
@@ -1268,14 +1273,15 @@ func TestRunHoldsTargetCacheUntilTheHashIsComplete(t *testing.T) {
 	// Releasing the hash lets the item finish and publish the entry of every file it handled.
 	release()
 	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("run error = %v, want nil", err)
+	case <-done:
+		if runErr != nil {
+			t.Fatalf("run error = %v, want nil", runErr)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the run never finished after the hash was released")
 	}
 
+	// Both stored entries must describe the completed content before the result is accepted.
 	if _, err := item.terminal(t); err != nil {
 		t.Fatalf("item failed: %v", err)
 	}

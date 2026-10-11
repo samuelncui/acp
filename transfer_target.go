@@ -5,10 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 
 	mapset "github.com/deckarep/golang-set/v2"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/unicode/norm"
 )
 
 type publicationOrder struct {
@@ -17,6 +21,7 @@ type publicationOrder struct {
 }
 
 type publicationTurn struct {
+	key        string
 	previous   <-chan struct{}
 	directTurn <-chan struct{}
 	done       chan struct{}
@@ -27,13 +32,26 @@ func newPublicationOrder() *publicationOrder {
 	return &publicationOrder{pending: make(map[string]chan struct{})}
 }
 
+func publicationKey(path string) string {
+	// ASCII paths need only case folding; avoid Unicode transform buffers for ordinary names.
+	for i := range len(path) {
+		if path[i] >= utf8.RuneSelf {
+			return norm.NFD.String(cases.Fold().String(norm.NFD.String(path)))
+		}
+	}
+	return strings.ToLower(path)
+}
+
 func (p *publicationOrder) reserve(path string) publicationTurn {
-	// Only conflicting paths share a completion dependency; finished entries do not accumulate.
+	// Canonical caseless matching conservatively orders native aliases without changing their paths.
+	key := publicationKey(path)
+
+	// Only potentially conflicting paths share a dependency; finished entries do not accumulate.
 	p.lock.Lock()
 	defer p.lock.Unlock()
 	done := make(chan struct{})
-	turn := publicationTurn{previous: p.pending[path], done: done}
-	p.pending[path] = done
+	turn := publicationTurn{key: key, previous: p.pending[key], done: done}
+	p.pending[key] = done
 	turn.release = func() {
 		// A failed middle output must retain its predecessor's publication dependency.
 		if turn.previous != nil {
@@ -44,8 +62,8 @@ func (p *publicationOrder) reserve(path string) publicationTurn {
 		p.lock.Lock()
 		defer p.lock.Unlock()
 		close(done)
-		if p.pending[path] == done {
-			delete(p.pending, path)
+		if p.pending[key] == done {
+			delete(p.pending, key)
 		}
 	}
 	return turn
@@ -57,6 +75,8 @@ func (t *transfer) reservePublications(order *publicationOrder) {
 	if t.noContent || (!c.toDevice.linear && c.toDevice.threads != 1 && !c.fromDevice.linear) {
 		return
 	}
+
+	// Derive each key once and reuse its first predecessor for direct aliases within this item.
 	t.publications = make([]publicationTurn, len(t.job.outputs))
 	for i, spec := range t.job.outputs {
 		turn := order.reserve(spec.path)
@@ -64,8 +84,8 @@ func (t *transfer) reservePublications(order *publicationOrder) {
 			// Aliases in one file share only the prior file's device lifetime, never their own data gate.
 			turn.directTurn = turn.previous
 			for j := 0; j < i; j++ {
-				if t.job.outputs[j].path == spec.path {
-					turn.directTurn = t.publications[j].directTurn
+				if t.publications[j].key == turn.key {
+					turn.directTurn = t.publications[j].previous
 					break
 				}
 			}

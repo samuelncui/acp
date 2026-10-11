@@ -161,3 +161,173 @@ func TestTargetParentTraversalFromSymlinkedWorkingDirectory(t *testing.T) {
 		})
 	}
 }
+
+func TestNativeTargetAliasesKeepSerialWinner(t *testing.T) {
+	// Cover every device configuration that promises ordered completion.
+	for _, config := range []struct {
+		name                       string
+		sourceLinear, targetLinear bool
+		targetThreads              int
+	}{
+		{"linear-target", false, true, 1},
+		{"single-writer", false, false, 1},
+		{"linear-source", true, false, 3},
+	} {
+		for _, alias := range []struct {
+			name  string
+			names [2]string
+		}{
+			{"case", [2]string{"target", "TARGET"}},
+			{"unicode-decomposition", [2]string{"caf\u00e9", "cafe\u0301"}},
+		} {
+			t.Run(config.name+"/"+alias.name, func(t *testing.T) {
+				// Native name lookup determines whether this fixture has one winner or two distinct outputs.
+				root := t.TempDir()
+				probe := writeSourceFile(t, root, alias.names[0], []byte("probe"))
+				first, err := os.Stat(probe)
+				if err != nil {
+					t.Fatal(err)
+				}
+				second, err := os.Stat(filepath.Join(root, alias.names[1]))
+				if err != nil && !errors.Is(err, os.ErrNotExist) {
+					t.Fatal(err)
+				}
+				nativeAlias := err == nil && os.SameFile(first, second)
+				t.Logf("native alias probe: %q and %q alias=%t", alias.names[0], alias.names[1], nativeAlias)
+
+				// Existing exclusive targets are the indexing control; the other cases exercise publication.
+				for _, test := range []struct {
+					name      string
+					exists    bool
+					overwrite bool
+				}{
+					{name: "missing-exclusive"},
+					{name: "missing-overwrite", overwrite: true},
+					{name: "existing-exclusive", exists: true},
+					{name: "existing-overwrite", exists: true, overwrite: true},
+				} {
+					t.Run(test.name, func(t *testing.T) {
+						synctest.Test(t, func(t *testing.T) {
+							// Index stable inputs and both native target aliases before any copy changes the destination.
+							c := newTestStream(t, Overwrite(test.overwrite), WithHashPolicy(HashOff),
+								SetFromDevice(LinearDevice(config.sourceLinear)),
+								SetToDevice(LinearDevice(config.targetLinear), DeviceThreads(config.targetThreads)))
+							dir := filepath.Join(root, test.name)
+							names := []string{filepath.Join(dir, alias.names[0]), filepath.Join(dir, alias.names[1]),
+								filepath.Join(dir, "independent")}
+							if test.exists {
+								writeSourceFile(t, dir, alias.names[0], []byte("original"))
+							}
+							prepared := make(chan *writeJob, len(names))
+							for i, name := range names {
+								content := []string{"first", "second", "independent"}[i]
+								source := writeSourceFile(t, filepath.Join(dir, "sources"), content, []byte(content))
+								job := c.buildJob(&SimpleJob{Path: source, Dsts: []string{name}}, uint64(i))
+								if job.itemError != nil {
+									t.Fatalf("index outcome: %+v", job.result())
+								}
+								wantOutputs := 1
+								if i < 2 && test.exists && !test.overwrite && (i == 0 || nativeAlias) {
+									wantOutputs = 0
+								}
+								if len(job.outputs) != wantOutputs {
+									t.Fatalf("index order=%d: %+v", i, job.result())
+								}
+								wj := c.prepareItem(job)
+								t.Cleanup(func() { _ = wj.finishSource() })
+								prepared <- wj
+							}
+							close(prepared)
+
+							// Hold only the first Commit; native writes, metadata and renames remain real.
+							gate := make(chan struct{})
+							release := onceRelease(gate)
+							defer release()
+							native := c.fs()
+							c.filesystem = pipelineFilesystem{
+								transferFilesystem: native,
+								create: func(job *writeJob, spec targetSpec) (transferOutput, error) {
+									// Retain native output ownership and delay only the first item's replacement.
+									out, err := native.Create(job, spec)
+									if err != nil || job.order != 0 {
+										return out, err
+									}
+									return &delayedPublicationOutput{transferOutput: out, gate: gate}, nil
+								},
+							}
+							out := c.copy(context.Background(), prepared)
+							synctest.Wait()
+
+							// A fix must hold the alias while allowing the unrelated file in the same directory to publish.
+							if data, err := os.ReadFile(names[2]); err != nil || string(data) != "independent" {
+								t.Errorf("independent output blocked by alias completion: %q / %v", data, err)
+							}
+							data, err := os.ReadFile(names[0])
+							t.Logf("before first Commit: target=%q error=%v", data, err)
+							if test.exists {
+								if err != nil || string(data) != "original" {
+									t.Errorf("alias published before first Commit: %q / %v", data, err)
+								}
+							} else if !errors.Is(err, os.ErrNotExist) {
+								t.Errorf("missing alias published before first Commit: %q / %v", data, err)
+							}
+							release()
+
+							// Drain all real outcomes and retain the first exclusive or last overwrite winner.
+							count := 0
+							for job := range out {
+								count++
+								result := job.result()
+								if result.Err != nil || len(result.Targets) != 1 || result.Targets[0].Path != names[job.order] {
+									t.Errorf("unexpected result: %+v", result)
+									continue
+								}
+								targetErr := result.Targets[0].Err
+								t.Logf("order=%d target error=%v", job.order, targetErr)
+								refused := test.exists && job.order == 0 || nativeAlias && job.order == 1
+								if !test.overwrite && refused {
+									if !errors.Is(targetErr, os.ErrExist) {
+										t.Errorf("order=%d: error=%v, want existence failure", job.order, targetErr)
+									}
+								} else if targetErr != nil {
+									t.Errorf("order=%d failed: %v", job.order, targetErr)
+								}
+							}
+							want := "first"
+							if test.overwrite && nativeAlias {
+								want = "second"
+							} else if test.exists && !test.overwrite {
+								want = "original"
+							}
+							data, err = os.ReadFile(names[0])
+							t.Logf("final target=%q, want %q; results=%d", data, want, count)
+							if err != nil || string(data) != want || count != len(names) {
+								t.Errorf("wrong serial winner: %q / %v, want %q; results=%d", data, err, want, count)
+							}
+							if !nativeAlias {
+								second, err := os.ReadFile(names[1])
+								if err != nil || string(second) != "second" {
+									t.Errorf("distinct native target lost its content: %q / %v", second, err)
+								}
+							}
+						})
+					})
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkPublicationOrder(b *testing.B) {
+	// Measure the per-file completion dependency with ordinary and Unicode target names.
+	for _, name := range []string{"/volume/archive/file-000001.bin", "/volume/Archive/File-000001.bin", "/volume/caf\u00e9/file-000001.bin"} {
+		b.Run(name, func(b *testing.B) {
+			order := newPublicationOrder()
+			b.ReportAllocs()
+			for b.Loop() {
+				turn := order.reserve(name)
+				turn.release()
+			}
+		})
+	}
+}

@@ -28,28 +28,49 @@ func onceRelease(ch chan struct{}) func() {
 	return func() { once.Do(func() { close(ch) }) }
 }
 
+func cleanupPipeline(t *testing.T, c *StreamCopyer, releases ...func()) {
+	t.Helper()
+
+	// Release fault-injection gates and join workers before model or global-hook cleanup.
+	t.Cleanup(func() {
+		for _, release := range releases {
+			release()
+		}
+		if err := c.Wait(); err != nil {
+			t.Errorf("pipeline teardown failed: %v", err)
+		}
+	})
+}
+
 func TestPipelineOverlapsHashWriteAndLinearClose(t *testing.T) {
-	// Hold hashing and the first Close independently while both ordered data writes progress.
+	// Model hooks see resolved output paths; results retain the caller's original names.
 	root := t.TempDir()
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	content := bytes.Repeat([]byte("parallel content"), 64<<10)
 	source := writeSourceFile(t, root, "source", content)
 	a, b := filepath.Join(root, "a"), filepath.Join(root, "b")
+	resolvedA, resolvedB := filepath.Join(resolved, "a"), filepath.Join(resolved, "b")
+
+	// Hold hashing and the first Close independently while both ordered data writes progress.
 	hashStarted, _, releaseHash := holdContentHash(t)
-	t.Cleanup(releaseHash)
 	closeStarted, secondWrite, closeGate := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	releaseClose := onceRelease(closeGate)
-	t.Cleanup(releaseClose)
 	var closeOnce, writeOnce sync.Once
 	model := newLTFSModel(ltfsModelConfig{capture: true, entered: func(op, path string) {
-		if op == "close" && path == a {
+		if op == "close" && path == resolvedA {
 			closeOnce.Do(func() { close(closeStarted) })
 			<-closeGate
 		}
-		if op == "write" && path == b {
+		if op == "write" && path == resolvedB {
 			writeOnce.Do(func() { close(secondWrite) })
 		}
 	}})
-	defer model.shutdown()
+	t.Cleanup(model.shutdown)
+
+	// Keep fixture cleanup behind every accepted transfer, including an early test failure.
 	results := make(chan Result, 2)
 	c, err := NewStream(context.Background(), func(batch []Result) error {
 		for _, r := range batch {
@@ -60,6 +81,7 @@ func TestPipelineOverlapsHashWriteAndLinearClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupPipeline(t, c, releaseClose, releaseHash)
 	c.filesystem = ltfsFilesystem{transferFilesystem: c.fs(), model: model}
 	if err := c.Submit(&SimpleJob{Path: source, Dsts: []string{a}}, &SimpleJob{Path: source, Dsts: []string{b}}); err != nil {
 		t.Fatal(err)
@@ -94,9 +116,9 @@ func TestPipelineOverlapsHashWriteAndLinearClose(t *testing.T) {
 			t.Fatalf("result: %+v", r)
 		}
 	}
-	for _, path := range []string{a, b} {
+	for _, path := range []string{resolvedA, resolvedB} {
 		out := model.outputs[path]
-		if !out.committed || !bytes.Equal(out.data, content) {
+		if out == nil || !out.committed || !bytes.Equal(out.data, content) {
 			t.Fatalf("output %q is incomplete", path)
 		}
 	}
@@ -150,7 +172,6 @@ func TestPipelineLinearReadAdvancesBeforeSourceClose(t *testing.T) {
 	b := writeSourceFile(t, root, "b", []byte("bbbb"))
 	gate, closing, reading := make(chan struct{}), make(chan struct{}), make(chan struct{})
 	release := onceRelease(gate)
-	t.Cleanup(release)
 	var closeOnce, readOnce sync.Once
 	m := newLTFSModel(ltfsModelConfig{entered: func(op, path string) {
 		if op == "source-close" && path == a {
@@ -161,18 +182,23 @@ func TestPipelineLinearReadAdvancesBeforeSourceClose(t *testing.T) {
 			readOnce.Do(func() { close(reading) })
 		}
 	}})
-	defer m.shutdown()
+	t.Cleanup(m.shutdown)
+
+	// Join source closure before shutting down the model, even when an observation fails.
 	var seen atomic.Int64
 	c, err := NewStream(context.Background(), func(r []Result) error { seen.Add(int64(len(r))); return nil }, WithHashPolicy(HashRead), SetFromDevice(LinearDevice(true)))
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupPipeline(t, c, release)
 	c.filesystem = ltfsFilesystem{transferFilesystem: c.fs(), model: m, readPositions: map[string]int64{a: 0, b: 4}}
 	if err := c.Submit(&SimpleJob{Path: a}, &SimpleJob{Path: b}); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan struct{})
 	go func() { _ = c.Close(); close(done) }()
+
+	// The next source can read while the preceding source still owns its Close.
 	awaitStage(t, closing, "first source Close")
 	awaitStage(t, reading, "second ordered Read")
 	release()
@@ -189,26 +215,38 @@ func TestPipelineLinearReadAdvancesBeforeSourceClose(t *testing.T) {
 }
 
 func TestPipelineLateCloseNoSpaceKeepsAlreadyStartedOutcome(t *testing.T) {
-	// The first late Close fails only after the second Write has entered; the third must stay unstarted.
+	// Model hooks see resolved output paths; results retain the caller's original names.
 	root := t.TempDir()
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	src := writeSourceFile(t, root, "source", []byte("late close"))
 	a, b, d := filepath.Join(root, "a"), filepath.Join(root, "b"), filepath.Join(root, "d")
+	resolvedA, resolvedB, resolvedD := filepath.Join(resolved, "a"), filepath.Join(resolved, "b"), filepath.Join(resolved, "d")
+
+	// The first late Close fails only after the second Write has entered; the third must stay unstarted.
 	secondStarted, secondGate := make(chan struct{}), make(chan struct{})
 	releaseSecond := onceRelease(secondGate)
-	t.Cleanup(releaseSecond)
 	m := newLTFSModel(ltfsModelConfig{before: func(op, path string) {
-		if op == "write" && path == b {
+		if op == "write" && path == resolvedB {
 			close(secondStarted)
 			<-secondGate
 		}
 	}, closeError: func(path string) error {
-		if path == a {
-			<-secondStarted
+		if path == resolvedA {
+			// Teardown also releases this wait if the second writer never reaches the hook.
+			select {
+			case <-secondStarted:
+			case <-secondGate:
+			}
 			return syscall.ENOSPC
 		}
 		return nil
 	}})
-	defer m.shutdown()
+	t.Cleanup(m.shutdown)
+
+	// Retain all outcomes while cleanup can release a blocked writer after an assertion fails.
 	results := make(chan Result, 3)
 	c, err := NewStream(context.Background(), func(batch []Result) error {
 		for _, r := range batch {
@@ -219,13 +257,22 @@ func TestPipelineLateCloseNoSpaceKeepsAlreadyStartedOutcome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupPipeline(t, c, releaseSecond)
 	c.filesystem = ltfsFilesystem{transferFilesystem: c.fs(), model: m}
 	if err := c.Submit(&SimpleJob{Path: src, Dsts: []string{a}}, &SimpleJob{Path: src, Dsts: []string{b}}, &SimpleJob{Path: src, Dsts: []string{d}}); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan struct{})
 	go func() { _ = c.Close(); close(done) }()
-	first := <-results
+
+	// Observe the authoritative failure before allowing the already-started writer to finish.
+	awaitStage(t, secondStarted, "second Write before first Close failure")
+	var first Result
+	select {
+	case first = <-results:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the late Close failure")
+	}
 	if len(first.Targets) != 1 || first.Targets[0].Path != a || !errors.Is(first.Targets[0].Err, syscall.ENOSPC) || !errors.Is(first.Targets[0].Err, ErrTargetNoSpace) {
 		t.Fatalf("first result: %+v", first)
 	}
@@ -244,7 +291,9 @@ func TestPipelineLateCloseNoSpaceKeepsAlreadyStartedOutcome(t *testing.T) {
 	if outcomes[b].Err != nil || outcomes[b].Targets[0].Err != nil || !errors.Is(outcomes[d].Err, ErrTargetNoSpace) {
 		t.Fatalf("outcomes: %+v", outcomes)
 	}
-	if m.outputs[d] != nil || !m.outputs[a].discarded || m.outputs[a].committed || !m.outputs[b].committed {
+	firstOutput, secondOutput := m.outputs[resolvedA], m.outputs[resolvedB]
+	if m.outputs[resolvedD] != nil || firstOutput == nil || secondOutput == nil ||
+		!firstOutput.discarded || firstOutput.committed || !secondOutput.committed {
 		t.Fatal("late Close publication/admission mismatch")
 	}
 	if err := m.validate(); err != nil {
@@ -258,7 +307,6 @@ func TestPipelineRandomTargetsWriteConcurrently(t *testing.T) {
 	src := writeSourceFile(t, root, "source", []byte("fanout"))
 	gate := make(chan struct{})
 	release := onceRelease(gate)
-	t.Cleanup(release)
 	entered := make(chan struct{}, 2)
 	m := newLTFSModel(ltfsModelConfig{capture: true, before: func(op, path string) {
 		if op == "write" {
@@ -266,17 +314,22 @@ func TestPipelineRandomTargetsWriteConcurrently(t *testing.T) {
 			<-gate
 		}
 	}})
-	defer m.shutdown()
+	t.Cleanup(m.shutdown)
+
+	// Release both consumers and join the run before model cleanup on every test exit.
 	c, err := NewStream(context.Background(), func([]Result) error { return nil }, WithHashPolicy(HashRead), SetToDevice(DeviceThreads(1)))
 	if err != nil {
 		t.Fatal(err)
 	}
+	cleanupPipeline(t, c, release)
 	c.filesystem = ltfsFilesystem{transferFilesystem: c.fs(), model: m}
 	if err := c.Submit(&SimpleJob{Path: src, Dsts: []string{filepath.Join(root, "a"), filepath.Join(root, "b")}}); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan struct{})
 	go func() { _ = c.Close(); close(done) }()
+
+	// Both target writers must enter before either may finish its first Write.
 	awaitStage(t, entered, "first random target Write")
 	awaitStage(t, entered, "second random target Write")
 	release()
