@@ -53,6 +53,14 @@ var openSourceContent = func(path string, mode ReadMode, info os.FileInfo) (item
 // prepareItem opens the one descriptor an item owns and reads its stored hash through it. That
 // descriptor supplies cached metadata and content once; computed cache refresh can follow closure by path.
 func (c *StreamCopyer) prepareItem(job *baseJob) *writeJob {
+	// Stream sources open only in the serialized transfer lane, never in parallel preparation.
+	if job.contentSource != nil {
+		if len(job.targets) == 0 && !c.hashPolicy.readsContent() {
+			return c.noContentJob(job)
+		}
+		return newWriteJob(job, nil)
+	}
+
 	// An item needs its source when it writes somewhere or hashes content, and a targetless item
 	// reads its stored hash only where the policy reuses one.
 	needsContent := len(job.targets) > 0 || c.hashPolicy.readsContent()

@@ -86,6 +86,10 @@ func (c *StreamCopyer) copy(ctx context.Context, prepared <-chan *writeJob) <-ch
 		var offset int64
 		publication := newPublicationOrder()
 		for job := range prepared {
+			// Stream members retain the lane through Close, Finish, publication and result handoff.
+			if job.endpoints {
+				children.Wait()
+			}
 			t := newTransfer(c, job, ahead, offset)
 			if job.stat != nil {
 				offset += max(job.stat.size, 0)
@@ -106,6 +110,14 @@ func (c *StreamCopyer) copy(ctx context.Context, prepared <-chan *writeJob) <-ch
 					t.admitted = true
 				case <-c.hardStop:
 				}
+			}
+			if job.endpoints {
+				t.run(ctx, out, writing, cntr, exhausted)
+				if job.contentSource != nil && job.stat != nil {
+					offset += max(job.stat.size, 0)
+				}
+				job.releaseSlot()
+				continue
 			}
 			children.Add(1)
 			go c.wrap(context.WithoutCancel(ctx), func() {

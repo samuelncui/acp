@@ -25,12 +25,16 @@ const (
 )
 
 type baseJob struct {
-	copyer   *StreamCopyer
-	item     Item
-	path     string
-	stat     *stat
-	order    uint64
-	readMode ReadMode
+	copyer         *StreamCopyer
+	item           Item
+	path           string
+	stat           *stat
+	order          uint64
+	readMode       ReadMode
+	contentSource  ContentSource
+	contentTargets []ContentTarget
+	endpoints      bool
+	metadata       ContentMetadata
 
 	// itemError reports an item ACP could not process at all, instead of a completion.
 	itemError error

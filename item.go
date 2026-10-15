@@ -1,6 +1,8 @@
 package acp
 
 import (
+	"context"
+	"io"
 	"io/fs"
 	"time"
 )
@@ -14,13 +16,56 @@ import (
 // more when it is reported, so a failure path may read Source twice. ACP never keeps the item
 // afterwards.
 type Item interface {
-	// Source returns the exact path to read.
+	// Source returns the exact native path to read, or the content source display identifier.
 	Source() string
 
-	// Targets returns the destinations of a copy. An empty slice writes nothing: the source is
+	// Targets returns native paths or content target display identifiers. An empty slice writes nothing: the source is
 	// read and hashed only when the hash policy produces a hash, so the default HashOff reports
 	// neither a copy nor a hash.
 	Targets() []string
+}
+
+// ContentMetadata is an immutable snapshot observed when a source opens. Endpoint implementations
+// retain ownership of their input; ACP copies the snapshot before forwarding it to targets.
+type ContentMetadata struct {
+	Info   fs.FileInfo
+	Xattrs map[string][]byte
+}
+
+// ContentSource opens one member in an ordered content stream. ACP observes Stat and optional
+// Xattrs once before opening targets. ACP owns any returned file, even alongside an error, and
+// closes it once before another member opens or its native outputs can be committed.
+type ContentSource interface {
+	Open(context.Context) (fs.File, error)
+}
+
+// XattrReader optionally supplies ordinary attributes from an opened content source. Values are
+// opaque bytes. Providers normalize missing or unsupported attribute facilities to an empty map.
+type XattrReader interface {
+	Xattrs() (map[string][]byte, error)
+}
+
+// ContentTarget opens one member using observed source metadata. Its matching target string is
+// a display identifier, never a filesystem path.
+type ContentTarget interface {
+	Open(context.Context, ContentMetadata) (ContentWriter, error)
+}
+
+// ContentWriter receives member bytes. ACP calls Finish exactly once after writes stop, passing
+// the transfer failure, if any; Finish must not publish a truncated member as successful.
+type ContentWriter interface {
+	io.Writer
+	Finish(cause error) error
+}
+
+// ContentItem optionally supplies stream endpoints. A nil source selects the native Source path.
+// ContentTargets is either nil or aligned with Targets; nil entries select native target paths.
+// Each endpoint side requires LinearDevice(true); content sources require buffered reads.
+// At most one target endpoint is supported per item. Native sides retain their device options.
+type ContentItem interface {
+	Item
+	ContentSource() ContentSource
+	ContentTargets() []ContentTarget
 }
 
 // ReadModeItem optionally selects how one item's source content is read. Items that do not

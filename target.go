@@ -24,6 +24,7 @@ var (
 // path is its resolved destination, which may be a symlink referent.
 type targetSpec struct {
 	name, path, device string
+	content            ContentTarget
 	direct             bool
 	output             *fileio.Output
 }

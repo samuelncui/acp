@@ -200,6 +200,11 @@ func (c *StreamCopyer) Submit(items ...Item) error {
 	return nil
 }
 
+// HardStopped returns a channel closed when a fatal pipeline failure ends per-item accounting.
+// It does not signal normal completion, graceful stopping or physical source settlement. Call
+// Close and Wait to settle resources and obtain the run's authoritative terminal error.
+func (c *StreamCopyer) HardStopped() <-chan struct{} { return c.hardStop }
+
 // Close ends the feed and drains the run: every item already submitted finishes
 // and all dependent cache and Close work settle, the remaining results are flushed, and the run's
 // cache summary is reported. It returns the flush error, and it is safe to call more than once.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 )
 
 func (t *transfer) readContent() {
@@ -12,6 +13,13 @@ func (t *transfer) readContent() {
 	defer func() {
 		if value := recover(); value != nil {
 			t.readErr = t.panicFailure("source reader", value)
+		}
+		// An Open error or panic still releases writers waiting for observed metadata.
+		if t.sourceReady != nil {
+			t.sourceReadyOnce.Do(func() { close(t.sourceReady) })
+		}
+		if t.job.endpoints && t.readErr != nil {
+			t.stopEndpoint(t.readErr)
 		}
 		close(t.chunks)
 		if t.hashes != nil {
@@ -27,10 +35,55 @@ func (t *transfer) readContent() {
 				}
 			}()
 			t.sourceErr = t.job.finishSource()
+			if t.job.contentSource != nil {
+				t.stopEndpoint(t.sourceErr)
+			}
 		})
 	}()
 	if !t.wait(t.readTurn) || t.noContent {
 		return
+	}
+
+	// Observe the acquired file once before allowing any output allocation or header emission.
+	if t.job.contentSource != nil {
+		var file fs.File
+		var err error
+		panicErr := protectCall("ContentSource.Open", func() {
+			file, err = t.job.contentSource.Open(t.copyer.ctx)
+		})
+		t.job.reader = file
+		err = errors.Join(err, panicErr, t.copyer.ctx.Err())
+		if err == nil && file == nil {
+			err = fmt.Errorf("content source returned no file")
+		}
+		if err == nil {
+			var metadata ContentMetadata
+			panicErr = protectCall("content source metadata", func() {
+				metadata.Info, err = file.Stat()
+				err = errors.Join(err, t.copyer.ctx.Err())
+				if err != nil {
+					return
+				}
+				if attrs, ok := file.(XattrReader); ok {
+					metadata.Xattrs, err = attrs.Xattrs()
+					err = errors.Join(err, t.copyer.ctx.Err())
+					if err != nil {
+						return
+					}
+				}
+				t.job.metadata, err = snapshotContentMetadata(metadata)
+			})
+			err = errors.Join(err, panicErr, t.copyer.ctx.Err())
+		}
+		if err != nil {
+			t.readErr, t.job.itemError = err, err
+			return
+		}
+		t.job.stat = contentStat(t.job.metadata)
+		t.sourceReadyOnce.Do(func() { close(t.sourceReady) })
+		if t.job.stat.size == 0 {
+			return
+		}
 	}
 
 	// Quota-limited short blocks are not EOF; only the actual reader outcome ends content.
@@ -52,6 +105,10 @@ func (t *transfer) readContent() {
 			return
 		}
 		if done {
+			if t.job.endpoints && offset != t.job.stat.size {
+				t.readErr = fmt.Errorf("content size mismatch, read=%d, expected=%d: %w",
+					offset, t.job.stat.size, io.ErrUnexpectedEOF)
+			}
 			return
 		}
 	}

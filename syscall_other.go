@@ -31,3 +31,13 @@ func writeSysStat(name string, j *stat) error {
 	}
 	return nil
 }
+
+func readSysStatWithContent(path string, info fs.FileInfo, bounded bool) (*sysStat, error) {
+	return readSysStat(path, info)
+}
+
+func nativeContentMetadata(j *stat) ContentMetadata { return ContentMetadata{Info: j.info} }
+
+func contentStat(metadata ContentMetadata) *stat {
+	return &stat{info: metadata.Info, size: metadata.Info.Size(), mode: metadata.Info.Mode(), modTime: metadata.Info.ModTime()}
+}

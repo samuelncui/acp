@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -79,6 +80,9 @@ func (t *transfer) reservePublications(order *publicationOrder) {
 	// Derive each key once and reuse its first predecessor for direct aliases within this item.
 	t.publications = make([]publicationTurn, len(t.job.outputs))
 	for i, spec := range t.job.outputs {
+		if spec.content != nil {
+			continue
+		}
 		turn := order.reserve(spec.path)
 		if spec.direct {
 			// Aliases in one file share only the prior file's device lifetime, never their own data gate.
@@ -97,6 +101,7 @@ func (t *transfer) reservePublications(order *publicationOrder) {
 type targetTransfer struct {
 	spec        targetSpec
 	output      transferOutput
+	content     ContentWriter
 	chunks      chan *chunkBuffer
 	err         error
 	publication publicationTurn
@@ -132,6 +137,14 @@ func (t *transfer) writeContent(cntr *counter, exhausted mapset.Set[string]) {
 		}
 	}()
 
+	// Source endpoint Open must settle before any output allocation or endpoint header emission.
+	if t.sourceReady != nil {
+		<-t.sourceReady
+	}
+	if t.job.itemError != nil {
+		return
+	}
+
 	// Prepare each independent outcome before transferring output ownership to its consumer.
 	for i, spec := range t.job.outputs {
 		// A direct device becomes visible during Write and may require the preceding handle to close.
@@ -144,8 +157,37 @@ func (t *transfer) writeContent(cntr *counter, exhausted mapset.Set[string]) {
 			t.job.fail(spec.name, ErrTargetNoSpace)
 			continue
 		}
-		output, err := c.fs().Create(t.job, spec)
+		var output transferOutput
+		var content ContentWriter
+		var err error
+		if spec.content != nil {
+			metadata, metadataErr := snapshotContentMetadata(t.job.metadata)
+			err = metadataErr
+			if err == nil {
+				panicErr := protectCall("ContentTarget.Open", func() { content, err = spec.content.Open(c.ctx, metadata) })
+				err = errors.Join(err, panicErr)
+			}
+			if err == nil && content == nil {
+				err = fmt.Errorf("content target returned no writer")
+			}
+		} else {
+			output, err = c.fs().Create(t.job, spec)
+		}
 		if err != nil {
+			if spec.content != nil {
+				if content != nil {
+					// Even an errored Open can return an owned handle; Finish still waits for Close.
+					targets = append(targets, &targetTransfer{spec: spec, content: content, err: err})
+				} else {
+					c.targetFailed(t.job.baseJob, spec.name, spec.device, err, exhausted)
+				}
+				for _, remaining := range t.job.outputs[i+1:] {
+					t.job.fail(remaining.name, err)
+				}
+				t.stopEndpoint(err)
+				t.abort()
+				break
+			}
 			c.targetFailed(t.job.baseJob, spec.name, spec.device, err, exhausted)
 			continue
 		}
@@ -153,7 +195,7 @@ func (t *transfer) writeContent(cntr *counter, exhausted mapset.Set[string]) {
 		if i < len(t.publications) {
 			turn = t.publications[i]
 		}
-		target := &targetTransfer{spec: spec, output: output, publication: turn}
+		target := &targetTransfer{spec: spec, output: output, content: content, publication: turn}
 		targets = append(targets, target)
 		if i < len(t.publications) {
 			t.publications[i] = publicationTurn{}
@@ -183,9 +225,13 @@ func (t *transfer) writeContent(cntr *counter, exhausted mapset.Set[string]) {
 				if c.toDevice.linear {
 					// All linear outputs share this one application data writer.
 					if target.err == nil {
-						if err := writeChunk(target.output, chunk.retain()); err != nil {
+						if err := writeChunk(target.writer(), chunk.retain()); err != nil {
 							target.err = err
 							c.endLinearTarget(err)
+							if target.content != nil {
+								t.stopEndpoint(err)
+								t.abort()
+							}
 						}
 					}
 					continue
@@ -224,14 +270,24 @@ func (t *transfer) writeTargetData(target *targetTransfer) {
 			chunk.release()
 			continue
 		}
-		if err := writeChunk(target.output, chunk); err != nil {
+		if err := writeChunk(target.writer(), chunk); err != nil {
 			target.err = err
 			t.copyer.endLinearTarget(err)
+			if target.content != nil {
+				t.stopEndpoint(err)
+				t.abort()
+			}
 		}
 	}
 }
 
 func (t *transfer) finishTarget(target *targetTransfer, exhausted mapset.Set[string]) {
+	// Stream Finish owns its complete lifecycle and never invokes native filesystem operations.
+	if target.content != nil {
+		t.finishContentTarget(target)
+		return
+	}
+
 	// Publication release survives a secondary panic while cleanup reports its outcome.
 	if target.publication.release != nil {
 		defer target.publication.release()
@@ -278,6 +334,15 @@ func (t *transfer) finishTarget(target *targetTransfer, exhausted mapset.Set[str
 	default:
 	}
 
+	// A stream source must settle padding/cursor validation before publishing any native output.
+	if t.job.contentSource != nil {
+		<-t.sourceDone
+		if t.sourceErr != nil {
+			target.err = fmt.Errorf("close content source failed, %w", t.sourceErr)
+			return
+		}
+	}
+
 	// Managed metadata precedes restrictive permissions; ordinary random targets retain their sync order.
 	if !target.spec.direct {
 		out.Cache(t.job.baseJob, c.toDevice.linear)
@@ -310,4 +375,30 @@ func (t *transfer) finishTarget(target *targetTransfer, exhausted mapset.Set[str
 		target.err = fmt.Errorf("commit target failed, %w", err)
 		c.endLinearTarget(target.err)
 	}
+}
+
+func (target *targetTransfer) writer() io.Writer {
+	if target.content != nil {
+		return target.content
+	}
+	return target.output
+}
+
+func (t *transfer) finishContentTarget(target *targetTransfer) {
+	// Both source validation and hashing settle before one terminal Finish receives their causes.
+	t.publishHash()
+	<-t.sourceDone
+	target.err = errors.Join(target.err, t.sourceErr, t.hashErr)
+	panicErr := protectCall("ContentWriter.Finish", func() {
+		target.err = errors.Join(target.err, target.content.Finish(target.err))
+	})
+	target.err = errors.Join(target.err, panicErr)
+
+	// A broken member stops the ordered stream, preserving each original failure cause.
+	if target.err != nil {
+		t.stopEndpoint(target.err)
+		t.job.fail(target.spec.name, target.err)
+		return
+	}
+	t.job.success(target.spec.name)
 }

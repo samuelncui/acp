@@ -15,7 +15,11 @@ type stat struct {
 }
 
 func newStat(path string, fi fs.FileInfo) (*stat, error) {
-	sysStat, err := readSysStat(path, fi)
+	return newStatWithContent(path, fi, false)
+}
+
+func newStatWithContent(path string, fi fs.FileInfo, bounded bool) (*stat, error) {
+	sysStat, err := readSysStatWithContent(path, fi, bounded)
 	if err != nil {
 		return nil, fmt.Errorf("read sys stat failed, %w", err)
 	}

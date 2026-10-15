@@ -130,6 +130,7 @@ func NewStream(ctx context.Context, onResults func([]Result) error, opts ...Opti
 func (c *StreamCopyer) Submit(items ...Item) error
 func (c *StreamCopyer) Close() error
 func (c *StreamCopyer) Wait() error
+func (c *StreamCopyer) HardStopped() <-chan struct{}
 ```
 
 ```go
@@ -205,6 +206,116 @@ type TargetResult struct {
 }
 ```
 
+### Content endpoints
+
+An `Item` can optionally implement `ContentItem` to copy a member of an ordered stream:
+
+```go
+type ContentMetadata struct {
+	Info   fs.FileInfo
+	Xattrs map[string][]byte
+}
+type ContentSource interface {
+	Open(context.Context) (fs.File, error)
+}
+// Optional capability of the opened source file.
+type XattrReader interface {
+	Xattrs() (map[string][]byte, error)
+}
+func SourceFromFS(fsys fs.FS, name string) ContentSource
+
+type ContentTarget interface {
+	Open(context.Context, ContentMetadata) (ContentWriter, error)
+}
+type ContentWriter interface {
+	io.Writer
+	Finish(cause error) error
+}
+type ContentItem interface {
+	Item
+	ContentSource() ContentSource
+	ContentTargets() []ContentTarget
+}
+```
+
+A nil content source selects the native `Source` path. `ContentTargets` is nil or aligned with
+`Targets`; a nil entry selects that native target path. For an endpoint, the matching Item string
+is an exact display/result identifier: ACP never cleans, stats, caches or deletes it as a path.
+Each actual endpoint side requires `LinearDevice(true)`; content sources require buffered reads.
+At most one non-nil content target is supported per item. Native sides retain their options,
+including mapped source reads, ordinary output staging, metadata, cache and no-overwrite behavior.
+These combinations are validated while indexing, before endpoint Open or native source observation.
+
+Endpoint items run one complete lifecycle at a time through the existing bounded transfer engine.
+A content source opens lazily in that lane. ACP calls the opened file's Stat once, then optional
+Xattrs once, and takes its own portable metadata snapshot before any output is created. Stat must
+supply regular-file metadata with a nonnegative size. Expected metadata belongs to the caller and
+cannot substitute for that observation. Open, Stat or Xattrs failure creates no output. Any file
+returned alongside an Open error still receives one Close attempt; observation and cleanup errors
+retain their causes. A provider normalizes missing or unsupported xattr facilities to an empty map;
+other Xattrs errors fail the item.
+
+Panics in custom source Open, Stat, Xattrs or file-info accessors retain their cause as an item
+failure before target creation, and any acquired file still receives one Close attempt. Panics in
+the Read or Close worker remain fatal pipeline failures. Empty observed members skip payload Read
+while retaining metadata observation, hashing when enabled, source Close and target Finish.
+
+Source Close settles before the next source Open, before target Finish, and before any native target
+publication. A Close error discards the owned native temporary
+output and retains the existing final file. Endpoint failure stops future member admission; accepted
+unstarted items still receive the original stopping error. Source reads stop on cancellation without
+draining remaining payload. Context-aware endpoint implementations receive the run context and must
+make their blocking Open, Read and Write operations respond to cancellation. ACP also checks
+cancellation during source observation and closes any acquired file before reporting the outcome.
+
+SourceFromFS binds an existing fs.FS and an fs.ValidPath name without opening it. It opens only in
+that same ordered lane and returns the filesystem's actual fs.File, retaining optional XattrReader.
+It never calls fs.Stat separately. Invalid names and a nil filesystem fail before target creation.
+The name is relative, UTF-8 and slash-delimited; Item.Source remains the caller's display identifier:
+
+```go
+source := acp.SourceFromFS(fsys, "docs/readme.txt")
+// Return source from the existing caller-owned Item's ContentSource method.
+```
+
+The adapter checks context before and after Open, retaining any acquired file and joining an Open
+error with cancellation for ACP's common cleanup. Standard filesystem methods that ignore context
+are not made interruptible. An injected os.DirFS stays an opaque filesystem: ACP does not infer a
+native root, mmap, ownership or cache access. The caller keeps its storage disjoint from native
+outputs under the stable-input operating model. Native-path entrypoints retain their native name,
+symlink, alias, mapped-read and rewrite behavior.
+
+ACP calls each returned writer's Finish exactly once after writes stop, passing any read, write,
+hash or source Close error as its cause. A Finish error also fails that target and stops the lane.
+Finish must settle a failed member without acknowledging missing bytes as successful. Completion
+proves one member's transfer only; finalization of the enclosing stream belongs to the caller after
+`Close`/`Wait` settle handles and result callbacks. Endpoint operations perform no native mmap,
+cache, capacity query, rename or per-file sync. Content-requiring hash policies hash actual bytes;
+`HashCachedOnly` on a targetless content source opens nothing and reports no hash or cache hit.
+
+Metadata is copied into a portable immutable snapshot of size, mode, mtime and ordinary xattrs;
+endpoint `Info.Sys` never supplies native ownership. Native sources reuse their already-captured
+platform-selected attrs. Native outputs restore ordinary attrs before restrictive permissions,
+retain ACP's existing best-effort destination xattr error policy, and regenerate managed cache
+entries through the selected hash policy. Both managed keys (`acp.signature` and
+`user.acp.signature`) are excluded from endpoint snapshots. Empty and binary attribute values
+are preserved. Attribute names and values remain opaque to generic snapshots; each codec owns
+its representation checks, including PAX key grammar. ACP applies these exported envelope limits:
+
+| Limit | Value |
+| --- | --- |
+| `ContentMaxXattrCount` | 256 ordinary attributes |
+| `ContentMaxXattrNameBytes` | 1 KiB per name |
+| `ContentMaxXattrValueBytes` | 1 MiB per value |
+| `ContentMaxMetadataBytes` | 4 MiB aggregate xattr names/values, including 64 bytes framing allowance per attribute |
+
+Native endpoint capture validates the name-list and each name/value/count/aggregate limit before
+the corresponding buffer allocation or snapshot growth. Managed keys are excluded before ordinary
+count/value/aggregate checks. ACP bounds its own snapshot allocations; a custom XattrReader must
+bound any earlier decoding itself. Ordinary native-to-native capture retains its current behavior.
+A codec must also bound its own other metadata and encoded header chain. Optional XattrReader does
+not opt a custom source into native signature-cache reuse or refresh.
+
 ### Terminology
 
 | Term | Meaning |
@@ -247,6 +358,11 @@ submissions. Accepted items that cannot start receive the stopping error; work a
 read stage finishes and is reported. A callback error does not retract the submission already
 in progress. Closing the feed alone is not a stopping error. A fatal pipeline failure ends the
 run without a per-item completion guarantee.
+
+`HardStopped` closes when that fatal boundary is crossed, so a caller waiting for per-item source
+completion can escape without first closing the feed. It stays open for normal completion and
+graceful stops. The signal does not prove that sources or device commands have settled; `Close`
+and `Wait` still settle resources, and `Wait` supplies the authoritative terminal error.
 
 Caller methods, the results callback and event handlers run under panic protection. A panic
 in an item method fails that item; a callback or event-handler panic becomes a run error. A

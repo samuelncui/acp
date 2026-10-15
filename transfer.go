@@ -20,6 +20,8 @@ type transfer struct {
 	chunks                                                     chan *chunkBuffer
 	hashes                                                     chan *chunkBuffer
 	readDone, hashDone, sourceDone, sourceCacheDone, writeDone chan struct{}
+	sourceReady                                                chan struct{}
+	sourceReadyOnce                                            sync.Once
 	readTurn, writeTurn                                        <-chan struct{}
 	stop                                                       chan struct{}
 	stopOnce, hashOnce                                         sync.Once
@@ -43,7 +45,10 @@ func newTransfer(c *StreamCopyer, job *writeJob, ahead *readAhead, start int64) 
 		chunks:   make(chan *chunkBuffer, capacity),
 		readDone: make(chan struct{}), hashDone: make(chan struct{}), sourceDone: make(chan struct{}),
 		sourceCacheDone: make(chan struct{}), writeDone: make(chan struct{}), stop: make(chan struct{}),
-		noContent: job.itemError != nil || job.skipContent || job.cacheHit || job.reader == nil,
+		noContent: job.itemError != nil || job.skipContent || job.cacheHit || (job.reader == nil && job.contentSource == nil),
+	}
+	if job.contentSource != nil {
+		t.sourceReady = make(chan struct{})
 	}
 	if !t.noContent && c.hashPolicy.producesHash() {
 		t.hashes = make(chan *chunkBuffer, 4)
@@ -130,6 +135,10 @@ func (t *transfer) cacheSource() {
 func (t *transfer) run(ctx context.Context, out chan<- *baseJob, writing chan struct{}, cntr *counter, exhausted mapset.Set[string]) {
 	// Reading and hashing can run ahead while target data remains ordered.
 	c := t.copyer
+	unstarted := t.job.endpoints && c.markUnstarted(ctx, t.job.baseJob)
+	if unstarted {
+		t.noContent = true
+	}
 	drained := context.WithoutCancel(ctx)
 	go c.wrap(drained, t.hashContent)
 	go c.wrap(drained, t.readContent)
@@ -180,7 +189,7 @@ func (t *transfer) run(ctx context.Context, out chan<- *baseJob, writing chan st
 			<-writing
 		}
 	}()
-	if c.markUnstarted(ctx, t.job.baseJob) {
+	if unstarted || (!t.job.endpoints && c.markUnstarted(ctx, t.job.baseJob)) {
 		return
 	}
 	t.ahead.advance(t.job.order, t.start)
@@ -213,6 +222,9 @@ func (t *transfer) finishWrite() {
 }
 
 func (t *transfer) stopped() bool {
+	if t.job.endpoints && t.copyer.ctx.Err() != nil {
+		return true
+	}
 	select {
 	case <-t.stop:
 		return true
@@ -223,4 +235,16 @@ func (t *transfer) stopped() bool {
 	}
 }
 
-func (t *transfer) stoppedError() error { return fmt.Errorf("source prefetch stopped") }
+func (t *transfer) stoppedError() error {
+	if t.job.endpoints && t.copyer.ctx.Err() != nil {
+		return t.copyer.ctx.Err()
+	}
+	return fmt.Errorf("source prefetch stopped")
+}
+
+func (t *transfer) stopEndpoint(err error) {
+	if err != nil {
+		t.copyer.setCallbackStop(err)
+		t.copyer.setError(err)
+	}
+}

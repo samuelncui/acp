@@ -97,6 +97,22 @@ Rewrite process tests live beside that command. These E2E tests skip under `-sho
 `go build` are not race-instrumented. Reader cleanup tests call `Close` explicitly and never
 assert finalizer timing.
 
+Content endpoint regressions in `content_test.go` verify source-observation handoff before native
+output creation, Open failure cleanup, source Close failure preventing native publication, ordered
+Close/Finish and member Open, mapped native sources, exact display identifiers, cached-only policy,
+short read/write, original error causes and cancellation without payload draining.
+`content_source_test.go` verifies lazy fs.FS binding, one Open/Stat/Xattrs observation, plain standard
+files, empty members, opaque display identifiers, independent snapshot ownership, observation
+errors/panics/cancellation and exactly-once cleanup of Open-returned files alongside errors.
+`content_buffer_test.go` checks bounded chunks under target backpressure;
+`content_metadata_test.go` checks immutable portable snapshots, codec-independent names, metadata
+limits and managed values excluded before those limits. `content_xattr_unix_test.go` verifies
+native-to-endpoint-to-native empty, binary and PAX-incompatible attributes, managed-cache filtering
+and regeneration, and native size-probe rejection
+before oversized metadata buffers are allocated. Real xattr checks probe support and report skips.
+Run `go test -race -run '^TestContent' .` for this boundary; the native copy/cache/metadata,
+no-overwrite and bounded-pipeline suites remain required regression coverage.
+
 ## Focused checks
 
 ```sh
