@@ -99,7 +99,9 @@ assert finalizer timing.
 
 Content endpoint regressions in `content_test.go` verify source-observation handoff before native
 output creation, Open failure cleanup, source Close failure preventing native publication, ordered
-Close/Finish and member Open, mapped native sources, exact display identifiers, cached-only policy,
+Close/Finish and member Open, bounded native-target completion overlapping the next member with
+unchanged publication order, per-item failures and hard-stop cleanup, no overlap without ordered
+publication, lane members and native items after overlapped completions, mapped native sources, exact display identifiers, cached-only policy,
 short read/write, original error causes and cancellation without payload draining.
 `content_source_test.go` verifies lazy fs.FS binding, one Open/Stat/Xattrs observation, plain standard
 files, empty members, opaque display identifiers, independent snapshot ownership, observation

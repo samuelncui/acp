@@ -70,10 +70,14 @@ func (p *publicationOrder) reserve(path string) publicationTurn {
 	return turn
 }
 
+// ordersPublication reports whether conflicting outputs publish in dispatch order. Formerly
+// serialized configurations keep their winners across asynchronous completion.
+func (c *StreamCopyer) ordersPublication() bool {
+	return c.toDevice.linear || c.toDevice.threads == 1 || c.fromDevice.linear
+}
+
 func (t *transfer) reservePublications(order *publicationOrder) {
-	// Formerly serialized files keep their conflicting-output winners across asynchronous completion.
-	c := t.copyer
-	if t.noContent || (!c.toDevice.linear && c.toDevice.threads != 1 && !c.fromDevice.linear) {
+	if t.noContent || !t.copyer.ordersPublication() {
 		return
 	}
 

@@ -109,7 +109,10 @@ media buffering or overhead, so a passing estimate does not guarantee that the w
 `Close`/`Wait` stop and join the polling workers after copying drains. An in-flight filesystem
 capacity call cannot be cancelled and can delay shutdown, but never holds the cache lock.
 Actual no-space and read-only errors stop the affected device and retain `ErrTargetNoSpace` and
-`ErrTargetDropToReadonly`; `ErrTargetIO` remains an individual target failure.
+`ErrTargetDropToReadonly`; `ErrTargetIO` remains an individual target failure. Outputs already
+created on that device when the error is observed, by concurrent files or overlapped stream members,
+are not refused in advance; they succeed or fail on their own operations, and any device error they
+hit is classified the same way.
 
 Same-directory rename does not promise atomic replacement on every platform, including Windows,
 or durability through power failure. ACP's existing sync policy is not a filesystem transaction.
@@ -246,7 +249,14 @@ At most one non-nil content target is supported per item. Native sides retain th
 including mapped source reads, ordinary output staging, metadata, cache and no-overwrite behavior.
 These combinations are validated while indexing, before endpoint Open or native source observation.
 
-Endpoint items run one complete lifecycle at a time through the existing bounded transfer engine.
+Endpoint items run through one ordered lane of the existing bounded transfer engine. A member with
+a content target or a linear target holds the lane for its complete lifecycle, as does every member
+unless the source is linear or the target has one thread, the configurations that order same-path
+publication. Otherwise, a member whose outputs are all random-target native paths releases the lane
+once its source has reached EOF and closed and all its data has been written to the outputs; its
+metadata, Sync, rename, publication and result then complete while the next member opens and reads.
+At most three such members complete behind the reading one; they hold output descriptors and owned
+temporary files but no content backing. Their results therefore arrive in completion order.
 A content source opens lazily in that lane. ACP calls the opened file's Stat once, then optional
 Xattrs once, and takes its own portable metadata snapshot before any output is created. Stat must
 supply regular-file metadata with a nonnegative size. Expected metadata belongs to the caller and

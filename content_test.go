@@ -5,15 +5,18 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -532,4 +535,382 @@ func TestContentOptionsFailBeforeOpeningEitherSide(t *testing.T) {
 			}
 		})
 	}
+}
+
+// finishOutput records one native output's completion steps for endpoint overlap checks.
+type finishOutput struct {
+	*pipelineOutput
+	sync      func() error
+	publish   func() error
+	discard   func()
+	discarded atomic.Int32
+}
+
+func (o *finishOutput) Sync() error       { return o.sync() }
+func (o *finishOutput) Commit(bool) error { return o.publish() }
+func (o *finishOutput) Discard() error {
+	o.discarded.Add(1)
+	if o.discard != nil {
+		o.discard()
+	}
+	return nil
+}
+
+// endpointMember builds one prepared content-source member with a native target.
+func endpointMember(c *StreamCopyer, order uint64, target string, source ContentSource) *writeJob {
+	name := fmt.Sprintf("member-%d", order)
+	job := newWriteJob(&baseJob{copyer: c, item: &SimpleJob{Path: name, Dsts: []string{target}},
+		path: name, order: order, targets: []string{target},
+		outputs: []targetSpec{{name: target, path: target, device: "fixture"}}}, nil)
+	job.contentSource, job.endpoints = source, true
+	return job
+}
+
+func memberSource(size int64, read func(), opened func(), closeErr error) ContentSource {
+	return testContentSource(func(context.Context) (fs.File, error) {
+		opened()
+		return &testContentFile{
+			ReadCloser: &testContentReader{
+				Reader: &generatedReader{remaining: size, read: func(int) { read() }},
+				close:  func() error { return closeErr },
+			},
+			metadata: ContentMetadata{Info: contentInfo{name: "member", size: size, mode: 0600}},
+		}, nil
+	})
+}
+
+func TestContentNativeTargetCompletionOverlapsNextMember(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Every Sync blocks; later members must still open and read until the in-flight bound.
+		c := newTestStream(t, WithHashPolicy(HashOff), SetFromDevice(LinearDevice(true)))
+		release := make(chan struct{})
+		var lock sync.Mutex
+		var events []string
+		record := func(event string) { lock.Lock(); defer lock.Unlock(); events = append(events, event) }
+		outputs := make(map[uint64]*finishOutput)
+		c.filesystem = pipelineFilesystem{create: func(job *writeJob, spec targetSpec) (transferOutput, error) {
+			output := &finishOutput{
+				pipelineOutput: &pipelineOutput{write: func(data []byte) (int, error) { return len(data), nil }},
+				sync:           func() error { <-release; return nil },
+				publish:        func() error { record(fmt.Sprintf("commit-%d", job.order)); return nil },
+			}
+			lock.Lock()
+			outputs[job.order] = output
+			lock.Unlock()
+			return output, nil
+		}}
+		prepared := make(chan *writeJob, endpointMembers+1)
+		for i := range uint64(endpointMembers + 1) {
+			order := i
+			prepared <- endpointMember(c, order, fmt.Sprintf("target-%d", order), memberSource(2*batchSize, func() {},
+				func() { record(fmt.Sprintf("open-%d", order)) }, nil))
+		}
+		close(prepared)
+		out := c.copy(context.Background(), prepared)
+
+		// Members open while earlier ones sync, and the member beyond the bound waits for a completion.
+		synctest.Wait()
+		lock.Lock()
+		got := slices.Clone(events)
+		lock.Unlock()
+		if !slices.Equal(got, []string{"open-0", "open-1", "open-2", "open-3"}) {
+			t.Fatalf("events before any Sync completed=%v", got)
+		}
+
+		close(release)
+		results := 0
+		for job := range out {
+			results++
+			if err := job.result().Targets[0].Err; err != nil {
+				t.Errorf("member %d: %v", job.order, err)
+			}
+		}
+		if results != endpointMembers+1 || !slices.Contains(events, "open-4") || !slices.Contains(events, "commit-0") {
+			t.Fatalf("results=%d events=%v", results, events)
+		}
+		for order, output := range outputs {
+			if output.discarded.Load() != 1 {
+				t.Errorf("member %d discards=%d", order, output.discarded.Load())
+			}
+		}
+	})
+}
+
+func TestContentOverlappedCompletionKeepsPublicationOrderAndFailures(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Two members publish one path; the later one must not commit before the delayed earlier one.
+		c := newTestStream(t, WithHashPolicy(HashOff), SetFromDevice(LinearDevice(true)))
+		release := make(chan struct{})
+		syncErr := errors.New("sync failed")
+		closeErr := errors.New("member close failed")
+		var lock sync.Mutex
+		var commits []uint64
+		c.filesystem = pipelineFilesystem{create: func(job *writeJob, spec targetSpec) (transferOutput, error) {
+			return &finishOutput{
+				pipelineOutput: &pipelineOutput{write: func(data []byte) (int, error) { return len(data), nil }},
+				sync: func() error {
+					if job.order == 0 {
+						<-release
+					}
+					if job.order == 2 {
+						return syncErr
+					}
+					return nil
+				},
+				publish: func() error { lock.Lock(); defer lock.Unlock(); commits = append(commits, job.order); return nil },
+			}, nil
+		}}
+
+		// A native completion failure stays per-item; a source Close failure still stops later members.
+		opened := make([]atomic.Bool, 5)
+		prepared := make(chan *writeJob, 5)
+		for i, target := range []string{"same", "same", "failed-sync", "close-fails", "never-opened"} {
+			var err error
+			if i == 3 {
+				err = closeErr
+			}
+			prepared <- endpointMember(c, uint64(i), target, memberSource(batchSize, func() {}, func() { opened[i].Store(true) }, err))
+		}
+		close(prepared)
+		out := c.copy(context.Background(), prepared)
+		synctest.Wait()
+		lock.Lock()
+		premature := slices.Contains(commits, 1)
+		lock.Unlock()
+		if premature || !opened[3].Load() {
+			t.Fatalf("same-path member published before its predecessor: commits=%v opened=%v", commits, opened[3].Load())
+		}
+		close(release)
+
+		errs := make(map[uint64]error)
+		for job := range out {
+			result := job.result()
+			errs[job.order] = errors.Join(result.Err, result.Targets[0].Err)
+		}
+		if !slices.Equal(commits, []uint64{0, 1}) {
+			t.Fatalf("commits=%v", commits)
+		}
+		if errs[0] != nil || errs[1] != nil || !errors.Is(errs[2], syncErr) || !errors.Is(errs[3], closeErr) ||
+			!errors.Is(errs[4], closeErr) || opened[4].Load() {
+			t.Fatalf("errors=%v unstarted member opened=%v", errs, opened[4].Load())
+		}
+	})
+}
+
+func TestContentHardStopDuringOverlappedCompletionDiscardsOutputs(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Stop the pipeline while member 0 syncs and member 1 is reading.
+		c := newTestStream(t, WithHashPolicy(HashOff), SetFromDevice(LinearDevice(true)))
+		syncing, reading := make(chan struct{}), make(chan struct{})
+		var lock sync.Mutex
+		var commits []uint64
+		outputs := make(map[uint64]*finishOutput)
+		c.filesystem = pipelineFilesystem{create: func(job *writeJob, spec targetSpec) (transferOutput, error) {
+			output := &finishOutput{
+				pipelineOutput: &pipelineOutput{write: func(data []byte) (int, error) { return len(data), nil }},
+				sync: func() error {
+					if job.order == 0 {
+						close(syncing)
+						<-c.hardStop
+						return errors.New("sync interrupted")
+					}
+					return nil
+				},
+				publish: func() error { lock.Lock(); defer lock.Unlock(); commits = append(commits, job.order); return nil },
+			}
+			lock.Lock()
+			outputs[job.order] = output
+			lock.Unlock()
+			return output, nil
+		}}
+		var once sync.Once
+		var opens, closed atomic.Int32
+		block := func() {
+			once.Do(func() { close(reading) })
+			<-c.hardStop
+		}
+		prepared := make(chan *writeJob, 3)
+		for i := range 3 {
+			read := func() {}
+			if i == 1 {
+				read = block
+			}
+			source := memberSource(4*batchSize, read, func() { opens.Add(1) }, nil)
+			prepared <- endpointMember(c, uint64(i), fmt.Sprintf("target-%d", i), testContentSource(
+				func(ctx context.Context) (fs.File, error) {
+					file, err := source.Open(ctx)
+					file.(*testContentFile).ReadCloser.(*testContentReader).close = func() error { closed.Add(1); return nil }
+					return file, err
+				}))
+		}
+		close(prepared)
+		out := c.copy(context.Background(), prepared)
+		<-syncing
+		<-reading
+		c.stopHard()
+		for range out {
+		}
+
+		// A hard stop may still race one later Open, as before; nothing publishes and every
+		// acquired source and created output is released exactly once.
+		if len(commits) != 0 || opens.Load() < 2 || closed.Load() != opens.Load() || len(outputs) < 2 {
+			t.Fatalf("commits=%v opens=%d closes=%d outputs=%d", commits, opens.Load(), closed.Load(), len(outputs))
+		}
+		for order, output := range outputs {
+			if output.discarded.Load() != 1 {
+				t.Errorf("member %d discards=%d", order, output.discarded.Load())
+			}
+		}
+	})
+}
+
+// eventLog records pipeline steps from concurrent completion workers.
+type eventLog struct {
+	lock   sync.Mutex
+	events []string
+}
+
+func (l *eventLog) add(format string, args ...any) {
+	l.lock.Lock()
+	defer l.lock.Unlock()
+	l.events = append(l.events, fmt.Sprintf(format, args...))
+}
+
+func (l *eventLog) snapshot() []string {
+	l.lock.Lock()
+	defer l.lock.Unlock()
+	return slices.Clone(l.events)
+}
+
+// loggedFilesystem creates outputs whose Sync waits for release when blocked reports their
+// order, and whose Commit and Discard are logged.
+func loggedFilesystem(log *eventLog, blocked func(uint64) bool, release <-chan struct{}) pipelineFilesystem {
+	return pipelineFilesystem{create: func(job *writeJob, spec targetSpec) (transferOutput, error) {
+		log.add("create-%d", job.order)
+		return &finishOutput{
+			pipelineOutput: &pipelineOutput{write: func(data []byte) (int, error) { return len(data), nil }},
+			sync: func() error {
+				if blocked(job.order) {
+					<-release
+				}
+				return nil
+			},
+			publish: func() error { log.add("commit-%d", job.order); return nil },
+			discard: func() { log.add("discard-%d", job.order) },
+		}, nil
+	}}
+}
+
+func TestContentRandomSourceKeepsSamePathMembersInLane(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Without ordered publication, a same-path member must not open while its predecessor completes.
+		c := newTestStream(t, WithHashPolicy(HashOff), Overwrite(true))
+		if c.ordersPublication() {
+			t.Fatal("default devices unexpectedly order publication")
+		}
+		release := make(chan struct{})
+		log := new(eventLog)
+		c.filesystem = loggedFilesystem(log, func(uint64) bool { return true }, release)
+		prepared := make(chan *writeJob, 2)
+		for i := range uint64(2) {
+			prepared <- endpointMember(c, i, "same", memberSource(batchSize, func() {}, func() { log.add("open-%d", i) }, nil))
+		}
+		close(prepared)
+		out := c.copy(context.Background(), prepared)
+		synctest.Wait()
+		if got := log.snapshot(); !slices.Equal(got, []string{"open-0", "create-0"}) {
+			t.Errorf("events before member 0 completed=%v", got)
+		}
+		close(release)
+		for job := range out {
+			if err := job.result().Targets[0].Err; err != nil {
+				t.Errorf("member %d: %v", job.order, err)
+			}
+		}
+		commits := slices.DeleteFunc(log.snapshot(), func(event string) bool { return !strings.HasPrefix(event, "commit-") })
+		if !slices.Equal(commits, []string{"commit-0", "commit-1"}) {
+			t.Fatalf("commits=%v", commits)
+		}
+	})
+}
+
+func TestContentLaneMemberWaitsForOverlappedCompletion(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Two overlapped members sync while a ContentTarget member, which keeps its lane, follows.
+		c := newTestStream(t, WithHashPolicy(HashOff), SetFromDevice(LinearDevice(true)))
+		release := make(chan struct{})
+		log := new(eventLog)
+		c.filesystem = loggedFilesystem(log, func(uint64) bool { return true }, release)
+		prepared := make(chan *writeJob, 3)
+		for i := range uint64(2) {
+			prepared <- endpointMember(c, i, fmt.Sprintf("target-%d", i),
+				memberSource(batchSize, func() {}, func() { log.add("open-%d", i) }, nil))
+		}
+		member := endpointMember(c, 2, "stream", memberSource(batchSize, func() {}, func() { log.add("open-2") }, nil))
+		member.outputs[0].content = testContentTarget(func(context.Context, ContentMetadata) (ContentWriter, error) {
+			log.add("target-open-2")
+			return &testContentWriter{Writer: io.Discard, finish: func(error) error { log.add("finish-2"); return nil }}, nil
+		})
+		if c.finishesOffLane(member) {
+			t.Fatal("ContentTarget member must keep its lane")
+		}
+		prepared <- member
+		close(prepared)
+		out := c.copy(context.Background(), prepared)
+		synctest.Wait()
+		if before := log.snapshot(); !slices.Equal(before, []string{"open-0", "create-0", "open-1", "create-1"}) {
+			t.Errorf("events before overlapped completion=%v", before)
+		}
+		close(release)
+		results := 0
+		for job := range out {
+			results++
+			if err := job.result().Targets[0].Err; err != nil {
+				t.Errorf("job %d: %v", job.order, err)
+			}
+		}
+
+		// The lane member opens only after every earlier completion committed and discarded.
+		events := log.snapshot()
+		opened := slices.Index(events, "open-2")
+		for _, event := range []string{"commit-0", "discard-0", "commit-1", "discard-1"} {
+			if at := slices.Index(events, event); at < 0 || at > opened {
+				t.Fatalf("%s not before open-2: %v", event, events)
+			}
+		}
+		if results != 3 || slices.Index(events, "target-open-2") < opened || !slices.Contains(events, "finish-2") {
+			t.Fatalf("results=%d events=%v", results, events)
+		}
+	})
+}
+
+func TestContentNativeItemAfterOverlappedMemberPublishesInOrder(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Only member 0's Sync blocks; the native item's own completion is ready at once.
+		c := newTestStream(t, WithHashPolicy(HashOff), SetFromDevice(LinearDevice(true)))
+		release := make(chan struct{})
+		log := new(eventLog)
+		c.filesystem = loggedFilesystem(log, func(order uint64) bool { return order == 0 }, release)
+		prepared := make(chan *writeJob, 2)
+		prepared <- endpointMember(c, 0, "same", memberSource(batchSize, func() {}, func() { log.add("open-0") }, nil))
+		prepared <- preparedFixture(c, 1, batchSize, "same", &generatedReader{remaining: batchSize})
+		close(prepared)
+		out := c.copy(context.Background(), prepared)
+
+		// The native item runs during member 0's completion; only publication order holds its commit.
+		synctest.Wait()
+		if before := log.snapshot(); !slices.Contains(before, "create-1") || slices.Contains(before, "commit-1") {
+			t.Errorf("events before member 0 completed=%v", before)
+		}
+		close(release)
+		for job := range out {
+			if err := job.result().Targets[0].Err; err != nil {
+				t.Errorf("job %d: %v", job.order, err)
+			}
+		}
+		commits := slices.DeleteFunc(log.snapshot(), func(event string) bool { return !strings.HasPrefix(event, "commit-") })
+		if !slices.Equal(commits, []string{"commit-0", "commit-1"}) {
+			t.Fatalf("commits=%v", commits)
+		}
+	})
 }

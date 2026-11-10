@@ -12,6 +12,11 @@ import (
 
 const batchSize = 1 * 1024 * 1024
 
+// endpointMembers bounds stream members in flight when native target completion overlaps the
+// lane: the reading member plus three completing ones. Completing members hold no content
+// backing, only their output descriptors and unpublished temporaries.
+const endpointMembers = 4
+
 var sha256Pool = &sync.Pool{New: func() interface{} { return sha256.New() }}
 
 // chunkBuffer shares immutable content; the final reference returns one backing allocation.
@@ -70,10 +75,12 @@ func (c *StreamCopyer) copy(ctx context.Context, prepared <-chan *writeJob) <-ch
 
 	// Managed children retain their own resources until completion; ordered turns end at data EOF.
 	go c.wrap(context.WithoutCancel(ctx), func() {
-		var children sync.WaitGroup
+		var children, finishing sync.WaitGroup
+		members := make(chan struct{}, endpointMembers)
 		defer func() {
 			// Return backing only after all data, completion and cleanup owners have exited.
 			children.Wait()
+			finishing.Wait()
 			ahead.close()
 			c.stopSpaceMonitors()
 			close(done)
@@ -86,9 +93,21 @@ func (c *StreamCopyer) copy(ctx context.Context, prepared <-chan *writeJob) <-ch
 		var offset int64
 		publication := newPublicationOrder()
 		for job := range prepared {
-			// Stream members retain the lane through Close, Finish, publication and result handoff.
+			// Stream members follow earlier native work. Members with only random native targets
+			// release the lane once their source settles; others keep the whole lifecycle.
+			overlapped := false
 			if job.endpoints {
 				children.Wait()
+				if c.finishesOffLane(job) {
+					select {
+					case members <- struct{}{}:
+						overlapped = true
+					case <-c.hardStop:
+					}
+				}
+				if !overlapped {
+					finishing.Wait()
+				}
 			}
 			t := newTransfer(c, job, ahead, offset)
 			if job.stat != nil {
@@ -111,12 +130,28 @@ func (c *StreamCopyer) copy(ctx context.Context, prepared <-chan *writeJob) <-ch
 				case <-c.hardStop:
 				}
 			}
-			if job.endpoints {
+			if overlapped {
+				t.laneDone = make(chan struct{})
+				finishing.Add(1)
+				go c.wrap(context.WithoutCancel(ctx), func() {
+					defer finishing.Done()
+					defer func() { <-members }()
+					defer job.releaseSlot()
+					t.run(ctx, out, writing, cntr, exhausted)
+				})
+				select {
+				case <-t.laneDone:
+				case <-c.hardStop:
+					continue
+				}
+			} else if job.endpoints {
 				t.run(ctx, out, writing, cntr, exhausted)
+				job.releaseSlot()
+			}
+			if job.endpoints {
 				if job.contentSource != nil && job.stat != nil {
 					offset += max(job.stat.size, 0)
 				}
-				job.releaseSlot()
 				continue
 			}
 			children.Add(1)
@@ -128,4 +163,19 @@ func (c *StreamCopyer) copy(ctx context.Context, prepared <-chan *writeJob) <-ch
 		}
 	})
 	return out
+}
+
+// finishesOffLane reports whether an endpoint member may complete its targets after the next
+// member opens. ContentWriter Finish and linear-target Close stay ordered inside the lane, and
+// only dispatch-ordered publication keeps same-path winners once completion overlaps.
+func (c *StreamCopyer) finishesOffLane(job *writeJob) bool {
+	if c.toDevice.linear || !c.ordersPublication() {
+		return false
+	}
+	for _, spec := range job.outputs {
+		if spec.content != nil {
+			return false
+		}
+	}
+	return true
 }

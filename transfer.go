@@ -20,7 +20,7 @@ type transfer struct {
 	chunks                                                     chan *chunkBuffer
 	hashes                                                     chan *chunkBuffer
 	readDone, hashDone, sourceDone, sourceCacheDone, writeDone chan struct{}
-	sourceReady                                                chan struct{}
+	sourceReady, laneDone                                      chan struct{}
 	sourceReadyOnce                                            sync.Once
 	readTurn, writeTurn                                        <-chan struct{}
 	stop                                                       chan struct{}
@@ -149,6 +149,10 @@ func (t *transfer) run(ctx context.Context, out chan<- *baseJob, writing chan st
 		}
 		t.abort()
 		if !turnReleased {
+			// A stopped content source may still be recording its observed size.
+			if t.job.contentSource != nil {
+				<-t.readDone
+			}
 			t.finishWrite()
 		}
 		for chunk := range t.chunks {
@@ -159,6 +163,11 @@ func (t *transfer) run(ctx context.Context, out chan<- *baseJob, writing chan st
 		<-t.sourceDone
 		if active {
 			t.cacheSource()
+		}
+
+		// The settled source and fully written data release an overlapped member's ordered lane.
+		if t.laneDone != nil {
+			close(t.laneDone)
 		}
 
 		// Failed or unstarted outputs release in reservation order after rewrite's cache dependency.
