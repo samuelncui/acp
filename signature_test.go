@@ -1478,3 +1478,39 @@ func readStoredSignature(t *testing.T, path string) (CachedSignature, bool) {
 	}
 	return signature, valid
 }
+
+func TestRunRefreshesOnlyTheSidesThatAllowIt(t *testing.T) {
+	// A refreshing transfer writes each side's signature unless that device opted out.
+	requireSignatureXattrSupport(t)
+	content := []byte("side fixture")
+	wantHash := sha256.Sum256(content)
+	for _, test := range []struct {
+		name           string
+		options        []Option
+		source, target bool
+	}{
+		{"source off", []Option{SetFromDevice(RefreshSignatureCache(false))}, false, true},
+		{"target off", []Option{SetToDevice(RefreshSignatureCache(false))}, true, false},
+		{"both off", []Option{SetFromDevice(RefreshSignatureCache(false)), SetToDevice(RefreshSignatureCache(false))}, false, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			input := writeSourceFile(t, root, "source.txt", content)
+			target := filepath.Join(root, "target.txt")
+			item := newFixtureItem(input, target)
+			options := append([]Option{WithHashPolicy(HashReadRefresh)}, test.options...)
+			if err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, options...); err != nil {
+				t.Fatal(err)
+			}
+			result, err := item.terminal(t)
+			if err != nil || !bytes.Equal(result.SHA256, wantHash[:]) {
+				t.Fatalf("result = %#v, err = %v", result, err)
+			}
+			for path, want := range map[string]bool{input: test.source, target: test.target} {
+				if _, valid := readStoredSignature(t, path); valid != want {
+					t.Fatalf("signature on %q present=%t, want %t", path, valid, want)
+				}
+			}
+		})
+	}
+}

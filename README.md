@@ -387,6 +387,7 @@ panic escaping pipeline code is a fatal run error, preserving the panic value.
 | `LinearDevice(bool)` | device | Enable linear device behavior |
 | `DeviceThreads(int)` | device | Worker count, default 8, forced to 1 for a linear device |
 | `WithReadMode(ReadBuffered\|ReadMapped)` | source device | Read sources buffered or through a memory mapping |
+| `RefreshSignatureCache(bool)` | device | Let a refreshing hash policy write signatures onto this side's files, default true |
 | `Overwrite(bool)` | run | Replace an existing target instead of refusing it; applies to every target |
 | `WithReadBuffer(items)` | run | Backpressure limit of the feed, default 4096 items |
 | `WithResultBuffer(items)` | run | Depth of the result queue, default 256 items |
@@ -456,6 +457,9 @@ stored metadata with the indexed facts to detect a cache made stale between runs
 entry is read at most once when needed; refresh compares that saved value with the computed
 entry and skips an unchanged write. A fresh staged target receives a new entry directly only
 when refresh is enabled, without reading or invalidating an old one.
+`RefreshSignatureCache(false)` on the source or target device keeps a refreshing policy from
+writing that side's entries; hashing, reuse and the other side are unchanged. A rewrite's
+replacement file is a written target.
 The target entry is written before restoring restrictive permissions; all metadata is complete
 before replacement.
 
@@ -505,7 +509,7 @@ c.Wait()
 - A repeated relative path inside one `WildcardJob` is an enumeration error: `WaitErr` returns it
   and nothing is copied.
 - `Overwrite(bool) Option`, `SetFromDevice`, `SetToDevice`, `LinearDevice`, `DeviceThreads`,
-  `WithReadMode`, `WithReadBuffer`, `WithResultBuffer`, `WithResultBatch`,
+  `WithReadMode`, `RefreshSignatureCache`, `WithReadBuffer`, `WithResultBuffer`, `WithResultBatch`,
   `WithResultFlushInterval`, `WithHashPolicy`, `WithLogger`, `WithEventHandler`,
   `WithProgressBar`, `WithHash(bool)`, `Event*`, `EventHandler`, `Error`, `Job`, `Report`,
   `ReportGetter`, `NewReportGetter`, `NewProgressBar`, `Cache[K,V]`, `DeviceOption`,

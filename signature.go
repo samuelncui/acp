@@ -237,6 +237,14 @@ func (c *StreamCopyer) cacheEntry(path string, job *baseJob, target bool) (Cache
 	if c.signatures == nil || !c.hashPolicy.refreshesCache() {
 		return CachedSignature{}, false
 	}
+	// Each side may opt out of the write alone; hashing and the other side are unaffected.
+	side := c.fromDevice
+	if target {
+		side = c.toDevice
+	}
+	if side.skipCacheRefresh {
+		return CachedSignature{}, false
+	}
 	hash, ok := job.computedHash()
 	if !ok {
 		return CachedSignature{}, false

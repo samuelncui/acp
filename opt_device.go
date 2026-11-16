@@ -26,6 +26,8 @@ type deviceOption struct {
 	linear   bool
 	threads  int
 	readMode ReadMode
+	// skipCacheRefresh keeps a refreshing hash policy from writing signatures on this side.
+	skipCacheRefresh bool
 }
 
 func (do *deviceOption) check() error {
@@ -65,6 +67,16 @@ func DeviceThreads(threads int) DeviceOption {
 func WithReadMode(mode ReadMode) DeviceOption {
 	return func(d *deviceOption) *deviceOption {
 		d.readMode = mode
+		return d
+	}
+}
+
+// RefreshSignatureCache selects whether a refreshing hash policy writes computed signatures onto
+// this device's files: sources on the source device, written targets on the target device. It
+// defaults to true and never changes hashing or reuse of stored signatures.
+func RefreshSignatureCache(b bool) DeviceOption {
+	return func(d *deviceOption) *deviceOption {
+		d.skipCacheRefresh = !b
 		return d
 	}
 }
