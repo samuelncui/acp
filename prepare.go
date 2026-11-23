@@ -64,7 +64,8 @@ func (c *StreamCopyer) prepareItem(job *baseJob) *writeJob {
 	// An item needs its source when it writes somewhere or hashes content, and a targetless item
 	// reads its stored hash only where the policy reuses one.
 	needsContent := len(job.targets) > 0 || c.hashPolicy.readsContent()
-	reuses := c.signatures != nil && len(job.targets) == 0 && c.hashPolicy.reusesCache()
+	cached := c.signatures != nil
+	reuses := cached && len(job.targets) == 0 && c.hashPolicy.reusesCache()
 
 	// A policy that neither reads content nor uses the cache completes without a source.
 	if !needsContent && !reuses {
@@ -102,24 +103,29 @@ func (c *StreamCopyer) prepareItem(job *baseJob) *writeJob {
 		}
 	}()
 
-	// Read the source entry once. Reuse accounts for misses and warnings; refresh-only reads
-	// silently replace unusable entries, preserving that policy's existing diagnostics.
+	// Read the source entry once and retain a fresh one, whose other half a refresh keeps. Reuse
+	// accounts for misses and warnings; refresh-only reads silently replace unusable entries,
+	// preserving that policy's existing diagnostics.
 	reused := false
 	if reuses {
-		if hash, ok := c.signatures.lookup(source.file, job.path, job.stat); ok {
+		entry, hash := c.signatures.lookup(source.file, job.path, job)
+		job.cachedEntry = entry
+		if hash != nil {
 			job.setCachedHash(hash)
 			reused = true
 		}
-	} else if c.signatures != nil && c.hashPolicy.refreshesCache() {
-		if signature, status, err := readCachedSignatureInfo(source.file, job.stat.info); err == nil && status == signatureReadHit {
-			job.cachedSignature = &signature
+	} else if cached && c.hashPolicy.refreshesCache() {
+		if entry, status, err := readSignatureEntryInfo(source.file, job.stat.info); err == nil && status == SignatureFresh {
+			job.cachedEntry = &entry
 		}
 	}
 
 	// Transfer the descriptor and indexed facts to the content stage.
 	wj := newWriteJob(job, source.reader)
 	wj.source = source.file
-	wj.sourcePath = job.path
+	if cached {
+		wj.sourcePath = job.path
+	}
 	source.reader = nil
 	if !needsContent && !reused {
 		// An item that reused no stored hash has no hash at all and is not a cache hit. Its

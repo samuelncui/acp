@@ -101,6 +101,29 @@ func (c *StreamCopyer) indexItem(job *baseJob) error {
 	if job.contentSource == nil {
 		job.path = filepath.Clean(job.path)
 	}
+	if item, ok := job.item.(TargetEncoderItem); ok {
+		if err := protectCall("Item.TargetEncoder", func() { job.encodeEncoding, job.encode = item.TargetEncoder() }); err != nil {
+			return err
+		}
+		if err := checkEncoding("target encoder", job.encodeEncoding, job.encode != nil); err != nil {
+			return err
+		}
+	}
+	var decodedSize int64
+	if item, ok := job.item.(SourceDecoderItem); ok {
+		if err := protectCall("Item.SourceDecoder", func() { job.decodeEncoding, job.decode, decodedSize = item.SourceDecoder() }); err != nil {
+			return err
+		}
+		if err := checkEncoding("source decoder", job.decodeEncoding, job.decode != nil); err != nil {
+			return err
+		}
+	}
+	if job.decode != nil && job.endpoints {
+		return fmt.Errorf("a source decoder requires a native source and native targets")
+	}
+	if job.decode != nil && decodedSize < 0 {
+		return fmt.Errorf("decoded source size is negative, size= %d", decodedSize)
+	}
 
 	// Enumeration and rewrite already own a source snapshot; direct items obtain it here.
 	var info os.FileInfo
@@ -126,6 +149,10 @@ func (c *StreamCopyer) indexItem(job *baseJob) error {
 	}
 	if err != nil {
 		return fmt.Errorf("read source stat failed, source= %q, %w", job.path, err)
+	}
+	if job.decode != nil {
+		// Content stages count decoded plaintext; stat.info keeps the stored file's own facts.
+		job.stat.size = decodedSize
 	}
 
 	// Snapshot already-captured native metadata for stream headers without listing attributes again.
@@ -157,6 +184,17 @@ func (c *StreamCopyer) indexItem(job *baseJob) error {
 			continue
 		}
 		job.outputs = append(job.outputs, target)
+	}
+	return nil
+}
+
+// checkEncoding requires a codec to name its encoding, which the managed signature entry records.
+func checkEncoding(what, encoding string, present bool) error {
+	if !present {
+		return nil
+	}
+	if encoding == "" || len(encoding) > signatureMaxEncoding {
+		return fmt.Errorf("%s needs an encoding name of 1 to %d bytes, encoding= %q", what, signatureMaxEncoding, encoding)
 	}
 	return nil
 }

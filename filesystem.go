@@ -19,7 +19,9 @@ type transferFilesystem interface {
 type transferOutput interface {
 	io.WriteCloser
 	Sync() error
-	Cache(job *baseJob, linear bool)
+	// Cache publishes the output's managed signature entry. An encoded output always has one and
+	// reports its write failure; a plain output's entry is optional and never fails.
+	Cache(job *baseJob, linear bool, stored int64) error
 	Restore(*stat) error
 	Commit(overwrite bool) error
 	Discard() error
@@ -60,15 +62,21 @@ func (o *nativeTransferOutput) Sync() error {
 	return o.output.File.Sync()
 }
 
-func (o *nativeTransferOutput) Cache(job *baseJob, linear bool) {
+func (o *nativeTransferOutput) Cache(job *baseJob, linear bool, stored int64) error {
+	// The entry of an encoded file is its marker, so its failure belongs to the target.
+	if job.encode != nil {
+		return o.copyer.writeEncodedMarker(o.output.File, o.output.Temporary, job, stored, linear)
+	}
+
 	// Linear completion has closed its descriptor but still owns the temporary path.
 	if linear {
 		o.copyer.refreshCachePath(o.output.Temporary, job, true)
-		return
+		return nil
 	}
 
 	// Random completion retains its descriptor until metadata and Sync finish.
 	o.copyer.refreshCacheEntry(o.output.File, o.target.name, job, true)
+	return nil
 }
 
 func (o *nativeTransferOutput) Restore(info *stat) error {

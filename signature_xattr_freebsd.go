@@ -14,8 +14,8 @@ import (
 const signatureXattrName = "acp.signature"
 
 func readSignatureXattr(file *os.File) ([]byte, error) {
-	// One bounded read captures the fixed codec and detects an oversized attribute.
-	value := make([]byte, signatureEncodedSize+1)
+	// One bounded read captures any valid entry and detects an oversized attribute.
+	value := make([]byte, signatureMaxSize+1)
 	n, err := unix.ExtattrGetFd(
 		int(file.Fd()),
 		unix.EXTATTR_NAMESPACE_USER,

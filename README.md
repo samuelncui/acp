@@ -202,12 +202,94 @@ type Result struct {
 }
 
 type TargetResult struct {
-	Path      string
-	Size      int64
-	WriteTime time.Time
-	Err       error // nil when this target was written
+	Path       string
+	Size       int64
+	StoredSize int64 // bytes written to a written native target; zero for a failed or content target
+	WriteTime  time.Time
+	Err        error // nil when this target was written
 }
 ```
+
+A failure of the item's source while its transfer runs wraps `ErrSourceRead`: opening or
+observing a content source, reading or decoding a source, a content size mismatch, and closing
+the source. It is wrapped wherever ACP reports that failure, in `Result.Err` or inside a
+`TargetResult.Err`, so a caller can tell a source failure from a target's own failure. A failure
+to open a native source before its transfer starts, a stop (including a context error a source
+returns after the run was cancelled) and a panic are not tagged; a source's own deadline while the
+run continues is tagged.
+
+```go
+var ErrSourceRead error    // wrapped by every source failure during a transfer
+var ErrMemberSettled error // wrapped by an endpoint failure that ends only its own member
+```
+
+### Encoded native content
+
+An item can store a caller-owned encoding, such as a compression format, in its native targets, and
+read one back from its native source. ACP has no codec of its own; hashing, `Result.Size`,
+`TargetResult.Size` and progress always describe the plaintext:
+
+```go
+// Optional: encode every native target of this item; a nil encode writes plaintext.
+// encoding names the codec and is required, non-empty and at most 64 bytes, when encode is set.
+type TargetEncoderItem interface {
+	TargetEncoder() (encoding string, encode func(dst io.Writer) (io.WriteCloser, error))
+}
+
+// Optional: decode this item's native source; a nil decode reads plaintext.
+type SourceDecoderItem interface {
+	SourceDecoder() (encoding string, decode func(src io.Reader) (io.ReadCloser, error), size int64)
+}
+
+var ErrEncodedContent error // wrapped by every decoder failure
+```
+
+ACP calls `TargetEncoder` once while indexing; a non-nil `encode` without a valid `encoding` fails
+the item. For each native output it calls the encoder with
+that output's file writer and writes the item's plaintext into the returned writer. After the last
+write ACP calls `Close` exactly once, including after a failed write. `Close` flushes the encoded
+tail into `dst` and returns only after every write into `dst` has finished. It belongs to that
+output's data writing, so a linear writer starts the next file only after it returns. Content
+targets are not encoded.
+
+`TargetResult.StoredSize` counts the bytes written into `dst`. An encoded output keeps ordinary
+[target completion](#target-completion): its exclusive temporary file, the overwrite rules and the
+rename after completion, with the item's mode, times and ordinary xattrs restored onto the stored
+file. It is never preallocated, because its size is unknown. Linear capacity admission still debits
+the plaintext size. It always receives a managed signature entry that marks it as encoded; see the
+[content signature cache](#content-signature-cache).
+
+An encoder error, a nil writer, a `Close` error, a failure to write the managed entry, or a panic
+in either call fails that target and discards its temporary output; other targets and items continue. A panic in the returned writer's
+`Write` remains a fatal pipeline failure, as for a content writer. An encoder that returns an error
+keeps ownership of any writer it created. Wrap `dst` errors to keep their identity, so device
+errors such as `ErrTargetNoSpace` stay classified.
+
+ACP calls `SourceDecoder` once while indexing; a non-nil `decode` without a valid `encoding` fails
+the item. `size` is the declared plaintext size: it replaces
+the stored file's size in results, progress, read-ahead and target preallocation, while opening
+and mapping still use the stored file's own facts. A negative size fails the item. A decoded source requires
+native targets and no content source, since an endpoint would receive the stored file's size.
+Preparation opens the native source as usual; the decoder starts only when that source's read
+begins, so prepared items hold no decoder state. ACP reads plaintext from the returned reader until
+`io.EOF` and closes it exactly once, before the native descriptor; native targets publish only
+after that Close. The item's mode, times and ordinary xattrs come from the stored file.
+
+Every failure the decoder reports wraps `ErrEncodedContent`: an error from the decoder function,
+any `Read` error other than `io.EOF` (including the decoder's own `io.ErrUnexpectedEOF`), a `Close`
+error, and plaintext longer or shorter than the declared size. Reading stops once the plaintext
+passes the declared size. An error from the native source's own `Read` keeps its identity instead, even when the
+decoder returns a different error for it. A decode failure is reported where a read failure is:
+in `Result.Err` for a targetless item, and in each `TargetResult.Err` otherwise, whose temporary
+outputs are discarded; a decoder `Close` error also sets `Result.Err`, as a source Close error
+does. It never stops the run. A panic or nil reader from the decoder function fails the item
+without `ErrEncodedContent`; panics in the reader's `Read` and `Close` remain fatal pipeline
+failures, as for a content source. A decoder that returns an error keeps ownership of any reader
+it created.
+
+A decoded source reuses and refreshes only the decoded part of the managed signature entry, and a
+plaintext target written from it receives an entry as usual; see the
+[content signature cache](#content-signature-cache).
 
 ### Content endpoints
 
@@ -273,7 +355,10 @@ while retaining metadata observation, hashing when enabled, source Close and tar
 Source Close settles before the next source Open, before target Finish, and before any native target
 publication. A Close error discards the owned native temporary
 output and retains the existing final file. Endpoint failure stops future member admission; accepted
-unstarted items still receive the original stopping error. Source reads stop on cancellation without
+unstarted items still receive the original stopping error. A content source that wraps
+`ErrMemberSettled` in its Open, Read or Close error has left its stream at a usable boundary: that
+item fails and later members are still admitted. A native source's failure on an item with a
+content target is decided by that target's Finish instead. Source reads stop on cancellation without
 draining remaining payload. Context-aware endpoint implementations receive the run context and must
 make their blocking Open, Read and Write operations respond to cancellation. ACP also checks
 cancellation during source observation and closes any acquired file before reporting the outcome.
@@ -296,7 +381,19 @@ outputs under the stable-input operating model. Native-path entrypoints retain t
 symlink, alias, mapped-read and rewrite behavior.
 
 ACP calls each returned writer's Finish exactly once after writes stop, passing any read, write,
-hash or source Close error as its cause. A Finish error also fails that target and stops the lane.
+hash or source Close error as its cause. A Finish error also fails that target and stops the lane,
+unless the writer wraps `ErrMemberSettled` itself: a writer that has completed the member's framing,
+for example by padding it to its declared size, fails only that target and later members are still
+admitted. Only a marker the writer adds counts. The cause reaches Finish as its own node, and a
+marker inside it, such as a content source's settlement, never settles the target stream, so a
+Finish that returns, wraps or joins its cause stops the lane as usual. A panicking Finish always
+stops it.
+A content writer's own Write error always stops the lane when it happens, before Finish runs:
+`ErrMemberSettled` settles a failed source or a refused member, never a failed write to the stream.
+A content target's Open error that wraps `ErrMemberSettled` and returns no writer likewise fails
+only that target, while the item's other targets continue; the target refused the member before
+emitting anything, such as a name its format cannot represent. A content source is always read to
+the end of its member, even when no target or hash consumes it, so its stream keeps its boundary.
 Finish must settle a failed member without acknowledging missing bytes as successful. Completion
 proves one member's transfer only; finalization of the enclosing stream belongs to the caller after
 `Close`/`Wait` settle handles and result callbacks. Endpoint operations perform no native mmap,
@@ -452,19 +549,45 @@ stream creation. `HashCachedOrReadRefresh` transfers as `HashReadRefresh`.
 
 ## Content signature cache
 
-The managed xattr holds a fixed binary SHA-256, size and nanosecond mtime. A lookup compares the
-stored metadata with the indexed facts to detect a cache made stale between runs. The source
-entry is read at most once when needed; refresh compares that saved value with the computed
-entry and skips an unchanged write. A fresh staged target receives a new entry directly only
-when refresh is enabled, without reading or invalidating an old one.
+The managed xattr (`user.acp.signature` on Linux, `acp.signature` on Darwin and FreeBSD) holds a
+Protobuf `SignatureEntry` of at most 512 bytes (`internal/signaturepb/signature.proto`, generated
+by `go generate ./internal/signaturepb`). `size` and `mtime_ns` describe the file on disk and decide
+freshness against the stored file's own size and mtime, never a decoded size; `sha256` is the hash of
+the bytes on disk. An encoded file also carries `decoded`: the item's `encoding`, the decoded `size`
+and the decoded content's `sha256`. Every hash is empty when unknown; an entry with a bad hash
+length, a negative size, a `decoded` without an encoding or a value over 512 bytes is invalid, which
+is a cache warning and a miss. The 56-byte `ACPS` layout of earlier releases is still read, as an
+entry without `decoded`; every write uses the Protobuf form, which never begins with `ACPS`.
+
+A lookup compares the stored metadata with the indexed facts to detect a cache made stale between
+runs. A plain read reuses only a fresh entry's `sha256`. A decoding read reuses only a fresh
+entry's `decoded.sha256`, and only when `decoded.encoding` equals the item's encoding and
+`decoded.size` equals the declared size; targetless decoding items reuse under the same policies as
+plain ones. Neither read ever trusts the other hash. The source entry is read at most once when
+needed. A refresh writes the hash its read computed (`sha256`, or `decoded` for a decoding read),
+keeps the other half of a fresh entry unchanged, writes only what it computed over a stale or
+missing entry, and skips an unchanged write. A fresh staged plaintext target receives a new entry
+directly only when refresh is enabled, without reading or invalidating an old one.
 `RefreshSignatureCache(false)` on the source or target device keeps a refreshing policy from
 writing that side's entries; hashing, reuse and the other side are unchanged. A rewrite's
 replacement file is a written target.
+
+An encoded target always receives an entry, whatever the hash policy: `size` is the stored size
+(`TargetResult.StoredSize`), `mtime_ns` the source mtime the metadata restore applies, and
+`decoded` the encoding, plaintext size and, when the policy refreshes, the target side has not
+opted out and a hash was computed, plaintext hash. This entry is the durable marker that the file
+is encoded, so a failure to write it, including a file system without the attribute, fails that
+target and discards its temporary output, unlike the warning-only plaintext writes.
+For a written target, only an encoding write produces the marker. A plain copy of an encoded
+file, including an `acp-rewrite` replacement, does not carry `decoded`: the managed key is never
+copied as an ordinary attribute, and the copy writes at most a plaintext entry for the stored bytes.
 The target entry is written before restoring restrictive permissions; all metadata is complete
 before replacement.
 
-Source cache lookup uses its content descriptor. Source refresh runs after hash and source Close
-through the stable source path; a closed linear output uses its owned temporary path. Random
+Source cache lookup uses its content descriptor. Source refresh runs after hash and a successful
+source Close through the stable source path, so a decoder that rejects its plaintext in Close, or a
+plain source whose Close fails, leaves its entry unchanged; a closed linear output uses its owned
+temporary path. Random
 output cache work uses its still-open descriptor before Sync and Close. Platforms may reopen
 these paths for metadata operations without rereading content. Rewrite waits for source cache
 and closure before replacing its source. The managed key is excluded from ordinary xattr
@@ -514,7 +637,9 @@ c.Wait()
   `WithProgressBar`, `WithHash(bool)`, `Event*`, `EventHandler`, `Error`, `Job`, `Report`,
   `ReportGetter`, `NewReportGetter`, `NewProgressBar`, `Cache[K,V]`, `DeviceOption`,
   `WildcardJobOption`, `Option`, `ReadCachedSignature`, `CachedSignature`,
-  `DecodeCachedSignature`, `ErrTargetNoSpace`, `ErrTargetDropToReadonly`, `ErrTargetIO`,
+  `DecodeCachedSignature`, `SignatureEntry`, `DecodedSignature`, `SignatureStatus`
+  (`SignatureMissing`, `SignatureStale`, `SignatureFresh`), `ReadSignatureEntry`,
+  `DecodeSignatureEntry`, `ErrTargetNoSpace`, `ErrTargetDropToReadonly`, `ErrTargetIO`,
   `CopyAttrs`, `UnexpectFileMode`.
 - `WithHash(true)` maps to `HashReadRefresh`; `WithHash(false)` maps to `HashOff`.
 - Pipeline errors are returned by `WaitErr` and cause the command to fail. The shell produces

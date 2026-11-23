@@ -1,24 +1,37 @@
 package acp
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
 	"sync"
 
+	"github.com/samuelncui/acp/internal/signaturepb"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
-	signatureMagic       = "ACPS"
-	signatureVersion     = uint8(1)
-	signatureSHA256      = uint8(1)
-	signatureEncodedSize = 56
+	// The legacy layout is exactly 56 bytes that begin with the magic; every new entry is Protobuf.
+	signatureMagic      = "ACPS"
+	signatureVersion    = uint8(1)
+	signatureSHA256     = uint8(1)
+	signatureLegacySize = 56
+	// signatureMaxSize bounds a stored entry; the longest valid one is far smaller. A longer value
+	// is an invalid entry.
+	signatureMaxSize = 512
+	// signatureMaxEncoding bounds an item's encoding name so every entry fits signatureMaxSize.
+	signatureMaxEncoding = 64
 	signatureSampleLimit = 5
 )
 
-var errSignatureXattrUnsupported = errors.New("signature xattr is unsupported")
+var (
+	errSignatureXattrUnsupported = errors.New("signature xattr is unsupported")
+	errSignatureOversized        = errors.New("signature xattr is larger than any valid entry")
+)
 
 // The managed-xattr operations are indirected so a test can exercise the missing, unsupported
 // and failing paths on a file system that accepts the attribute.
@@ -35,12 +48,45 @@ func signatureXattrIgnorable(err error) bool {
 	return errors.Is(err, errSignatureXattrUnsupported) || isSignatureXattrMissing(err) || isSignatureXattrUnsupported(err)
 }
 
-// CachedSignature is a SHA-256 content signature bound to file metadata.
+// CachedSignature is a SHA-256 content signature of the bytes on disk, bound to file metadata.
 type CachedSignature struct {
 	Size    int64
 	MtimeNS int64
 	SHA256  [32]byte
 }
+
+// DecodedSignature describes the decoded content of an encoded file.
+type DecodedSignature struct {
+	// Encoding is the caller-defined, non-empty encoding name.
+	Encoding string
+	// Size is the decoded size.
+	Size int64
+	// SHA256 is the SHA-256 of the decoded content; empty when unknown.
+	SHA256 []byte
+}
+
+// SignatureEntry is the managed signature xattr of a file. Size and MtimeNS describe the file on
+// disk and decide freshness; SHA256 is the hash of the bytes on disk and is empty when unknown.
+// Decoded is present only for an encoded file, where the entry is also the marker that the file
+// is encoded.
+type SignatureEntry struct {
+	Size    int64
+	MtimeNS int64
+	SHA256  []byte
+	Decoded *DecodedSignature
+}
+
+// SignatureStatus tells whether a file's managed signature entry describes its current version.
+type SignatureStatus uint8
+
+const (
+	// SignatureMissing means the file has no entry, or its file system has no managed attribute.
+	SignatureMissing SignatureStatus = iota
+	// SignatureStale means the entry's size or mtime no longer match the file.
+	SignatureStale
+	// SignatureFresh means the entry's size and mtime match the file.
+	SignatureFresh
+)
 
 // SignatureCacheSummary describes cache activity for one Copyer run.
 type SignatureCacheSummary struct {
@@ -53,21 +99,70 @@ type SignatureCacheSummary struct {
 	Samples    []string `json:"samples,omitempty"`
 }
 
-func encodeCachedSignature(signature CachedSignature) []byte {
-	encoded := make([]byte, signatureEncodedSize)
-	copy(encoded[:4], signatureMagic)
-	encoded[4] = signatureVersion
-	encoded[5] = signatureSHA256
-	binary.BigEndian.PutUint64(encoded[8:16], uint64(signature.Size))
-	binary.BigEndian.PutUint64(encoded[16:24], uint64(signature.MtimeNS))
-	copy(encoded[24:], signature.SHA256[:])
-	return encoded
+func (e SignatureEntry) equal(other SignatureEntry) bool {
+	if e.Size != other.Size || e.MtimeNS != other.MtimeNS || !bytes.Equal(e.SHA256, other.SHA256) {
+		return false
+	}
+	if e.Decoded == nil || other.Decoded == nil {
+		return e.Decoded == other.Decoded
+	}
+	return e.Decoded.Encoding == other.Decoded.Encoding && e.Decoded.Size == other.Decoded.Size &&
+		bytes.Equal(e.Decoded.SHA256, other.Decoded.SHA256)
 }
 
-// DecodeCachedSignature decodes ACP's stable, big-endian xattr representation.
-func DecodeCachedSignature(encoded []byte) (CachedSignature, error) {
-	// Reject any representation outside the one stable codec version.
-	if len(encoded) != signatureEncodedSize {
+// encodeSignatureEntry returns the Protobuf form every write uses. It starts with a field tag, so
+// it never begins with the legacy magic.
+func encodeSignatureEntry(entry SignatureEntry) ([]byte, error) {
+	message := &signaturepb.SignatureEntry{Size: entry.Size, MtimeNs: entry.MtimeNS, Sha256: entry.SHA256}
+	if entry.Decoded != nil {
+		message.Decoded = &signaturepb.Decoded{
+			Encoding: entry.Decoded.Encoding,
+			Size:     entry.Decoded.Size,
+			Sha256:   entry.Decoded.SHA256,
+		}
+	}
+	return proto.Marshal(message)
+}
+
+func validSignatureHash(hash []byte) bool {
+	return len(hash) == 0 || len(hash) == sha256.Size
+}
+
+// DecodeSignatureEntry decodes the managed xattr value: the Protobuf form, or the legacy
+// fixed-size layout that begins with the legacy magic.
+func DecodeSignatureEntry(encoded []byte) (SignatureEntry, error) {
+	if len(encoded) == 0 || len(encoded) > signatureMaxSize {
+		return SignatureEntry{}, fmt.Errorf("decode signature entry failed, size=%d", len(encoded))
+	}
+	if bytes.HasPrefix(encoded, []byte(signatureMagic)) {
+		signature, err := decodeLegacySignature(encoded)
+		if err != nil {
+			return SignatureEntry{}, err
+		}
+		return SignatureEntry{Size: signature.Size, MtimeNS: signature.MtimeNS, SHA256: signature.SHA256[:]}, nil
+	}
+
+	var message signaturepb.SignatureEntry
+	if err := proto.Unmarshal(encoded, &message); err != nil {
+		return SignatureEntry{}, fmt.Errorf("decode signature entry failed, %w", err)
+	}
+	entry := SignatureEntry{Size: message.Size, MtimeNS: message.MtimeNs, SHA256: message.Sha256}
+	if entry.Size < 0 || !validSignatureHash(entry.SHA256) {
+		return SignatureEntry{}, fmt.Errorf("decode signature entry failed, invalid size or hash")
+	}
+	if decoded := message.Decoded; decoded != nil {
+		if decoded.Encoding == "" || decoded.Size < 0 || !validSignatureHash(decoded.Sha256) {
+			return SignatureEntry{}, fmt.Errorf("decode signature entry failed, invalid decoded description")
+		}
+		entry.Decoded = &DecodedSignature{Encoding: decoded.Encoding, Size: decoded.Size, SHA256: decoded.Sha256}
+	}
+	return entry, nil
+}
+
+// decodeLegacySignature decodes the fixed, big-endian layout earlier releases wrote.
+func decodeLegacySignature(encoded []byte) (CachedSignature, error) {
+	// Reject any representation outside the one legacy codec version.
+	if len(encoded) != signatureLegacySize {
 		return CachedSignature{}, fmt.Errorf("decode cached signature failed, size=%d", len(encoded))
 	}
 	if string(encoded[:4]) != signatureMagic {
@@ -91,47 +186,62 @@ func DecodeCachedSignature(encoded []byte) (CachedSignature, error) {
 	return signature, nil
 }
 
-type signatureReadStatus uint8
-
-const (
-	signatureReadMiss signatureReadStatus = iota
-	signatureReadHit
-	signatureReadStale
-)
-
-// ReadCachedSignature returns a signature only when its size and mtime still
-// match the regular file. Missing, stale, and unsupported xattrs are cache misses.
-func ReadCachedSignature(path string) (CachedSignature, bool, error) {
-	signature, status, err := readCachedSignature(path)
-	return signature, status == signatureReadHit, err
+// DecodeCachedSignature decodes the plain view of a managed xattr value, in either encoding. It
+// fails for an entry without a SHA-256 of the bytes on disk.
+func DecodeCachedSignature(encoded []byte) (CachedSignature, error) {
+	entry, err := DecodeSignatureEntry(encoded)
+	if err != nil {
+		return CachedSignature{}, err
+	}
+	return plainSignature(entry)
 }
 
-func readCachedSignature(path string) (CachedSignature, signatureReadStatus, error) {
+func plainSignature(entry SignatureEntry) (CachedSignature, error) {
+	if len(entry.SHA256) != sha256.Size {
+		return CachedSignature{}, fmt.Errorf("cached signature has no SHA-256 of the stored bytes")
+	}
+	signature := CachedSignature{Size: entry.Size, MtimeNS: entry.MtimeNS}
+	copy(signature.SHA256[:], entry.SHA256)
+	return signature, nil
+}
+
+// ReadCachedSignature returns the plain signature of the bytes on disk only when the entry's size
+// and mtime still match the regular file and the entry has that hash. Missing, stale, decoded-only
+// and unsupported xattrs are cache misses.
+func ReadCachedSignature(path string) (CachedSignature, bool, error) {
+	entry, status, err := ReadSignatureEntry(path)
+	if err != nil {
+		return CachedSignature{}, false, err
+	}
+	signature, plainErr := plainSignature(entry)
+	return signature, status == SignatureFresh && plainErr == nil, nil
+}
+
+// ReadSignatureEntry returns a regular file's managed entry and whether it is fresh. A stale
+// entry is still returned, so a caller can see its Decoded marker when only the mtime changed.
+// Missing and unsupported xattrs report SignatureMissing.
+func ReadSignatureEntry(path string) (SignatureEntry, SignatureStatus, error) {
 	// Bind metadata and xattr reads to one regular-file descriptor this lookup owns.
 	file, err := os.Open(path)
 	if err != nil {
-		return CachedSignature{}, signatureReadMiss, fmt.Errorf("open signature source failed, %w", err)
+		return SignatureEntry{}, SignatureMissing, fmt.Errorf("open signature source failed, %w", err)
 	}
 	defer file.Close()
 
-	return readCachedSignatureFile(file)
-}
-
-// readCachedSignatureFile obtains metadata for a standalone lookup through an owned descriptor.
-// Pipeline lookups already have that metadata and call readCachedSignatureInfo directly.
-func readCachedSignatureFile(file *os.File) (CachedSignature, signatureReadStatus, error) {
 	// Capture the regular-file facts that bind the cached signature.
 	info, err := file.Stat()
 	if err != nil {
-		return CachedSignature{}, signatureReadMiss, fmt.Errorf("stat signature source failed, %w", err)
+		return SignatureEntry{}, SignatureMissing, fmt.Errorf("stat signature source failed, %w", err)
 	}
-	return readCachedSignatureInfo(file, info)
+	return readSignatureEntryInfo(file, info)
 }
 
-func readCachedSignatureInfo(file *os.File, info os.FileInfo) (CachedSignature, signatureReadStatus, error) {
+// readSignatureEntryInfo reads the entry through a descriptor whose metadata the caller already
+// holds. Pipeline lookups call it directly; ReadSignatureEntry obtains the metadata itself.
+func readSignatureEntryInfo(file *os.File, info os.FileInfo) (SignatureEntry, SignatureStatus, error) {
 	// Only regular-file metadata can validate a stored content signature.
 	if !info.Mode().IsRegular() {
-		return CachedSignature{}, signatureReadMiss, fmt.Errorf("signature source is not a regular file")
+		return SignatureEntry{}, SignatureMissing, fmt.Errorf("signature source is not a regular file")
 	}
 
 	// Decode the managed xattr while preserving miss and failure semantics. A file system
@@ -139,20 +249,21 @@ func readCachedSignatureInfo(file *os.File, info os.FileInfo) (CachedSignature, 
 	encoded, err := readManagedXattr(file)
 	if err != nil {
 		if signatureXattrIgnorable(err) {
-			return CachedSignature{}, signatureReadMiss, nil
+			return SignatureEntry{}, SignatureMissing, nil
 		}
-		return CachedSignature{}, signatureReadMiss, fmt.Errorf("read signature xattr failed, %w", err)
+		return SignatureEntry{}, SignatureMissing, fmt.Errorf("read signature xattr failed, %w", err)
 	}
-	signature, err := DecodeCachedSignature(encoded)
+	entry, err := DecodeSignatureEntry(encoded)
 	if err != nil {
-		return CachedSignature{}, signatureReadMiss, err
+		return SignatureEntry{}, SignatureMissing, err
 	}
 
-	// Compare with this run's metadata so a file changed between runs rejects its old entry.
-	if signature.Size != info.Size() || signature.MtimeNS != info.ModTime().UnixNano() {
-		return signature, signatureReadStale, nil
+	// Compare with the stored file's own facts, never a decoded size, so a file changed between
+	// runs rejects its old entry.
+	if entry.Size != info.Size() || entry.MtimeNS != info.ModTime().UnixNano() {
+		return entry, SignatureStale, nil
 	}
-	return signature, signatureReadHit, nil
+	return entry, SignatureFresh, nil
 }
 
 // signatureCache is the aggregate accounting of one run's cache activity. It owns no writer and
@@ -167,42 +278,49 @@ func newSignatureCache() *signatureCache {
 	return &signatureCache{}
 }
 
-func newCachedSignature(hash []byte, indexed *stat) (CachedSignature, error) {
-	if len(hash) != len(CachedSignature{}.SHA256) {
-		return CachedSignature{}, fmt.Errorf("invalid SHA-256 size=%d", len(hash))
+// storedHash returns the stored hash an item may reuse from a fresh entry. A plain read trusts
+// only the hash of the bytes on disk; a decoding read trusts only the decoded hash, and only for
+// the encoding and declared size the item names now.
+func (j *baseJob) storedHash(entry *SignatureEntry) []byte {
+	if j.decode == nil {
+		if len(entry.SHA256) == sha256.Size {
+			return entry.SHA256
+		}
+		return nil
 	}
-	if indexed == nil {
-		return CachedSignature{}, fmt.Errorf("signature metadata is missing")
+	decoded := entry.Decoded
+	if decoded == nil || decoded.Encoding != j.decodeEncoding || decoded.Size != j.stat.size || len(decoded.SHA256) != sha256.Size {
+		return nil
 	}
-
-	signature := CachedSignature{
-		Size:    indexed.size,
-		MtimeNS: indexed.modTime.UnixNano(),
-	}
-	copy(signature.SHA256[:], hash)
-	return signature, nil
+	return decoded.SHA256
 }
 
-func (c *signatureCache) lookup(file *os.File, path string, indexed *stat) ([]byte, bool) {
+// lookup reads a source's entry through its content descriptor. It returns the fresh entry, which
+// a later refresh merges into, and the stored hash only when this item can reuse it.
+func (c *signatureCache) lookup(file *os.File, path string, job *baseJob) (*SignatureEntry, []byte) {
 	// Treat every unusable cache read as a non-fatal miss with diagnostics.
-	signature, status, err := readCachedSignatureInfo(file, indexed.info)
+	entry, status, err := readSignatureEntryInfo(file, job.stat.info)
 	if err != nil {
 		c.recordFailure(path, err)
 		c.incrementMiss()
-		return nil, false
+		return nil, nil
 	}
 
 	// Distinguish metadata staleness from an absent entry for aggregate reporting.
 	switch status {
-	case signatureReadHit:
-		c.incrementHit()
-		return append([]byte(nil), signature.SHA256[:]...), true
-	case signatureReadStale:
+	case SignatureFresh:
+		if hash := job.storedHash(&entry); hash != nil {
+			c.incrementHit()
+			return &entry, append([]byte(nil), hash...)
+		}
+		c.incrementMiss()
+		return &entry, nil
+	case SignatureStale:
 		c.incrementStale()
 	default:
 		c.incrementMiss()
 	}
-	return nil, false
+	return nil, nil
 }
 
 // refreshCacheEntry publishes the computed content signature of a finished item through the
@@ -219,56 +337,132 @@ func (c *StreamCopyer) refreshCacheEntry(file *os.File, path string, job *baseJo
 	}
 
 	// Share policy and snapshot decisions with publication after descriptor closure.
-	if signature, ok := c.cacheEntry(path, job, target); ok {
-		c.signatures.write(file, path, signature)
+	if entry, ok := c.cacheEntry(path, job, target); ok {
+		c.signatures.write(file, path, entry)
 	}
 }
 
 // refreshCachePath publishes through a stable, caller-owned path after its descriptor closes.
 // The caller keeps the path unchanged until publication and any target replacement finish.
 func (c *StreamCopyer) refreshCachePath(path string, job *baseJob, target bool) {
-	if signature, ok := c.cacheEntry(path, job, target); ok {
-		c.signatures.recordWrite(path, writeManagedPathXattr(path, encodeCachedSignature(signature)))
+	if entry, ok := c.cacheEntry(path, job, target); ok {
+		c.signatures.recordWrite(path, writeEntryPath(path, entry))
 	}
 }
 
-func (c *StreamCopyer) cacheEntry(path string, job *baseJob, target bool) (CachedSignature, bool) {
-	// Only a completed content hash under a refresh policy can publish an entry.
-	if c.signatures == nil || !c.hashPolicy.refreshesCache() {
-		return CachedSignature{}, false
+func writeEntryPath(path string, entry SignatureEntry) error {
+	encoded, err := encodeSignatureEntry(entry)
+	if err != nil {
+		return err
 	}
+	return writeManagedPathXattr(path, encoded)
+}
+
+func writeEntryFile(file *os.File, entry SignatureEntry) error {
+	encoded, err := encodeSignatureEntry(entry)
+	if err != nil {
+		return err
+	}
+	return writeManagedXattr(file, encoded)
+}
+
+// refreshHash returns the hash this run computed when the policy refreshes the cache and the
+// side has not opted out of writing it.
+func (c *StreamCopyer) refreshHash(job *baseJob, target bool) ([]byte, bool) {
+	// Only a completed content hash under a refresh policy can publish a hash.
+	if c.signatures == nil || !c.hashPolicy.refreshesCache() {
+		return nil, false
+	}
+
 	// Each side may opt out of the write alone; hashing and the other side are unaffected.
 	side := c.fromDevice
 	if target {
 		side = c.toDevice
 	}
 	if side.skipCacheRefresh {
-		return CachedSignature{}, false
+		return nil, false
 	}
-	hash, ok := job.computedHash()
-	if !ok {
-		return CachedSignature{}, false
-	}
-	signature, err := newCachedSignature(hash, job.stat)
-	if err != nil {
-		c.signatures.recordFailure(path, err)
-		return CachedSignature{}, false
-	}
-
-	// Preparation retained the source entry; fresh targets have no equal entry to skip.
-	if !target && job.cachedSignature != nil && *job.cachedSignature == signature {
-		return CachedSignature{}, false
-	}
-	return signature, true
+	return job.computedHash()
 }
 
-// write publishes one computed signature through the descriptor that owns the file. The snapshot
-// is stored unchanged: a signature describes the version that was hashed, the reader treats an
+func (c *StreamCopyer) cacheEntry(path string, job *baseJob, target bool) (SignatureEntry, bool) {
+	hash, ok := c.refreshHash(job, target)
+	if !ok {
+		return SignatureEntry{}, false
+	}
+	if job.stat == nil {
+		c.signatures.recordFailure(path, fmt.Errorf("signature metadata is missing"))
+		return SignatureEntry{}, false
+	}
+
+	// A fresh target has no entry to merge with or skip.
+	if target {
+		return SignatureEntry{Size: job.stat.size, MtimeNS: job.stat.modTime.UnixNano(), SHA256: hash}, true
+	}
+
+	// A source keeps the half of its fresh entry this read did not compute, and skips an unchanged write.
+	entry := SignatureEntry{Size: job.stat.info.Size(), MtimeNS: job.stat.info.ModTime().UnixNano()}
+	existing := job.cachedEntry
+	switch {
+	case job.decode == nil:
+		entry.SHA256 = hash
+		if existing != nil {
+			entry.Decoded = existing.Decoded
+		}
+	default:
+		if existing != nil {
+			entry.SHA256 = existing.SHA256
+		}
+		entry.Decoded = &DecodedSignature{Encoding: job.decodeEncoding, Size: job.stat.size, SHA256: hash}
+	}
+	if existing != nil && existing.equal(entry) {
+		return SignatureEntry{}, false
+	}
+	return entry, true
+}
+
+// encodedEntry describes an encoded target: the stored file's own size and the source mtime that
+// the metadata restore applies, with the plaintext facts as the encoded-file marker. The hash is
+// the only optional part, and follows the refresh policy.
+func (c *StreamCopyer) encodedEntry(job *baseJob, stored int64) SignatureEntry {
+	entry := SignatureEntry{
+		Size:    stored,
+		MtimeNS: job.stat.modTime.UnixNano(),
+		Decoded: &DecodedSignature{Encoding: job.encodeEncoding, Size: job.stat.size},
+	}
+	if hash, ok := c.refreshHash(job, true); ok {
+		entry.Decoded.SHA256 = hash
+	}
+	return entry
+}
+
+// writeEncodedMarker publishes the entry that marks a target as encoded, through the descriptor
+// of a random output or the owned temporary path of a closed linear one. Unlike a plain cache
+// write, its failure is the caller's error, including a file system without the attribute.
+func (c *StreamCopyer) writeEncodedMarker(file *os.File, path string, job *baseJob, stored int64, linear bool) error {
+	entry := c.encodedEntry(job, stored)
+	var err error
+	if linear {
+		err = writeEntryPath(path, entry)
+	} else {
+		err = writeEntryFile(file, entry)
+	}
+	if err != nil {
+		return err
+	}
+	if c.signatures != nil {
+		c.signatures.incrementWrite()
+	}
+	return nil
+}
+
+// write publishes one computed entry through the descriptor that owns the file. The snapshot
+// is stored unchanged: an entry describes the version that was hashed, the reader treats an
 // entry whose size or mtime no longer match as stale, and re-deriving it from live metadata would
 // bind the hash to a version it never described. Every failure is an aggregate warning, because a
 // cache that cannot store an entry never fails the item that computed it.
-func (c *signatureCache) write(file *os.File, path string, signature CachedSignature) {
-	c.recordWrite(path, writeManagedXattr(file, encodeCachedSignature(signature)))
+func (c *signatureCache) write(file *os.File, path string, entry SignatureEntry) {
+	c.recordWrite(path, writeEntryFile(file, entry))
 }
 
 func (c *signatureCache) recordWrite(path string, err error) {

@@ -11,10 +11,13 @@ import (
 )
 
 func readSignatureXattr(file *os.File) ([]byte, error) {
-	// The codec has a fixed size. One spare byte makes oversized entries fail decoding,
-	// including platforms that return a truncated attribute instead of ERANGE.
-	value := make([]byte, signatureEncodedSize+1)
+	// One spare byte makes an oversized entry fail decoding on platforms that return a truncated
+	// attribute; the others report ERANGE.
+	value := make([]byte, signatureMaxSize+1)
 	n, err := unix.Fgetxattr(int(file.Fd()), signatureXattrName, value)
+	if errors.Is(err, unix.ERANGE) {
+		return nil, errSignatureOversized
+	}
 	if err != nil {
 		return nil, err
 	}

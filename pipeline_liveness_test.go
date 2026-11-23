@@ -59,10 +59,10 @@ func (o *pipelineOutput) Close() error {
 	}
 	return nil
 }
-func (*pipelineOutput) Sync() error          { return nil }
-func (*pipelineOutput) Cache(*baseJob, bool) {}
-func (*pipelineOutput) Restore(*stat) error  { return nil }
-func (*pipelineOutput) Discard() error       { return nil }
+func (*pipelineOutput) Sync() error                       { return nil }
+func (*pipelineOutput) Cache(*baseJob, bool, int64) error { return nil }
+func (*pipelineOutput) Restore(*stat) error               { return nil }
+func (*pipelineOutput) Discard() error                    { return nil }
 func (o *pipelineOutput) Commit(bool) error {
 	if o.commit != nil {
 		return o.commit()

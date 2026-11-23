@@ -182,7 +182,8 @@ func (c *StreamCopyer) prepareTarget(job *writeJob, target targetSpec) (out *fil
 			}
 		}
 	}
-	if !c.toDevice.linear && job.stat.size > 0 {
+	// An encoded output's stored size is unknown until its encoder closes.
+	if !c.toDevice.linear && job.stat.size > 0 && job.encode == nil {
 		if err := allocateTarget(out.File, job.stat.size); err != nil {
 			return out, fmt.Errorf("preallocate target failed, %w", err)
 		}

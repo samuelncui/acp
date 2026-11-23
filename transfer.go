@@ -127,7 +127,9 @@ func (t *transfer) cacheSource() {
 	}()
 	t.publishHash()
 	<-t.sourceDone
-	if t.job.sourcePath != "" {
+	// A source whose Close failed, including a decoder that rejected its plaintext, has no hash
+	// worth storing. sourceErr is set before sourceDone closes.
+	if t.sourceErr == nil && t.job.sourcePath != "" {
 		t.copyer.refreshCachePath(t.job.sourcePath, t.job.baseJob, false)
 	}
 }

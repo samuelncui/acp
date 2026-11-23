@@ -69,6 +69,7 @@ func TestSignatureCacheWriteRetainsPriorRunMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	entry := SignatureEntry{Size: want.Size, MtimeNS: want.MtimeNS, SHA256: want.SHA256[:]}
 
 	// Open the descriptor the item would own, seed a decoy so the assertion below proves the
 	// writer replaced it, and skip on filesystems that cannot store the attribute at all.
@@ -83,7 +84,7 @@ func TestSignatureCacheWriteRetainsPriorRunMetadata(t *testing.T) {
 
 	// Publish the stable file's hash through its owned descriptor.
 	cache := newSignatureCache()
-	cache.write(file, path, want)
+	cache.write(file, path, entry)
 	if cache.summary.Writes != 1 || cache.summary.Failures != 0 {
 		t.Fatalf("signature summary = %#v", cache.summary)
 	}
@@ -579,7 +580,8 @@ func TestRunCorruptSignatureIsWarning(t *testing.T) {
 	for name, value := range map[string][]byte{
 		"short":     []byte("corrupt"),
 		"one extra": append(encodeCachedSignature(CachedSignature{}), 0),
-		"oversized": make([]byte, signatureEncodedSize*2),
+		"oversized": make([]byte, signatureLegacySize*2),
+		"too long":  bytes.Repeat([]byte{0x0a, 0x00}, signatureMaxSize),
 	} {
 		t.Run(name, func(t *testing.T) {
 			// A bounded xattr read must reject malformed data without accepting a valid prefix.

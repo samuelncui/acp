@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package acp.signature;
+
+option go_package = "github.com/samuelncui/acp/internal/signaturepb";
+
+// SignatureEntry is the value of the managed signature xattr. It describes the stored file's own
+// bytes and, for an encoded file, the decoded content.
+message SignatureEntry {
+  // Size and mtime_ns of the file on disk decide whether the entry is fresh.
+  int64 size = 1;
+  int64 mtime_ns = 2;
+  // SHA-256 of the bytes on disk; empty when unknown.
+  bytes sha256 = 3;
+  // Present only for an encoded file, where it is also the durable marker that the file is encoded.
+  Decoded decoded = 4;
+}
+
+message Decoded {
+  // Caller-defined, non-empty encoding name, such as "zstd".
+  string encoding = 1;
+  // Decoded size.
+  int64 size = 2;
+  // SHA-256 of the decoded content; empty when unknown.
+  bytes sha256 = 3;
+}

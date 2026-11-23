@@ -60,6 +60,10 @@ windows/amd64, darwin/arm64 and freebsd/amd64, the Python 3 release-tool regress
 concurrency, cache, pipeline and event changes. Individual gates remain available as `make test`,
 `make vet`, `make cross` and `make race`.
 
+The managed-entry Protobuf code is generated: after editing `internal/signaturepb/signature.proto`,
+run `go generate ./internal/signaturepb` with `protoc` 26.0 and `protoc-gen-go` v1.33.0 on `PATH`
+and commit the result; never edit the `.pb.go` file by hand.
+
 ## Behavior and test boundaries
 
 [README.md](README.md#operating-model-and-stages) owns the behavior being verified. Unit and
@@ -76,8 +80,10 @@ Use this inventory to select or update coverage; it is not a record of tests run
 | Input-method evaluation, reused source facts, target resolution and alias/overwrite validation | `item_test.go`, `stream_test.go`, `fs_test.go`, `target_test.go` | Public stream and shell copies in `library_e2e_test.go` |
 | Source ownership, one content pass/hash, read modes, empty files and multiple targets | `copy_test.go`, `item_test.go`, `fs_test.go` | Library and command E2E |
 | Staged replacement, failure preservation, final-path outcomes and owned temporary cleanup | `staged_target_test.go`, `target_test.go`, `internal/fileio/output_test.go`, `internal/fileio/temp_test.go` | Library/command E2E and rewrite failure/resume tests |
+| Encoded native content: plaintext facts, stored size, staging without preallocation, the encoded-file entry and its write failure, decoded read-back, `ErrEncodedContent` versus native read errors, encoder/decoder failure cleanup | `encoded_test.go`, `decoded_close_test.go`, `signature_decoded_test.go` | Random/linear target and buffered/mapped/linear source stream copies in `encoded_test.go` |
+| Source-failure tagging and member-only endpoint failures: `ErrSourceRead` versus target failures and stops, settled content-source, target-refusal and writer-Finish failures, cause isolation, refused-member draining | `source_tag_test.go`, `source_timeout_test.go`, `member_settled_test.go`, `member_settled_*_test.go` | Linear content-endpoint stream copies in those tests |
 | Ordered completion of native path aliases without blocking independent outputs | `publication_serial_test.go`, `pipeline_liveness_test.go` | Native case/decomposition and relative/absolute copies in `target_identity_test.go` |
-| Metadata, hash policies, between-run cache staleness, cache warnings and descriptor use | `signature_test.go`, `signature_xattr_copy_test.go`, `cleanup_test.go` | Real cache copies in those tests; metadata and report hashes in library/command E2E |
+| Metadata, hash policies, between-run cache staleness, cache warnings and descriptor use; Protobuf and legacy entry codec, plain and decoding reuse and refresh merging | `signature_test.go`, `signature_entry_test.go`, `signature_decoded_test.go`, `signature_xattr_copy_test.go`, `cleanup_test.go` | Real cache copies in those tests; metadata and report hashes in library/command E2E |
 | Results, batching, cancellation, backpressure, linear ordering and event delivery | `item_test.go`, `stream_test.go`, `copy_test.go`, `opt_test.go` | Command interrupt, report and progress tests in `e2e_test.go` |
 | Panic handling, channel completion and resource release | `recover_test.go`, `copy_test.go`, `stream_test.go` | Caller callback/handler panic tests driving a real stream |
 | Independent cache initialization, asynchronous capacity polling and filesystem error identities | `cache_test.go`, `fs_test.go`, `disk_usage_test.go`, `linear_space_test.go`, `full_linux_test.go` | Real copies with blocked capacity queries and Linux device/filled-volume cases |

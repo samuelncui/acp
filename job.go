@@ -35,6 +35,10 @@ type baseJob struct {
 	contentTargets []ContentTarget
 	endpoints      bool
 	metadata       ContentMetadata
+	encode         func(io.Writer) (io.WriteCloser, error)
+	decode         func(io.Reader) (io.ReadCloser, error)
+	encodeEncoding string
+	decodeEncoding string
 
 	// itemError reports an item ACP could not process at all, instead of a completion.
 	itemError error
@@ -42,14 +46,15 @@ type baseJob struct {
 	lock      sync.Mutex
 	writeTime time.Time
 
-	targets         []string
-	outputs         []targetSpec
-	cachedSignature *CachedSignature
-	successTargets  []string
-	failedTargets   map[string]error
-	hash            []byte
-	cacheHit        bool
-	hashValid       bool
+	targets        []string
+	outputs        []targetSpec
+	cachedEntry    *SignatureEntry
+	successTargets []string
+	storedSizes    map[string]int64
+	failedTargets  map[string]error
+	hash           []byte
+	cacheHit       bool
+	hashValid      bool
 }
 
 // startWrite records when the copy stage took the item, which is the write time of every
@@ -95,11 +100,15 @@ func (j *baseJob) computedHash() ([]byte, bool) {
 	return j.hash, true
 }
 
-func (j *baseJob) success(path string) {
+func (j *baseJob) success(path string, stored int64) {
 	j.lock.Lock()
 	defer j.lock.Unlock()
 
 	j.successTargets = append(j.successTargets, path)
+	if j.storedSizes == nil {
+		j.storedSizes = make(map[string]int64, len(j.targets))
+	}
+	j.storedSizes[path] = stored
 }
 
 func (j *baseJob) fail(path string, err error) {
@@ -166,6 +175,8 @@ func (j *baseJob) result() Result {
 			// The item never reached this target, so its outcome is the item error instead of
 			// a write that never happened.
 			outcome.Err = j.itemError
+		default:
+			outcome.StoredSize = j.storedSizes[target]
 		}
 		result.Targets = append(result.Targets, outcome)
 	}

@@ -106,9 +106,44 @@ type targetTransfer struct {
 	spec        targetSpec
 	output      transferOutput
 	content     ContentWriter
+	encoder     io.WriteCloser
+	stored      int64
 	chunks      chan *chunkBuffer
 	err         error
 	publication publicationTurn
+}
+
+// storedWriter counts the bytes a native output stores, beneath any item encoder.
+type storedWriter struct{ target *targetTransfer }
+
+func (w storedWriter) Write(data []byte) (int, error) {
+	n, err := w.target.output.Write(data)
+	w.target.stored += int64(n)
+	return n, err
+}
+
+// startEncoder wraps a created native output in the item's encoder.
+func (target *targetTransfer) startEncoder(encode func(io.Writer) (io.WriteCloser, error)) error {
+	var err error
+	panicErr := protectCall("item target encoder", func() { target.encoder, err = encode(storedWriter{target}) })
+	err = errors.Join(err, panicErr)
+	if err == nil && target.encoder == nil {
+		err = fmt.Errorf("target encoder returned no writer")
+	}
+	if err != nil {
+		return fmt.Errorf("start target encoder failed, %w", err)
+	}
+	return nil
+}
+
+// closeEncoder flushes the encoded tail once, including after a failed write.
+func (target *targetTransfer) closeEncoder() error {
+	var err error
+	panicErr := protectCall("item target encoder Close", func() { err = target.encoder.Close() })
+	if err = errors.Join(err, panicErr); err != nil {
+		return fmt.Errorf("close target encoder failed, %w", err)
+	}
+	return nil
 }
 
 func (t *transfer) writeContent(cntr *counter, exhausted mapset.Set[string]) {
@@ -116,6 +151,8 @@ func (t *transfer) writeContent(cntr *counter, exhausted mapset.Set[string]) {
 	c := t.copyer
 	var targets []*targetTransfer
 	var data sync.WaitGroup
+	// aborted records that this item stopped its own read early, so the read's stop is no failure.
+	var aborted bool
 	defer func() {
 		var failure error
 		if value := recover(); value != nil {
@@ -130,13 +167,22 @@ func (t *transfer) writeContent(cntr *counter, exhausted mapset.Set[string]) {
 		<-t.readDone
 		for _, target := range targets {
 			target.err = errors.Join(target.err, t.readErr, failure)
+			// The encoded tail belongs to this file's data writing, before a linear writer moves on.
+			if target.encoder != nil {
+				if err := target.closeEncoder(); err != nil {
+					target.err = errors.Join(target.err, err)
+					c.endLinearTarget(err)
+				}
+			}
 			t.targets.Add(1)
 			go c.wrap(context.Background(), func() {
 				defer t.targets.Done()
 				t.finishTarget(target, exhausted)
 			})
 		}
-		if t.readErr != nil && len(targets) == 0 && t.hashes != nil {
+		// With no target to carry it, a read failure is the item's own; a drained member reports it
+		// too, while an item that aborted its read keeps the stop out of its result.
+		if t.readErr != nil && len(targets) == 0 && (t.hashes != nil || !aborted) {
 			t.job.itemError = t.readErr
 		}
 	}()
@@ -179,6 +225,11 @@ func (t *transfer) writeContent(cntr *counter, exhausted mapset.Set[string]) {
 		}
 		if err != nil {
 			if spec.content != nil {
+				// A writer that refused the member before emitting anything fails only this target.
+				if content == nil && errors.Is(err, ErrMemberSettled) {
+					c.targetFailed(t.job.baseJob, spec.name, spec.device, err, exhausted)
+					continue
+				}
 				if content != nil {
 					// Even an errored Open can return an owned handle; Finish still waits for Close.
 					targets = append(targets, &targetTransfer{spec: spec, content: content, err: err})
@@ -189,21 +240,26 @@ func (t *transfer) writeContent(cntr *counter, exhausted mapset.Set[string]) {
 					t.job.fail(remaining.name, err)
 				}
 				t.stopEndpoint(err)
+				aborted = true
 				t.abort()
 				break
 			}
 			c.targetFailed(t.job.baseJob, spec.name, spec.device, err, exhausted)
 			continue
 		}
-		var turn publicationTurn
-		if i < len(t.publications) {
-			turn = t.publications[i]
+		target := &targetTransfer{spec: spec, output: output, content: content}
+		if spec.content == nil && t.job.encode != nil {
+			// A refused encoder leaves its output unpublished, like any other creation failure.
+			if err := target.startEncoder(t.job.encode); err != nil {
+				c.targetFailed(t.job.baseJob, spec.name, spec.device, errors.Join(err, output.Discard()), exhausted)
+				continue
+			}
 		}
-		target := &targetTransfer{spec: spec, output: output, content: content, publication: turn}
-		targets = append(targets, target)
 		if i < len(t.publications) {
+			target.publication = t.publications[i]
 			t.publications[i] = publicationTurn{}
 		}
+		targets = append(targets, target)
 		if !c.toDevice.linear {
 			target.chunks = make(chan *chunkBuffer, 4)
 			data.Add(1)
@@ -214,8 +270,10 @@ func (t *transfer) writeContent(cntr *counter, exhausted mapset.Set[string]) {
 		}
 	}
 
-	// Failed consumers keep draining; only an item with no content consumer stops reading early.
-	if len(targets) == 0 && t.hashes == nil {
+	// Failed consumers keep draining; only a native item with no content consumer stops reading
+	// early. A content source always reads its member to the end, keeping its stream's boundary.
+	if len(targets) == 0 && t.hashes == nil && t.job.contentSource == nil {
+		aborted = true
 		t.abort()
 	}
 	var consumed int64
@@ -223,6 +281,9 @@ func (t *transfer) writeContent(cntr *counter, exhausted mapset.Set[string]) {
 		continued := func() bool {
 			defer chunk.release()
 			if len(targets) == 0 && t.hashes == nil {
+				// A drained member still advances the read-ahead window, or its reader waits forever.
+				consumed += int64(len(chunk.data))
+				t.ahead.advance(t.job.order, t.start+consumed)
 				return true
 			}
 			for _, target := range targets {
@@ -312,7 +373,7 @@ func (t *transfer) finishTarget(target *targetTransfer, exhausted mapset.Set[str
 		if target.err != nil {
 			c.targetFailed(t.job.baseJob, target.spec.name, target.spec.device, target.err, exhausted)
 		} else {
-			t.job.success(target.spec.name)
+			t.job.success(target.spec.name, target.stored)
 		}
 	}()
 
@@ -347,9 +408,22 @@ func (t *transfer) finishTarget(target *targetTransfer, exhausted mapset.Set[str
 		}
 	}
 
+	// A decoder Close can still reject the plaintext, so it settles before any native output publishes.
+	if t.job.decode != nil {
+		<-t.sourceDone
+		if t.sourceErr != nil {
+			target.err = fmt.Errorf("close decoded source failed, %w", t.sourceErr)
+			return
+		}
+	}
+
 	// Managed metadata precedes restrictive permissions; ordinary random targets retain their sync order.
 	if !target.spec.direct {
-		out.Cache(t.job.baseJob, c.toDevice.linear)
+		if err := out.Cache(t.job.baseJob, c.toDevice.linear, target.stored); err != nil {
+			target.err = fmt.Errorf("write target signature failed, %w", err)
+			c.endLinearTarget(target.err)
+			return
+		}
 		if err := out.Restore(t.job.stat); err != nil {
 			target.err = fmt.Errorf("restore target metadata failed, %w", err)
 			c.endLinearTarget(target.err)
@@ -382,10 +456,13 @@ func (t *transfer) finishTarget(target *targetTransfer, exhausted mapset.Set[str
 }
 
 func (target *targetTransfer) writer() io.Writer {
-	if target.content != nil {
+	switch {
+	case target.content != nil:
 		return target.content
+	case target.encoder != nil:
+		return target.encoder
 	}
-	return target.output
+	return storedWriter{target}
 }
 
 func (t *transfer) finishContentTarget(target *targetTransfer) {
@@ -393,16 +470,60 @@ func (t *transfer) finishContentTarget(target *targetTransfer) {
 	t.publishHash()
 	<-t.sourceDone
 	target.err = errors.Join(target.err, t.sourceErr, t.hashErr)
-	panicErr := protectCall("ContentWriter.Finish", func() {
-		target.err = errors.Join(target.err, target.content.Finish(target.err))
-	})
-	target.err = errors.Join(target.err, panicErr)
-
-	// A broken member stops the ordered stream, preserving each original failure cause.
+	// The cause reaches Finish behind its own node, so a marker Finish merely passes on from it is
+	// told apart from a marker Finish adds itself.
+	var cause error
 	if target.err != nil {
-		t.stopEndpoint(target.err)
+		cause = &finishCause{err: target.err}
+	}
+	var finishErr error
+	panicErr := protectCall("ContentWriter.Finish", func() {
+		finishErr = target.content.Finish(cause)
+	})
+	target.err = errors.Join(target.err, finishErr, panicErr)
+
+	// A broken member stops the ordered stream, preserving each original failure cause, unless the
+	// writer's own Finish settled it at a usable boundary. A source that settled its own failure
+	// says nothing about the target stream, and a panicking Finish settles nothing.
+	if target.err != nil {
+		if panicErr != nil || !settledByWriter(finishErr, cause) {
+			t.stopEndpoint(target.err)
+		}
 		t.job.fail(target.spec.name, target.err)
 		return
 	}
-	t.job.success(target.spec.name)
+	t.job.success(target.spec.name, 0)
+}
+
+// finishCause carries a failed member's cause into ContentWriter.Finish as a node of its own. It
+// keeps errors.Is and errors.As working through the cause.
+type finishCause struct{ err error }
+
+func (c *finishCause) Error() string { return c.err.Error() }
+func (c *finishCause) Unwrap() error { return c.err }
+
+// settledByWriter reports whether a Finish error wraps ErrMemberSettled outside the cause it was
+// given, following the same Is and Unwrap rules as errors.Is. Returning, wrapping or joining the
+// cause therefore never settles a member, even when the cause carries a source's own marker.
+func settledByWriter(err, cause error) bool {
+	if err == nil || err == cause {
+		return false
+	}
+	if err == ErrMemberSettled {
+		return true
+	}
+	if matcher, ok := err.(interface{ Is(error) bool }); ok && matcher.Is(ErrMemberSettled) {
+		return true
+	}
+	switch wrapped := err.(type) {
+	case interface{ Unwrap() error }:
+		return settledByWriter(wrapped.Unwrap(), cause)
+	case interface{ Unwrap() []error }:
+		for _, child := range wrapped.Unwrap() {
+			if settledByWriter(child, cause) {
+				return true
+			}
+		}
+	}
+	return false
 }
