@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package acp.signature;
 
-option go_package = "github.com/samuelncui/acp/internal/signaturepb";
+option go_package = "github.com/samuelncui/acp/signature/internal/signaturepb";
 
 // SignatureEntry is the value of the managed signature xattr. It describes the stored file's own
 // bytes and, for an encoded file, the decoded content.

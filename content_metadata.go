@@ -4,15 +4,17 @@ import (
 	"fmt"
 	"io/fs"
 	"time"
+
+	"github.com/samuelncui/acp/signature"
 )
 
 // Content endpoint metadata limits also bound native capture before allocating xattr buffers.
 // The aggregate includes a conservative 64-byte framing allowance per attribute.
 const (
-	ContentMaxXattrCount      = 256
-	ContentMaxXattrNameBytes  = 1 << 10
-	ContentMaxXattrValueBytes = 1 << 20
-	ContentMaxMetadataBytes   = 4 << 20
+	contentMaxXattrCount      = 256
+	contentMaxXattrNameBytes  = 1 << 10
+	contentMaxXattrValueBytes = 1 << 20
+	contentMaxMetadataBytes   = 4 << 20
 )
 
 type contentInfo struct {
@@ -31,14 +33,14 @@ func (i contentInfo) Sys() any           { return nil }
 
 func checkContentXattr(name string, size, count, total int) (int, error) {
 	// Attribute representation belongs to the source or target codec; ACP bounds snapshot size.
-	if len(name) > ContentMaxXattrNameBytes {
+	if len(name) > contentMaxXattrNameBytes {
 		return total, fmt.Errorf("content xattr name exceeds metadata limit, name=%q", name)
 	}
-	if size < 0 || size > ContentMaxXattrValueBytes || count > ContentMaxXattrCount {
+	if size < 0 || size > contentMaxXattrValueBytes || count > contentMaxXattrCount {
 		return total, fmt.Errorf("content xattr exceeds metadata limits, name=%q, size=%d, count=%d", name, size, count)
 	}
 	total += len(name) + size + 64
-	if total > ContentMaxMetadataBytes {
+	if total > contentMaxMetadataBytes {
 		return total, fmt.Errorf("content xattrs exceed aggregate metadata limit")
 	}
 	return total, nil
@@ -61,7 +63,7 @@ func snapshotContentMetadata(metadata ContentMetadata) (ContentMetadata, error) 
 	result := ContentMetadata{Info: info}
 	count, total := 0, 0
 	for name, value := range metadata.Xattrs {
-		if signatureCacheKey(name) {
+		if signature.IsAttribute(name) {
 			continue
 		}
 		count++

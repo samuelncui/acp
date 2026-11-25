@@ -16,11 +16,27 @@ import (
 	"testing/fstest"
 )
 
+// sourceFromFS binds a filesystem and a name for tests that need a standard fs.File source.
+func sourceFromFS(fsys fs.FS, name string) ContentSource { return fsSource{fsys: fsys, name: name} }
+
+type fsSource struct {
+	fsys fs.FS
+	name string
+}
+
+func (s fsSource) Open(ctx context.Context) (fs.File, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	file, err := s.fsys.Open(s.name)
+	return file, errors.Join(err, ctx.Err())
+}
+
 type testContentFS func(string) (fs.File, error)
 
 func (f testContentFS) Open(name string) (fs.File, error) { return f(name) }
 
-func TestContentSourceFromFSObservesOpenedFileOnce(t *testing.T) {
+func TestContentSourceObservesOpenedFileOnce(t *testing.T) {
 	for _, data := range []string{"", "observed bytes"} {
 		t.Run(data, func(t *testing.T) {
 			// Binding is lazy, and filesystem names remain distinct from display identifiers.
@@ -54,7 +70,7 @@ func TestContentSourceFromFSObservesOpenedFileOnce(t *testing.T) {
 					return attrs, nil
 				},
 			}
-			source := SourceFromFS(testContentFS(func(name string) (fs.File, error) {
+			source := sourceFromFS(testContentFS(func(name string) (fs.File, error) {
 				record("open")
 				if name != "docs/file" {
 					t.Errorf("filesystem name=%q", name)
@@ -108,7 +124,7 @@ func TestContentSourceFromFSObservesOpenedFileOnce(t *testing.T) {
 	}
 }
 
-func TestContentSourceFromFSUsesStandardFiles(t *testing.T) {
+func TestContentSourceUsesStandardFiles(t *testing.T) {
 	// A plain fs.File needs neither random access nor the optional xattr capability.
 	root := t.TempDir()
 	for _, name := range []string{"nested/source", "empty"} {
@@ -118,7 +134,7 @@ func TestContentSourceFromFSUsesStandardFiles(t *testing.T) {
 		}
 		fsys := fstest.MapFS{name: &fstest.MapFile{Data: data, Mode: 0600}}
 		item := &testContentItem{SimpleJob: &SimpleJob{Path: "display " + name,
-			Dsts: []string{filepath.Join(root, filepath.Base(name))}}, source: SourceFromFS(fsys, name)}
+			Dsts: []string{filepath.Join(root, filepath.Base(name))}}, source: sourceFromFS(fsys, name)}
 		callback, batches := collectResults()
 		if err := runStream(context.Background(), callback, []Item{item},
 			SetFromDevice(LinearDevice(true)), WithHashPolicy(HashRead)); err != nil {
@@ -180,7 +196,7 @@ func TestContentSourceObservationFailuresCloseAcquiredFiles(t *testing.T) {
 					cancel()
 					return nil, failure
 				case "oversized attrs":
-					return map[string][]byte{"attr": make([]byte, ContentMaxXattrValueBytes+1)}, nil
+					return map[string][]byte{"attr": make([]byte, contentMaxXattrValueBytes+1)}, nil
 				}
 				return nil, nil
 			}
@@ -196,7 +212,7 @@ func TestContentSourceObservationFailuresCloseAcquiredFiles(t *testing.T) {
 			root := t.TempDir()
 			item := &testContentItem{SimpleJob: &SimpleJob{Path: "member", Dsts: []string{
 				filepath.Join(root, "native"), "custom",
-			}}, source: SourceFromFS(fsys, "member"), targets: []ContentTarget{nil,
+			}}, source: sourceFromFS(fsys, "member"), targets: []ContentTarget{nil,
 				testContentTarget(func(context.Context, ContentMetadata) (ContentWriter, error) {
 					targetOpens++
 					return nil, errors.New("unexpected target Open")
@@ -248,31 +264,3 @@ type contentPanicInfo struct {
 }
 
 func (i contentPanicInfo) Size() int64 { panic(i.cause) }
-
-func TestContentSourceFromFSBindingErrorsDoNotOpen(t *testing.T) {
-	// Logical paths follow io/fs without cleaning or converting native path syntax.
-	for _, name := range []string{"", "/absolute", "a/../b", "a//b", "bad\xff"} {
-		source := SourceFromFS(testContentFS(func(string) (fs.File, error) {
-			t.Error("invalid binding opened filesystem")
-			return nil, nil
-		}), name)
-		file, err := source.Open(context.Background())
-		if file != nil || !errors.Is(err, fs.ErrInvalid) {
-			t.Fatalf("name=%q, file=%v, err=%v", name, file, err)
-		}
-	}
-	if _, err := SourceFromFS(nil, "valid").Open(context.Background()); !errors.Is(err, fs.ErrInvalid) {
-		t.Fatalf("nil filesystem error=%v", err)
-	}
-
-	// Already-cancelled contexts never call the standard filesystem.
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	source := SourceFromFS(testContentFS(func(string) (fs.File, error) {
-		t.Error("cancelled binding opened filesystem")
-		return nil, nil
-	}), "valid")
-	if _, err := source.Open(ctx); !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancelled Open=%v", err)
-	}
-}

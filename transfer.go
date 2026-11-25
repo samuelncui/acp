@@ -37,7 +37,7 @@ func newTransfer(c *StreamCopyer, job *writeJob, ahead *readAhead, start int64) 
 	// Channels hold references; backing capacity is shared across every admitted transfer.
 	size := int64(0)
 	if job.stat != nil {
-		size = max(job.stat.size, 0)
+		size = job.stat.size
 	}
 	capacity := max(1, int((min(size, readAheadBytes)+batchSize-1)/batchSize))
 	t := &transfer{
@@ -57,13 +57,6 @@ func newTransfer(c *StreamCopyer, job *writeJob, ahead *readAhead, start int64) 
 }
 
 func (t *transfer) abort() { t.stopOnce.Do(func() { close(t.stop) }) }
-
-func (t *transfer) panicFailure(stage string, value any) error {
-	err := panicError(stage, value)
-	t.copyer.setError(err)
-	t.copyer.stopHard()
-	return err
-}
 
 func (t *transfer) wait(turn <-chan struct{}) bool {
 	if turn == nil {
@@ -85,7 +78,7 @@ func (t *transfer) hashContent() {
 	}
 	defer func() {
 		if value := recover(); value != nil {
-			t.hashErr = t.panicFailure("hash consumer", value)
+			t.hashErr = t.copyer.fatalPanic("hash consumer", value)
 		}
 		for chunk := range t.hashes {
 			chunk.release()
@@ -122,7 +115,7 @@ func (t *transfer) cacheSource() {
 	defer close(t.sourceCacheDone)
 	defer func() {
 		if value := recover(); value != nil {
-			t.panicFailure("source cache", value)
+			t.copyer.fatalPanic("source cache", value)
 		}
 	}()
 	t.publishHash()
@@ -141,13 +134,12 @@ func (t *transfer) run(ctx context.Context, out chan<- *baseJob, writing chan st
 	if unstarted {
 		t.noContent = true
 	}
-	drained := context.WithoutCancel(ctx)
-	go c.wrap(drained, t.hashContent)
-	go c.wrap(drained, t.readContent)
+	go c.wrap(t.hashContent)
+	go c.wrap(t.readContent)
 	active, turnReleased := false, false
 	defer func() {
 		if value := recover(); value != nil {
-			t.job.itemError = t.panicFailure("transfer", value)
+			t.job.itemError = t.copyer.fatalPanic("transfer", value)
 		}
 		t.abort()
 		if !turnReleased {
@@ -226,7 +218,7 @@ func (t *transfer) finishWrite() {
 	// The next data producer need not wait for hash, Close, metadata or results.
 	end := t.start
 	if t.job.stat != nil {
-		end += max(t.job.stat.size, 0)
+		end += t.job.stat.size
 	}
 	t.ahead.advance(t.job.order+1, end)
 	close(t.writeDone)

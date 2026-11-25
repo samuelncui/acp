@@ -1,7 +1,6 @@
 package acp
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -106,7 +105,7 @@ func (c *StreamCopyer) checkLinearSpace(job *writeJob, target targetSpec) error 
 func (c *StreamCopyer) pollSpace(device string, sample *spaceEstimate) {
 	// Completion follows panic recovery, so Wait also observes a failed polling worker.
 	defer close(sample.done)
-	c.wrap(context.Background(), func() {
+	c.wrap(func() {
 		// One query at a time bounds work even when statfs takes longer than the interval.
 		ticker := time.NewTicker(spaceRefreshInterval)
 		defer ticker.Stop()

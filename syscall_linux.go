@@ -4,11 +4,10 @@
 package acp
 
 import (
-	"errors"
 	"os"
 	"syscall"
 
-	"golang.org/x/sys/unix"
+	"github.com/samuelncui/acp/signature"
 )
 
 func truncate(file *os.File, size int64) error {
@@ -18,10 +17,6 @@ func truncate(file *os.File, size int64) error {
 	return nil
 }
 
-func isNoAttrErr(err error) bool {
-	return errors.Is(err, unix.ENODATA)
-}
-
 func checkXattrKey(key string) bool {
-	return !signatureCacheKey(key)
+	return !signature.IsAttribute(key)
 }

@@ -74,16 +74,10 @@ func (p HashPolicy) readsContent() bool {
 	return false
 }
 
-// producesHash reports whether a read item receives a content hash.
+// producesHash reports whether a read item receives a content hash. Every such policy also
+// keeps the run's cache statistics: reusesCache reports the lookup and refreshesCache the write,
+// and HashRead hashes content without either.
 func (p HashPolicy) producesHash() bool {
-	return p != HashOff
-}
-
-// usesCache reports whether the policy touches the stored cache at all: it either reuses a stored
-// hash, refreshes one with a computed hash, or both. It is what decides whether a run needs a
-// signature cache, and it is true for HashRead, which hashes content and writes nothing:
-// reusesCache reports the lookup, refreshesCache reports the write.
-func (p HashPolicy) usesCache() bool {
 	return p != HashOff
 }
 

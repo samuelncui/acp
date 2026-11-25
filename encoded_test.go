@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/samuelncui/acp/signature"
 )
 
 // rleEncoder is a trivial reversible test codec: (count, value) pairs ending with a (0, 0) pair.
@@ -161,16 +163,11 @@ func codecName(name string) string {
 
 func hasManagedSignature(t *testing.T, path string) bool {
 	t.Helper()
-	file, err := os.Open(path)
+	_, status, err := signature.Read(path)
 	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	_, err = readSignatureXattr(file)
-	if err != nil && !signatureXattrIgnorable(err) {
 		t.Fatalf("read managed signature of %q: %v", path, err)
 	}
-	return err == nil
+	return status != signature.Missing
 }
 
 func assertOnlyFiles(t *testing.T, dir string, names ...string) {
@@ -231,31 +228,29 @@ func TestEncodedTargetStoresEncodedFile(t *testing.T) {
 				t.Fatal(err)
 			}
 			var allocations atomic.Int32
-			previous := allocateTarget
-			allocateTarget = func(file *os.File, size int64) error {
+			countAllocations := withFS(fsHooks{allocate: func(file *os.File, size int64) error {
 				allocations.Add(1)
-				return previous(file, size)
-			}
-			t.Cleanup(func() { allocateTarget = previous })
+				return truncate(file, size)
+			}})
 
 			encodedPath := filepath.Join(out, "source.enc")
 			plainPath := filepath.Join(out, "plain")
 			encoded := &encodedItem{SimpleJob: &SimpleJob{Path: source, Dsts: []string{encodedPath}}, encode: newRLEEncoder}
 			plainItem := &SimpleJob{Path: source, Dsts: []string{plainPath}}
 			onResults, snapshot := collectResults()
-			options := append([]Option{WithHashPolicy(HashReadRefresh)}, device.options...)
+			options := append([]Option{WithHashPolicy(HashReadRefresh), countAllocations}, device.options...)
 			if err := runStream(context.Background(), onResults, []Item{encoded, plainItem}, options...); err != nil {
 				t.Fatal(err)
 			}
 			results := resultsByItem(t, snapshot())
 
-			// Hash and Size describe plaintext; StoredSize is the encoded file on disk.
+			// Hash and Size describe plaintext; StoredSize and StoredSHA256 are the encoded file on disk.
 			result := results[encoded]
 			if result.Err != nil || len(result.Targets) != 1 || result.Targets[0].Err != nil {
 				t.Fatalf("encoded result = %#v", result)
 			}
-			if result.Size != int64(len(plain)) || result.Targets[0].Size != int64(len(plain)) || !bytes.Equal(result.SHA256, want[:]) {
-				t.Fatalf("encoded facts size=%d target size=%d hash=%x", result.Size, result.Targets[0].Size, result.SHA256)
+			if result.Size != int64(len(plain)) || !bytes.Equal(result.SHA256, want[:]) {
+				t.Fatalf("encoded facts size=%d hash=%x", result.Size, result.SHA256)
 			}
 			stored, err := os.Stat(encodedPath)
 			if err != nil {
@@ -265,26 +260,40 @@ func TestEncodedTargetStoresEncodedFile(t *testing.T) {
 			if result.Targets[0].StoredSize != stored.Size() || stored.Size() != int64(len(wantEncoded)) {
 				t.Fatalf("stored size = %d, file size = %d, encoded size = %d", result.Targets[0].StoredSize, stored.Size(), len(wantEncoded))
 			}
+			onDisk, err := os.ReadFile(encodedPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			storedSum := sha256.Sum256(onDisk)
+			if !bytes.Equal(result.Targets[0].StoredSHA256, storedSum[:]) {
+				t.Fatalf("stored hash = %x, want the hash of the file on disk %x", result.Targets[0].StoredSHA256, storedSum)
+			}
 			if !bytes.Equal(rleDecodeFile(t, encodedPath), plain) {
 				t.Fatal("encoded target does not decode to the source")
 			}
 
-			// Metadata belongs to the stored file; its entry names the encoding and describes both views.
+			// Metadata belongs to the stored file; its entry names the encoding and describes both views,
+			// so a plain read of the stored bytes can reuse their hash.
 			if stored.Mode() != sourceInfo.Mode() || !stored.ModTime().Equal(sourceInfo.ModTime()) {
 				t.Fatalf("encoded metadata mode=%s mtime=%s, want %s %s", stored.Mode(), stored.ModTime(), sourceInfo.Mode(), sourceInfo.ModTime())
 			}
-			entry, status, err := ReadSignatureEntry(encodedPath)
-			wantEntry := SignatureEntry{
-				Size: stored.Size(), MtimeNS: sourceInfo.ModTime().UnixNano(),
-				Decoded: &DecodedSignature{Encoding: "rle", Size: int64(len(plain)), SHA256: want[:]},
+			entry, status, err := signature.Read(encodedPath)
+			wantEntry := signature.Entry{
+				Size: stored.Size(), MtimeNS: sourceInfo.ModTime().UnixNano(), SHA256: storedSum[:],
+				Decoded: &signature.Decoded{Encoding: "rle", Size: int64(len(plain)), SHA256: want[:]},
 			}
-			if err != nil || status != SignatureFresh || !entry.equal(wantEntry) {
+			if err != nil || status != signature.Fresh || !entry.Equal(wantEntry) {
 				t.Fatalf("encoded entry = %#v %v / %v, want %#v", entry, status, err, wantEntry)
 			}
+			if signature, valid, err := signature.ReadCached(encodedPath); err != nil || !valid || !bytes.Equal(signature.SHA256, storedSum[:]) {
+				t.Fatalf("plain view of the encoded file = %#v valid=%t / %v", signature, valid, err)
+			}
 
-			// The unencoded item keeps preallocation, the cache entry and StoredSize equal to Size.
+			// The unencoded item keeps preallocation, the cache entry, and StoredSize and StoredSHA256
+			// equal to Size and SHA256.
 			plainResult := results[plainItem]
-			if plainResult.Err != nil || plainResult.Targets[0].Err != nil || plainResult.Targets[0].StoredSize != int64(len(plain)) {
+			if plainResult.Err != nil || plainResult.Targets[0].Err != nil || plainResult.Targets[0].StoredSize != int64(len(plain)) ||
+				!bytes.Equal(plainResult.Targets[0].StoredSHA256, plainResult.SHA256) || len(plainResult.SHA256) == 0 {
 				t.Fatalf("plain result = %#v", plainResult)
 			}
 			if !hasManagedSignature(t, plainPath) || !hasManagedSignature(t, source) {
@@ -298,6 +307,46 @@ func TestEncodedTargetStoresEncodedFile(t *testing.T) {
 				t.Fatalf("allocations = %d, want %d (only the unencoded random target)", got, wantAllocations)
 			}
 			assertOnlyFiles(t, out, "plain", "source.enc")
+
+			// One item with several targets stores the hash of each file on disk; an empty source still
+			// stores its encoder terminator; a failed target beside successful ones has none.
+			multiOut := t.TempDir()
+			blocker := filepath.Join(multiOut, "blocker")
+			if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			emptySource := writeSourceFile(t, root, "empty", nil)
+			multi := &encodedItem{SimpleJob: &SimpleJob{
+				Path: source, Dsts: []string{filepath.Join(multiOut, "a.enc"), filepath.Join(blocker, "failed.enc"), filepath.Join(multiOut, "b.enc")},
+			}, encode: newRLEEncoder}
+			empty := &encodedItem{SimpleJob: &SimpleJob{Path: emptySource, Dsts: []string{filepath.Join(multiOut, "empty.enc")}}, encode: newRLEEncoder}
+			multiResults, multiSnapshot := collectResults()
+			if err := runStream(context.Background(), multiResults, []Item{multi, empty}, options...); err != nil {
+				t.Fatal(err)
+			}
+			byItem := resultsByItem(t, multiSnapshot())
+			for _, item := range []*encodedItem{multi, empty} {
+				result := byItem[item]
+				if result.Err != nil || len(result.Targets) != len(item.Dsts) {
+					t.Fatalf("result of %q = %#v", item.Path, result)
+				}
+				for _, target := range result.Targets {
+					if filepath.Base(target.Path) == "failed.enc" {
+						if target.Err == nil || target.StoredSHA256 != nil || target.StoredSize != 0 {
+							t.Fatalf("failed target = %#v", target)
+						}
+						continue
+					}
+					content, err := os.ReadFile(target.Path)
+					if err != nil || target.Err != nil {
+						t.Fatalf("target %q err=%v read=%v", target.Path, target.Err, err)
+					}
+					sum := sha256.Sum256(content)
+					if len(content) == 0 || target.StoredSize != int64(len(content)) || !bytes.Equal(target.StoredSHA256, sum[:]) {
+						t.Fatalf("target %q stored size=%d hash=%x, want size %d hash %x", target.Path, target.StoredSize, target.StoredSHA256, len(content), sum)
+					}
+				}
+			}
 		})
 	}
 }
@@ -322,12 +371,13 @@ func TestEncodedTargetFailureLeavesNoTarget(t *testing.T) {
 				failed := &encodedItem{SimpleJob: &SimpleJob{Path: source, Dsts: []string{filepath.Join(out, "failed")}}, encode: failure.encode}
 				next := &SimpleJob{Path: source, Dsts: []string{filepath.Join(out, "next")}}
 				onResults, snapshot := collectResults()
-				if err := runStream(context.Background(), onResults, []Item{failed, next}, device.options...); err != nil {
+				options := append([]Option{WithHashPolicy(HashRead)}, device.options...)
+				if err := runStream(context.Background(), onResults, []Item{failed, next}, options...); err != nil {
 					t.Fatal(err)
 				}
 				results := resultsByItem(t, snapshot())
 				target := results[failed].Targets[0]
-				if results[failed].Err != nil || !errors.Is(target.Err, sentinel) || target.StoredSize != 0 {
+				if results[failed].Err != nil || !errors.Is(target.Err, sentinel) || target.StoredSize != 0 || target.StoredSHA256 != nil {
 					t.Fatalf("failed result = %#v", results[failed])
 				}
 				if results[next].Err != nil || results[next].Targets[0].Err != nil {
@@ -429,7 +479,7 @@ func TestDecodedSourceRoundTrip(t *testing.T) {
 				}
 			}
 			target := results[restore].Targets[0]
-			if target.Err != nil || target.Size != int64(len(plain)) || target.StoredSize != int64(len(plain)) {
+			if target.Err != nil || target.StoredSize != int64(len(plain)) {
 				t.Fatalf("restored target = %#v", target)
 			}
 			restored, err := os.ReadFile(restoredPath)
@@ -445,8 +495,10 @@ func TestDecodedSourceRoundTrip(t *testing.T) {
 			if info.Mode() != sourceInfo.Mode() || !info.ModTime().Equal(sourceInfo.ModTime()) {
 				t.Fatalf("restored metadata mode=%s mtime=%s, want %s %s", info.Mode(), info.ModTime(), sourceInfo.Mode(), sourceInfo.ModTime())
 			}
-			if entry, status, err := ReadSignatureEntry(encodedPath); err != nil || status != SignatureFresh ||
-				entry.Decoded == nil || !bytes.Equal(entry.Decoded.SHA256, want[:]) {
+			// The decoding refresh keeps the stored-bytes hash the encoding write recorded.
+			if entry, status, err := signature.Read(encodedPath); err != nil || status != signature.Fresh ||
+				entry.Decoded == nil || !bytes.Equal(entry.Decoded.SHA256, want[:]) ||
+				len(entry.SHA256) == 0 || !bytes.Equal(entry.SHA256, written.Targets[0].StoredSHA256) {
 				t.Fatalf("encoded copy entry = %#v %v / %v", entry, status, err)
 			}
 			if signature, valid := readStoredSignature(t, restoredPath); !valid || !bytes.Equal(signature.SHA256[:], want[:]) {
@@ -502,16 +554,15 @@ func TestDecodedSourceFailures(t *testing.T) {
 			bad := writeSourceFile(t, root, "bad.enc", failure.stored)
 			good := writeSourceFile(t, root, "good.enc", encoded)
 			plainSource := writeSourceFile(t, root, "plain", plain)
+			options := []Option{WithHashPolicy(HashRead)}
 			if failure.readErr {
-				previous := openSourceContent
-				openSourceContent = func(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
-					source, err := previous(path, mode, info)
+				options = append(options, withFS(fsHooks{open: func(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
+					source, err := openNativeSource(path, mode, info)
 					if err == nil && path == bad {
 						source.reader = failingReader{ReadCloser: source.reader, err: readErr}
 					}
 					return source, err
-				}
-				t.Cleanup(func() { openSourceContent = previous })
+				}}))
 			}
 			badVerify := &decodedItem{SimpleJob: &SimpleJob{Path: bad}, decode: failure.decode, size: failure.size}
 			badRestore := &decodedItem{SimpleJob: &SimpleJob{Path: bad, Dsts: []string{filepath.Join(out, "bad")}}, decode: failure.decode, size: failure.size}
@@ -520,7 +571,7 @@ func TestDecodedSourceFailures(t *testing.T) {
 			negative := &decodedItem{SimpleJob: &SimpleJob{Path: good}, decode: newRLEDecoder, size: -1}
 			onResults, snapshot := collectResults()
 			items := []Item{badVerify, badRestore, goodRestore, plainCopy, negative}
-			if err := runStream(context.Background(), onResults, items, WithHashPolicy(HashRead)); err != nil {
+			if err := runStream(context.Background(), onResults, items, options...); err != nil {
 				t.Fatal(err)
 			}
 			results := resultsByItem(t, snapshot())
@@ -552,3 +603,26 @@ type failingReader struct {
 }
 
 func (r failingReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestPlaintextTargetStoredHash(t *testing.T) {
+	for _, policy := range []HashPolicy{HashOff, HashRead} {
+		t.Run(policy.String(), func(t *testing.T) {
+			root := t.TempDir()
+			source := writeSourceFile(t, root, "source", []byte("plaintext target"))
+			result, _ := runOne(t, &SimpleJob{Path: source, Dsts: []string{filepath.Join(root, "target")}}, WithHashPolicy(policy))
+			if result.Err != nil || result.Targets[0].Err != nil {
+				t.Fatalf("result = %#v", result)
+			}
+
+			// A hashing transfer reports the content hash as the stored hash; unknown stays nil.
+			want := result.SHA256
+			if policy == HashOff {
+				want = nil
+			}
+			if len(want) != len(result.Targets[0].StoredSHA256) || !bytes.Equal(result.Targets[0].StoredSHA256, want) ||
+				(policy == HashRead && len(want) == 0) {
+				t.Fatalf("stored hash = %x, SHA256 = %x", result.Targets[0].StoredSHA256, result.SHA256)
+			}
+		})
+	}
+}

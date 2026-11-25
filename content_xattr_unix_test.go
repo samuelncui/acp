@@ -8,12 +8,13 @@ import (
 	"errors"
 	"io"
 	"io/fs"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/samuelncui/acp/signature"
 )
 
 func TestContentNativeXattrsRoundTrip(t *testing.T) {
@@ -29,7 +30,7 @@ func TestContentNativeXattrsRoundTrip(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := unix.Setxattr(source, signatureXattrName, []byte("stale cache"), 0); err != nil {
+	if err := unix.Setxattr(source, signatureAttribute, []byte("stale cache"), 0); err != nil {
 		t.Fatal(err)
 	}
 	var captured ContentMetadata
@@ -52,7 +53,7 @@ func TestContentNativeXattrsRoundTrip(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := captured.Xattrs[signatureXattrName]; ok {
+	if _, ok := captured.Xattrs[signatureAttribute]; ok {
 		t.Fatal("managed cache leaked into content metadata")
 	}
 	for name, value := range attrs {
@@ -91,17 +92,8 @@ func TestContentNativeXattrsRoundTrip(t *testing.T) {
 			t.Fatalf("restored %q=%v, err=%v", name, data[:n], err)
 		}
 	}
-	file, err := os.Open(destination)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	data, err := readSignatureXattr(file)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := DecodeCachedSignature(data); err != nil {
-		t.Fatalf("destination cache not regenerated: %v", err)
+	if _, valid, err := signature.ReadCached(destination); err != nil || !valid {
+		t.Fatalf("destination cache not regenerated: valid=%v, err=%v", valid, err)
 	}
 }
 
@@ -114,20 +106,20 @@ func TestContentNativeXattrLimitsPrecedeBufferAllocation(t *testing.T) {
 			var names []byte
 			count, size := 1, 0
 			if stage == "count" {
-				count = ContentMaxXattrCount + 1
+				count = contentMaxXattrCount + 1
 			}
 			if stage == "aggregate" {
-				count, size = 4, ContentMaxXattrValueBytes
+				count, size = 4, contentMaxXattrValueBytes
 			}
 			if stage == "value" {
-				size = ContentMaxXattrValueBytes + 1
+				size = contentMaxXattrValueBytes + 1
 			}
 			for i := 0; i < count; i++ {
 				names = append(names, []byte("user."+strings.Repeat("a", i+1))...)
 				names = append(names, 0)
 			}
 			if stage == "name" {
-				names = append([]byte(strings.Repeat("n", ContentMaxXattrNameBytes+1)), 0)
+				names = append([]byte(strings.Repeat("n", contentMaxXattrNameBytes+1)), 0)
 			}
 			listCalls, valuesAllocated := 0, 0
 			listOrdinaryXattrs = func(_ string, data []byte) (int, error) {
@@ -136,7 +128,7 @@ func TestContentNativeXattrLimitsPrecedeBufferAllocation(t *testing.T) {
 					if data != nil {
 						t.Error("oversized list buffer allocated")
 					}
-					return ContentMaxXattrCount*(ContentMaxXattrNameBytes+1) + 1, nil
+					return contentMaxXattrCount*(contentMaxXattrNameBytes+1) + 1, nil
 				}
 				if data != nil {
 					copy(data, names)
@@ -166,5 +158,36 @@ func TestContentNativeXattrLimitsPrecedeBufferAllocation(t *testing.T) {
 				t.Fatalf("value allocations=%d, want=%d", valuesAllocated, wantAllocations)
 			}
 		})
+	}
+}
+
+func TestOrdinaryXattrWithUnsupportedValueIsSkipped(t *testing.T) {
+	for _, failure := range []error{unix.ENOTSUP, unix.EOPNOTSUPP} {
+		for _, stage := range []string{"size", "value"} {
+			t.Run(failure.Error()+"/"+stage, func(t *testing.T) {
+				// A value read that reports an unsupported facility leaves that attribute out of the capture.
+				previousList, previousRead := listOrdinaryXattrs, readOrdinaryXattr
+				t.Cleanup(func() { listOrdinaryXattrs, readOrdinaryXattr = previousList, previousRead })
+				names := []byte("user.unsupported\x00user.kept\x00")
+				listOrdinaryXattrs = func(_ string, data []byte) (int, error) {
+					copy(data, names)
+					return len(names), nil
+				}
+				readOrdinaryXattr = func(_, name string, data []byte) (int, error) {
+					if name == "user.unsupported" && (stage == "size") == (data == nil) {
+						return 0, failure
+					}
+					if data != nil {
+						copy(data, "v")
+					}
+					return 1, nil
+				}
+
+				xattrs, err := readXattrs("unused")
+				if err != nil || len(xattrs) != 1 || xattrs[0].key != "user.kept" || string(xattrs[0].value) != "v" {
+					t.Fatalf("xattrs=%v, err=%v", xattrs, err)
+				}
+			})
+		}
 	}
 }

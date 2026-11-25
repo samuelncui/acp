@@ -1,5 +1,5 @@
-//go:build !linux && !darwin && !windows
-// +build !linux,!darwin,!windows
+//go:build !linux && !darwin
+// +build !linux,!darwin
 
 package acp
 
@@ -10,10 +10,6 @@ import (
 )
 
 type sysStat struct{}
-
-func readSysStat(path string, stat fs.FileInfo) (*sysStat, error) {
-	return nil, nil
-}
 
 func truncate(file *os.File, size int64) error {
 	if err := file.Truncate(size); err != nil {
@@ -32,8 +28,8 @@ func writeSysStat(name string, j *stat) error {
 	return nil
 }
 
-func readSysStatWithContent(path string, info fs.FileInfo, bounded bool) (*sysStat, error) {
-	return readSysStat(path, info)
+func readSysStatWithContent(string, fs.FileInfo, bool) (*sysStat, error) {
+	return nil, nil
 }
 
 func nativeContentMetadata(j *stat) ContentMetadata { return ContentMetadata{Info: j.info} }

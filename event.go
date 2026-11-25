@@ -1,8 +1,8 @@
 package acp
 
-// EventHandler observes the events of one run. ACP calls it from one goroutine per
-// registration and never concurrently, so a handler may keep unguarded state between events.
-// WithEventHandler is last-wins, so a run has at most one handler.
+// EventHandler observes the events of one run. ACP calls it from one goroutine and never
+// concurrently, so a handler may keep unguarded state between events. WithEventHandler is
+// last-wins, so a run has at most one handler.
 type EventHandler func(Event)
 
 type Event interface {
@@ -35,7 +35,7 @@ type EventReportError struct {
 
 func (*EventReportError) iEvent() {}
 
-// EventSignatureCacheSummary reports aggregate cache behavior for one Copyer.
+// EventSignatureCacheSummary reports the aggregate signature-cache activity of one run.
 type EventSignatureCacheSummary struct {
 	Summary SignatureCacheSummary
 }

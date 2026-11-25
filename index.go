@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/samuelncui/acp/internal/fileio"
+	"github.com/samuelncui/acp/signature"
 	"github.com/sirupsen/logrus"
 )
 
@@ -17,9 +18,9 @@ type counter struct {
 // that reports the failure through its own result, not a pipeline failure.
 func (c *StreamCopyer) buildJob(item Item, order uint64) *baseJob {
 	// A failed target description still evaluates the source once for its terminal result.
-	targets, err := itemTargets(item)
+	targets, err := c.itemTargets(item)
 	if err != nil {
-		c.logf(logrus.ErrorLevel, "read item targets failed, err= %v", err)
+		c.logf(logrus.ErrorLevel, "read item targets failed, err= %+v", err)
 		job := c.namedFailureJob(item, order)
 		job.itemError = err
 		return job
@@ -32,7 +33,7 @@ func (c *StreamCopyer) buildJob(item Item, order uint64) *baseJob {
 		job.itemError = c.indexItem(job)
 	}
 	if job.itemError != nil {
-		c.logf(logrus.ErrorLevel, "read item failed, %v", job.itemError)
+		c.logf(logrus.ErrorLevel, "read item failed, %+v", job.itemError)
 	}
 	return job
 }
@@ -41,7 +42,7 @@ func (c *StreamCopyer) buildJob(item Item, order uint64) *baseJob {
 func (c *StreamCopyer) namedFailureJob(item Item, order uint64) *baseJob {
 	job := &baseJob{copyer: c, item: item, order: order, readMode: c.fromDevice.readMode}
 	var sourceName string
-	job.itemError = protectCall("Item.Source", func() { sourceName = item.Source() })
+	job.itemError = c.protectCall("Item.Source", func() { sourceName = item.Source() })
 	if job.itemError == nil {
 		job.path = sourceName
 	}
@@ -58,7 +59,7 @@ func (c *StreamCopyer) indexItem(job *baseJob) error {
 		)
 	}
 	if selected, ok := job.item.(ReadModeItem); ok {
-		if err := protectCall("Item.ReadMode", func() { job.readMode = selected.ReadMode() }); err != nil {
+		if err := c.protectCall("Item.ReadMode", func() { job.readMode = selected.ReadMode() }); err != nil {
 			return err
 		}
 		if job.readMode != ReadBuffered && job.readMode != ReadMapped {
@@ -67,30 +68,34 @@ func (c *StreamCopyer) indexItem(job *baseJob) error {
 	}
 
 	// Resolve optional endpoints before treating any identifier as a native path.
-	if item, ok := job.item.(ContentItem); ok {
-		if err := protectCall("Item.ContentSource/ContentTargets", func() {
-			job.contentSource = item.ContentSource()
+	if item, ok := job.item.(ContentSourceItem); ok {
+		if err := c.protectCall("Item.ContentSource", func() { job.contentSource = item.ContentSource() }); err != nil {
+			return err
+		}
+	}
+	if item, ok := job.item.(ContentTargetItem); ok {
+		if err := c.protectCall("Item.ContentTargets", func() {
 			job.contentTargets = append([]ContentTarget(nil), item.ContentTargets()...)
 		}); err != nil {
 			return err
 		}
-		if len(job.contentTargets) != 0 && len(job.contentTargets) != len(job.targets) {
-			return fmt.Errorf("content targets must align with target identifiers")
+	}
+	if len(job.contentTargets) != 0 && len(job.contentTargets) != len(job.targets) {
+		return fmt.Errorf("content targets must align with target identifiers")
+	}
+	job.endpoints = job.contentSource != nil
+	contentTargets := 0
+	for _, target := range job.contentTargets {
+		if target != nil && !c.toDevice.linear {
+			return fmt.Errorf("content targets require a linear target device")
 		}
-		job.endpoints = job.contentSource != nil
-		contentTargets := 0
-		for _, target := range job.contentTargets {
-			if target != nil && !c.toDevice.linear {
-				return fmt.Errorf("content targets require a linear target device")
-			}
-			if target != nil {
-				contentTargets++
-			}
-			job.endpoints = job.endpoints || target != nil
+		if target != nil {
+			contentTargets++
 		}
-		if contentTargets > 1 {
-			return fmt.Errorf("an item supports at most one content target")
-		}
+		job.endpoints = job.endpoints || target != nil
+	}
+	if contentTargets > 1 {
+		return fmt.Errorf("an item supports at most one content target")
 	}
 	if job.contentSource != nil && !c.fromDevice.linear {
 		return fmt.Errorf("content sources require a linear source device")
@@ -102,7 +107,7 @@ func (c *StreamCopyer) indexItem(job *baseJob) error {
 		job.path = filepath.Clean(job.path)
 	}
 	if item, ok := job.item.(TargetEncoderItem); ok {
-		if err := protectCall("Item.TargetEncoder", func() { job.encodeEncoding, job.encode = item.TargetEncoder() }); err != nil {
+		if err := c.protectCall("Item.TargetEncoder", func() { job.encodeEncoding, job.encode = item.TargetEncoder() }); err != nil {
 			return err
 		}
 		if err := checkEncoding("target encoder", job.encodeEncoding, job.encode != nil); err != nil {
@@ -111,7 +116,7 @@ func (c *StreamCopyer) indexItem(job *baseJob) error {
 	}
 	var decodedSize int64
 	if item, ok := job.item.(SourceDecoderItem); ok {
-		if err := protectCall("Item.SourceDecoder", func() { job.decodeEncoding, job.decode, decodedSize = item.SourceDecoder() }); err != nil {
+		if err := c.protectCall("Item.SourceDecoder", func() { job.decodeEncoding, job.decode, decodedSize = item.SourceDecoder() }); err != nil {
 			return err
 		}
 		if err := checkEncoding("source decoder", job.decodeEncoding, job.decode != nil); err != nil {
@@ -193,17 +198,17 @@ func checkEncoding(what, encoding string, present bool) error {
 	if !present {
 		return nil
 	}
-	if encoding == "" || len(encoding) > signatureMaxEncoding {
-		return fmt.Errorf("%s needs an encoding name of 1 to %d bytes, encoding= %q", what, signatureMaxEncoding, encoding)
+	if encoding == "" || len(encoding) > signature.MaxEncoding {
+		return fmt.Errorf("%s needs an encoding name of 1 to %d bytes, encoding= %q", what, signature.MaxEncoding, encoding)
 	}
 	return nil
 }
 
 // itemTargets copies the targets the caller requested, turning a panic in the caller's code
 // into an item failure.
-func itemTargets(item Item) ([]string, error) {
+func (c *StreamCopyer) itemTargets(item Item) ([]string, error) {
 	var targets []string
-	if err := protectCall("Item.Targets", func() { targets = item.Targets() }); err != nil {
+	if err := c.protectCall("Item.Targets", func() { targets = item.Targets() }); err != nil {
 		return nil, err
 	}
 	return append([]string(nil), targets...), nil

@@ -8,9 +8,14 @@ import (
 	"sync"
 
 	"github.com/samuelncui/acp/mmap"
+	"github.com/samuelncui/acp/signature"
 	"github.com/sirupsen/logrus"
 )
 
+// prepareResult is one worker's outcome. The worker owns the opened source until release closes,
+// which happens when the result is forwarded. That bounds the prepared sources the ordered
+// reorder buffer holds to the worker count, while the slots semaphore bounds whole file lifetimes
+// (preparation through completion); neither bound implies the other.
 type prepareResult struct {
 	order   uint64
 	job     *writeJob
@@ -25,10 +30,9 @@ type itemSource struct {
 	reader io.ReadCloser
 }
 
-// openSourceContent opens the single descriptor an item owns, together with the reader that
-// delivers its content. It is a variable so a test can observe which descriptor an item's cache
-// read and cache write use.
-var openSourceContent = func(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
+// openNativeSource opens the single descriptor an item owns, together with the reader that
+// delivers its content.
+func openNativeSource(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
 	// Only a caller that asks for it reads through a mapping, which retains its descriptor.
 	if mode == ReadMapped {
 		readerAt, err := mmap.OpenWithInfo(path, info)
@@ -64,7 +68,7 @@ func (c *StreamCopyer) prepareItem(job *baseJob) *writeJob {
 	// An item needs its source when it writes somewhere or hashes content, and a targetless item
 	// reads its stored hash only where the policy reuses one.
 	needsContent := len(job.targets) > 0 || c.hashPolicy.readsContent()
-	cached := c.signatures != nil
+	cached := c.cacheStats != nil
 	reuses := cached && len(job.targets) == 0 && c.hashPolicy.reusesCache()
 
 	// A policy that neither reads content nor uses the cache completes without a source.
@@ -82,8 +86,8 @@ func (c *StreamCopyer) prepareItem(job *baseJob) *writeJob {
 		// A reuse-only item owns its descriptor for the stored hash alone, so a source it cannot
 		// open is a cache miss with a warning instead of an item failure.
 		if reuses {
-			c.signatures.recordFailure(job.path, err)
-			c.signatures.incrementMiss()
+			c.cacheStats.recordFailure(job.path, err)
+			c.cacheStats.count(cacheMiss)
 			if !needsContent {
 				return c.noContentJob(job)
 			}
@@ -91,7 +95,7 @@ func (c *StreamCopyer) prepareItem(job *baseJob) *writeJob {
 
 		// A source that cannot be opened is an item outcome. The marked job travels to the
 		// reporting stage instead of a side channel.
-		c.logf(logrus.ErrorLevel, "prepare source failed, source= %q, %v", job.path, err)
+		c.logf(logrus.ErrorLevel, "prepare source failed, source= %q, %+v", job.path, err)
 		job.itemError = err
 		return newWriteJob(job, nil)
 	}
@@ -108,14 +112,14 @@ func (c *StreamCopyer) prepareItem(job *baseJob) *writeJob {
 	// preserving that policy's existing diagnostics.
 	reused := false
 	if reuses {
-		entry, hash := c.signatures.lookup(source.file, job.path, job)
+		entry, hash := c.lookupSignature(source.file, job.path, job)
 		job.cachedEntry = entry
 		if hash != nil {
 			job.setCachedHash(hash)
 			reused = true
 		}
 	} else if cached && c.hashPolicy.refreshesCache() {
-		if entry, status, err := readSignatureEntryInfo(source.file, job.stat.info); err == nil && status == SignatureFresh {
+		if entry, status, err := c.fs().ReadEntry(source.file, job.stat.info); err == nil && status == signature.Fresh {
 			job.cachedEntry = &entry
 		}
 	}
@@ -149,10 +153,6 @@ func (c *StreamCopyer) noContentJob(job *baseJob) *writeJob {
 // reached before its source opened is marked and forwarded, so the reporting stage fails it
 // instead of dropping it.
 func (c *StreamCopyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-chan *writeJob {
-	// Everything this stage waits on runs on a context that never cancels, so a stop can
-	// never release a reader before its consumer owns it.
-	drained := context.WithoutCancel(ctx)
-
 	// Bound opened sources through their complete transfer lifetime, independently of data lanes.
 	chanLen := 32
 	slots := make(chan struct{}, transferLimit)
@@ -165,7 +165,7 @@ func (c *StreamCopyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-c
 	// Prepare source readers with the configured source-device concurrency.
 	for idx := 0; idx < min(max(c.fromDevice.threads, 8), transferLimit); idx++ {
 		workers.Add(1)
-		go c.wrap(drained, func() {
+		go c.wrap(func() {
 			defer workers.Done()
 
 			// Consume indexed jobs until source exhaustion. A stopped pipeline drains its
@@ -214,13 +214,13 @@ func (c *StreamCopyer) prepare(ctx context.Context, indexed <-chan *baseJob) <-c
 	}
 
 	// Close preparation outcomes only after every source worker relinquishes ownership.
-	go c.wrap(drained, func() {
+	go c.wrap(func() {
 		workers.Wait()
 		close(completed)
 	})
 
 	// Preserve request order only where one linear writer requires it.
-	go c.wrap(drained, func() {
+	go c.wrap(func() {
 		defer close(prepared)
 		c.forwardPrepared(completed, prepared)
 	})
@@ -234,9 +234,6 @@ func (c *StreamCopyer) sendPrepareResult(completed chan<- prepareResult, result 
 		result.finish()
 		return false
 	}
-	if result.release == nil {
-		return true
-	}
 	select {
 	case <-result.release:
 		return true
@@ -246,16 +243,12 @@ func (c *StreamCopyer) sendPrepareResult(completed chan<- prepareResult, result 
 }
 
 func (result prepareResult) releaseWorker() {
-	if result.release != nil {
-		close(result.release)
-	}
+	close(result.release)
 }
 
 func (result prepareResult) finish() {
-	if result.job != nil {
-		result.job.finishSource()
-		result.job.releaseSlot()
-	}
+	result.job.finishSource()
+	result.job.releaseSlot()
 	result.releaseWorker()
 }
 
@@ -276,9 +269,6 @@ func (c *StreamCopyer) forwardPrepared(
 	serial := c.fromDevice.threads == 1 && c.toDevice.threads == 1
 	if !c.toDevice.linear && !c.fromDevice.linear && !serial {
 		for result := range completed {
-			if result.job == nil {
-				continue
-			}
 			select {
 			case prepared <- result.job:
 				result.releaseWorker()
@@ -290,7 +280,7 @@ func (c *StreamCopyer) forwardPrepared(
 		return
 	}
 
-	// A bounded reorder buffer retains the request order of formerly serialized devices.
+	// A bounded reorder buffer retains the request order for linear and single-threaded devices.
 	next := uint64(0)
 	pending := make(map[uint64]prepareResult, c.fromDevice.threads)
 	defer func() {
@@ -319,10 +309,6 @@ func (c *StreamCopyer) forwardPrepared(
 			}
 			delete(pending, next)
 			next++
-			if result.job == nil {
-				result.releaseWorker()
-				continue
-			}
 			select {
 			case prepared <- result.job:
 				result.releaseWorker()

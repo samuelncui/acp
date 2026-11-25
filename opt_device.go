@@ -73,7 +73,8 @@ func WithReadMode(mode ReadMode) DeviceOption {
 
 // RefreshSignatureCache selects whether a refreshing hash policy writes computed signatures onto
 // this device's files: sources on the source device, written targets on the target device. It
-// defaults to true and never changes hashing or reuse of stored signatures.
+// defaults to true and never changes hashing or reuse of stored signatures, nor the marker of an
+// encoded target, which is not a cache write.
 func RefreshSignatureCache(b bool) DeviceOption {
 	return func(d *deviceOption) *deviceOption {
 		d.skipCacheRefresh = !b

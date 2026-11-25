@@ -12,10 +12,8 @@ import (
 //
 // The caller implements Item over whatever state it owns, so the item is the handle that ties a
 // result back to that state: Result.Job is the exact instance that was submitted, and no id
-// lookup or payload plumbing is needed. ACP calls Source and Targets under panic protection: the
-// first call describes the item, and an item whose description failed is asked for its Source once
-// more when it is reported, so a failure path may read Source twice. ACP never keeps the item
-// afterwards.
+// lookup or payload plumbing is needed. ACP calls Source and Targets once each, under panic
+// protection, while describing the item. ACP never keeps the item afterwards.
 type Item interface {
 	// Source returns the exact native path to read, or the content source display identifier.
 	Source() string
@@ -75,13 +73,17 @@ var ErrSourceRead = errors.New("read source failed")
 // targets continue. A content writer's own Write error always stops the run.
 var ErrMemberSettled = errors.New("acp: endpoint member failure is settled")
 
-// ContentItem optionally supplies stream endpoints. A nil source selects the native Source path.
-// ContentTargets is either nil or aligned with Targets; nil entries select native target paths.
-// Each endpoint side requires LinearDevice(true); content sources require buffered reads.
-// At most one target endpoint is supported per item. Native sides retain their device options.
-type ContentItem interface {
-	Item
+// ContentSourceItem optionally supplies a stream source. A nil source selects the native Source
+// path. A content source requires LinearDevice(true) on the source side and buffered reads.
+type ContentSourceItem interface {
 	ContentSource() ContentSource
+}
+
+// ContentTargetItem optionally supplies stream targets. ContentTargets is either nil or aligned
+// with Targets; nil entries select native target paths. A content target requires
+// LinearDevice(true) on the target side, and at most one is supported per item. Native sides
+// retain their device options.
+type ContentTargetItem interface {
 	ContentTargets() []ContentTarget
 }
 
@@ -99,9 +101,9 @@ type ReadModeItem interface {
 // calls the encoder with that output's file writer, writes the item's plaintext into the returned
 // writer and closes it once after the last write. Close flushes the encoded tail into dst and
 // returns only after every write into dst has finished. An encoded target is never preallocated
-// and always receives a managed signature entry that names the encoding and describes the
-// plaintext; the entry marks the file as encoded, so a failure to write it fails that target.
-// Content targets are not encoded.
+// and receives a managed signature entry that marks the file as encoded and names the encoding,
+// so a failure to write it fails that target. While the transfer computes hashes the entry holds
+// both the plaintext hash and the hash of the stored bytes. Content targets are not encoded.
 type TargetEncoderItem interface {
 	TargetEncoder() (encoding string, encode func(dst io.Writer) (io.WriteCloser, error))
 }
@@ -174,13 +176,13 @@ type Result struct {
 // TargetResult is the outcome of one requested target.
 type TargetResult struct {
 	Path string
-	// Size is the item's size as read, so a failed or partially written target reports that
-	// size rather than a count of the bytes that landed there.
-	Size int64
-	// StoredSize counts the bytes ACP wrote to a written native target: Size, or the encoded
+	// StoredSize counts the bytes ACP wrote to a written native target: Result.Size, or the encoded
 	// size when the item encodes its targets. It is zero for a failed or content target.
 	StoredSize int64
-	WriteTime  time.Time
+	// StoredSHA256 is the SHA-256 of the stored bytes of a written native target whenever the
+	// transfer hashes its content; for a plaintext target it equals Result.SHA256. It is nil only
+	// when unknown: the hash policy produced no hash, or the target is a content target or failed.
+	StoredSHA256 []byte
 
 	// Err is nil when the target was written. Target failures keep their error identity, so
 	// errors.Is(err, ErrTargetNoSpace) identifies an exhausted medium.

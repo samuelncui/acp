@@ -58,7 +58,7 @@ func (c *StreamCopyer) copy(ctx context.Context, prepared <-chan *writeJob) <-ch
 	cntr := new(counter)
 	done := make(chan struct{})
 	reported := make(chan struct{})
-	go c.wrap(context.WithoutCancel(ctx), func() {
+	go c.wrap(func() {
 		defer close(reported)
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
@@ -74,7 +74,7 @@ func (c *StreamCopyer) copy(ctx context.Context, prepared <-chan *writeJob) <-ch
 	})
 
 	// Managed children retain their own resources until completion; ordered turns end at data EOF.
-	go c.wrap(context.WithoutCancel(ctx), func() {
+	go c.wrap(func() {
 		var children, finishing sync.WaitGroup
 		members := make(chan struct{}, endpointMembers)
 		defer func() {
@@ -111,7 +111,7 @@ func (c *StreamCopyer) copy(ctx context.Context, prepared <-chan *writeJob) <-ch
 			}
 			t := newTransfer(c, job, ahead, offset)
 			if job.stat != nil {
-				offset += max(job.stat.size, 0)
+				offset += job.stat.size
 			}
 			if c.fromDevice.linear {
 				t.readTurn, readTurn = readTurn, t.readDone
@@ -133,7 +133,7 @@ func (c *StreamCopyer) copy(ctx context.Context, prepared <-chan *writeJob) <-ch
 			if overlapped {
 				t.laneDone = make(chan struct{})
 				finishing.Add(1)
-				go c.wrap(context.WithoutCancel(ctx), func() {
+				go c.wrap(func() {
 					defer finishing.Done()
 					defer func() { <-members }()
 					defer job.releaseSlot()
@@ -150,12 +150,12 @@ func (c *StreamCopyer) copy(ctx context.Context, prepared <-chan *writeJob) <-ch
 			}
 			if job.endpoints {
 				if job.contentSource != nil && job.stat != nil {
-					offset += max(job.stat.size, 0)
+					offset += job.stat.size
 				}
 				continue
 			}
 			children.Add(1)
-			go c.wrap(context.WithoutCancel(ctx), func() {
+			go c.wrap(func() {
 				defer children.Done()
 				defer job.releaseSlot()
 				t.run(ctx, out, writing, cntr, exhausted)

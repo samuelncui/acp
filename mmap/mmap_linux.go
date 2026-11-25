@@ -92,7 +92,8 @@ func (r *ReaderAt) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-// ReadAt implements the io.ReaderAt interface.
+// Slice returns the mapped bytes from off, at most limit of them and fewer at the end of the
+// mapping. The slice aliases the mapping and is valid until Close.
 func (r *ReaderAt) Slice(off, limit int64) ([]byte, error) {
 	if r.data == nil {
 		return nil, errors.New("mmap: closed")

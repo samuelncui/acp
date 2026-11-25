@@ -57,8 +57,8 @@ func TestHardStoppedNotifiesBeforeFeedCloseAndSourceSettlement(t *testing.T) {
 
 		// Close still settles the owned source, and Wait still returns the original fatal cause.
 		unblock()
-		if err := <-closed; err != nil {
-			t.Fatal(err)
+		if err := <-closed; !errors.Is(err, failure) {
+			t.Fatalf("Close = %v, want fatal cause %v", err, failure)
 		}
 		if err := stream.Wait(); !errors.Is(err, failure) {
 			t.Fatalf("Wait = %v, want fatal cause %v", err, failure)

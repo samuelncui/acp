@@ -22,13 +22,12 @@ func (s *resultSink) deliver(results []Result) {
 
 	copyer := s.copyer
 	var callbackErr error
-	if panicErr := protectCall("onResults", func() { callbackErr = copyer.onResults(results) }); panicErr != nil {
-		// A panicking callback is recorded as the run's error and reported from Wait and from
-		// Close. It does not stop the delivery stage: every later result is still handed to the
-		// callback, so the remaining items keep their accounting.
+	if panicErr := copyer.protectCall("onResults", func() { callbackErr = copyer.onResults(results) }); panicErr != nil {
+		// A panicking callback is recorded as the run's error and reported from Close and Wait. It does not
+		// stop the delivery stage: every later result is still handed to the callback, so the
+		// remaining items keep their accounting.
 		stopErr := fmt.Errorf("results callback failed, %w", panicErr)
 		copyer.setError(stopErr)
-		copyer.recordClose(stopErr)
 		return
 	}
 	if callbackErr == nil {
@@ -39,7 +38,6 @@ func (s *resultSink) deliver(results []Result) {
 	// started are reported with it, and items already past the read stage still finish.
 	stopErr := fmt.Errorf("results callback failed, %w", callbackErr)
 	copyer.setError(stopErr)
-	copyer.recordClose(stopErr)
 	copyer.setCallbackStop(stopErr)
 }
 

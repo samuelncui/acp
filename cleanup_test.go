@@ -112,12 +112,10 @@ func TestCleanupRemovesTargetAfterMetadataFailure(t *testing.T) {
 	source := writeSourceFile(t, root, "source", []byte("fixture"))
 	target := filepath.Join(root, "target")
 	sentinel := errors.New("metadata refused")
-	previous := restoreTarget
-	restoreTarget = func(string, *stat) error { return sentinel }
-	t.Cleanup(func() { restoreTarget = previous })
 	item := newFixtureItem(source, target)
 	fixture := newStreamFixture(item)
-	if err := runFixture(context.Background(), fixture, []Item{item}); err != nil {
+	refuse := withFS(fsHooks{restore: func(string, *stat) error { return sentinel }})
+	if err := runFixture(context.Background(), fixture, []Item{item}, refuse); err != nil {
 		t.Fatal(err)
 	}
 	result, terminalErr := item.terminal(t)

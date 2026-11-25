@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/samuelncui/acp/signature"
 )
 
 type sumHookHash struct {
@@ -59,8 +61,8 @@ func TestLinearCopyPreparesHashWhilePriorTargetFinishes(t *testing.T) {
 	var signal sync.Once
 	var hashCount, closeCount atomic.Int32
 	var sourceBytes atomic.Int64
-	oldHash, oldRestore, oldOpen := sha256Pool, restoreTarget, openSourceContent
-	t.Cleanup(func() { sha256Pool, restoreTarget, openSourceContent = oldHash, oldRestore, oldOpen })
+	oldHash := sha256Pool
+	t.Cleanup(func() { sha256Pool = oldHash })
 	sha256Pool = &sync.Pool{New: func() interface{} {
 		return &sumHookHash{Hash: sha256.New(), onSum: func(value []byte) {
 			hashCount.Add(1)
@@ -69,28 +71,30 @@ func TestLinearCopyPreparesHashWhilePriorTargetFinishes(t *testing.T) {
 			}
 		}}
 	}}
-	openSourceContent = func(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
-		// Keep the actual descriptor so cache and close ownership remain exercised.
-		source, err := oldOpen(path, mode, info)
-		if err == nil {
-			source.reader = &countedSource{ReadCloser: source.reader, bytes: &sourceBytes, closes: &closeCount}
-		}
-		return source, err
-	}
-	restoreTarget = func(path string, info *stat) error {
-		// A target already receiving data must not stop later source preparation.
-		if info.info.Name() == "one" {
-			close(blocked)
-			<-release
-		}
-		return oldRestore(path, info)
-	}
+	hooks := withFS(fsHooks{
+		open: func(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
+			// Keep the actual descriptor so cache and close ownership remain exercised.
+			source, err := openNativeSource(path, mode, info)
+			if err == nil {
+				source.reader = &countedSource{ReadCloser: source.reader, bytes: &sourceBytes, closes: &closeCount}
+			}
+			return source, err
+		},
+		restore: func(path string, info *stat) error {
+			// A target already receiving data must not stop later source preparation.
+			if info.info.Name() == "one" {
+				close(blocked)
+				<-release
+			}
+			return writeSysStat(path, info)
+		},
+	})
 
 	// Run the existing ordered stream and always release and join it before restoring hooks.
 	done := make(chan error, 1)
 	go func() {
 		done <- runFixture(context.Background(), newStreamFixture(one, two), []Item{one, two},
-			WithHashPolicy(HashReadRefresh), SetToDevice(LinearDevice(true)))
+			WithHashPolicy(HashReadRefresh), SetToDevice(LinearDevice(true)), hooks)
 	}()
 	select {
 	case <-blocked:
@@ -159,18 +163,9 @@ func TestLinearCopyPreservesHashWhenTargetsRejectPreparation(t *testing.T) {
 	}
 
 	// Source refresh stays valid even though no destination accepted this file.
-	file, err := os.Open(source)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	encoded, err := readSignatureXattr(file)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stored, err := DecodeCachedSignature(encoded)
-	if err != nil || stored.SHA256 != want || stored.Size != int64(len(content)) {
-		t.Fatalf("source signature = %+v / %v", stored, err)
+	stored, status, err := signature.Read(source)
+	if err != nil || status != signature.Fresh || !bytes.Equal(stored.SHA256, want[:]) || stored.Size != int64(len(content)) {
+		t.Fatalf("source signature = %+v %v / %v", stored, status, err)
 	}
 }
 
@@ -195,11 +190,11 @@ func TestLinearPreparedContentReleasesFailures(t *testing.T) {
 			sentinel := errors.New("prepared source failed")
 			var sourceBytes atomic.Int64
 			var closes atomic.Int32
-			oldOpen, oldHash := openSourceContent, sha256Pool
-			t.Cleanup(func() { openSourceContent, sha256Pool = oldOpen, oldHash })
-			openSourceContent = func(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
+			oldHash := sha256Pool
+			t.Cleanup(func() { sha256Pool = oldHash })
+			faulty := withFS(fsHooks{open: func(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
 				// Wrap the same descriptor; errors and panics must not leak it or its content buffer.
-				source, err := oldOpen(path, mode, info)
+				source, err := openNativeSource(path, mode, info)
 				if err != nil {
 					return source, err
 				}
@@ -218,7 +213,7 @@ func TestLinearPreparedContentReleasesFailures(t *testing.T) {
 					source.reader = &errorOnClose{ReadCloser: tracked, err: sentinel}
 				}
 				return source, nil
-			}
+			}})
 			if failure == "hash panic" {
 				sha256Pool = &sync.Pool{New: func() interface{} { return panickingHash{Hash: sha256.New()} }}
 				sentinel = errPanickingHash
@@ -226,7 +221,7 @@ func TestLinearPreparedContentReleasesFailures(t *testing.T) {
 
 			// Complete the real stream so error replay, cache policy and cleanup all run.
 			err := runFixture(context.Background(), newStreamFixture(item), []Item{item},
-				WithHashPolicy(HashReadRefresh), SetToDevice(LinearDevice(true)))
+				WithHashPolicy(HashReadRefresh), SetToDevice(LinearDevice(true)), faulty)
 			if closes.Load() != 1 {
 				t.Fatalf("source close count = %d, want 1", closes.Load())
 			}

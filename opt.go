@@ -59,22 +59,24 @@ type option struct {
 	fromDevice *deviceOption
 	toDevice   *deviceOption
 
-	createFlag          int
+	overwrite           bool
 	hashPolicy          HashPolicy
 	readBuffer          int
 	resultBuffer        int
 	resultBatch         int
 	resultFlushInterval time.Duration
 
-	logger        *logrus.Logger
-	eventHandlers []EventHandler
+	logger       *logrus.Logger
+	eventHandler EventHandler
+
+	// wrapFilesystem lets a test substitute file operations around the native ones.
+	wrapFilesystem func(transferFilesystem) transferFilesystem
 }
 
 func newOption() *option {
 	return &option{
 		fromDevice:          new(deviceOption),
 		toDevice:            new(deviceOption),
-		createFlag:          os.O_WRONLY | os.O_CREATE | os.O_EXCL,
 		readBuffer:          defaultReadBuffer,
 		resultBuffer:        defaultResultBuffer,
 		resultBatch:         defaultResultBatch,
@@ -156,12 +158,7 @@ func SetToDevice(opts ...DeviceOption) Option {
 // option and applies to every requested target.
 func Overwrite(b bool) Option {
 	return func(o *option) *option {
-		if b {
-			o.createFlag = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
-			return o
-		}
-
-		o.createFlag = os.O_WRONLY | os.O_CREATE | os.O_EXCL
+		o.overwrite = b
 		return o
 	}
 }
@@ -225,16 +222,11 @@ func WithLogger(logger *logrus.Logger) Option {
 }
 
 // WithEventHandler registers the run's event handler. Repeated options are last-wins, so this
-// replaces every handler registered before it, and a nil handler clears the registration
+// replaces the handler registered before it, and a nil handler clears the registration
 // instead of leaving a handler that fails the run when it is called.
 func WithEventHandler(h EventHandler) Option {
 	return func(o *option) *option {
-		o.eventHandlers = nil
-		if h == nil {
-			return o
-		}
-
-		o.eventHandlers = []EventHandler{h}
+		o.eventHandler = h
 		return o
 	}
 }

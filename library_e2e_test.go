@@ -257,9 +257,6 @@ func TestACPLibraryE2E(t *testing.T) {
 			if outcome.Path != job.Dsts[index] || outcome.Err != nil {
 				t.Fatalf("job %q target %d = %#v", job.Path, index, outcome)
 			}
-			if outcome.Size != result.Size || outcome.WriteTime.IsZero() || !outcome.WriteTime.Equal(result.WriteTime) {
-				t.Fatalf("target %q facts = %#v, want the item's size and write time", outcome.Path, outcome)
-			}
 			got, err := os.ReadFile(outcome.Path)
 			if err != nil || !bytes.Equal(got, data) {
 				t.Fatalf("target %q content = %v / %v, want %v", outcome.Path, got, err, data)

@@ -60,8 +60,8 @@ windows/amd64, darwin/arm64 and freebsd/amd64, the Python 3 release-tool regress
 concurrency, cache, pipeline and event changes. Individual gates remain available as `make test`,
 `make vet`, `make cross` and `make race`.
 
-The managed-entry Protobuf code is generated: after editing `internal/signaturepb/signature.proto`,
-run `go generate ./internal/signaturepb` with `protoc` 26.0 and `protoc-gen-go` v1.33.0 on `PATH`
+The managed-entry Protobuf code is generated: after editing `signature/internal/signaturepb/signature.proto`,
+run `go generate ./signature/internal/signaturepb` with `protoc` 26.0 and `protoc-gen-go` v1.33.0 on `PATH`
 and commit the result; never edit the `.pb.go` file by hand.
 
 ## Behavior and test boundaries
@@ -77,15 +77,15 @@ Use this inventory to select or update coverage; it is not a record of tests run
 | Boundary | Unit or stage coverage | Integration coverage |
 | --- | --- | --- |
 | Selection, path mapping, option validation and the `af05f05c` surface | `files_test.go`, `opt_test.go`, `opt_windows_test.go`, `compat_af05f05c_test.go` | `library_e2e_test.go`, `e2e_test.go` |
-| Input-method evaluation, reused source facts, target resolution and alias/overwrite validation | `item_test.go`, `stream_test.go`, `fs_test.go`, `target_test.go` | Public stream and shell copies in `library_e2e_test.go` |
-| Source ownership, one content pass/hash, read modes, empty files and multiple targets | `copy_test.go`, `item_test.go`, `fs_test.go` | Library and command E2E |
+| Input-method evaluation, reused source facts, target resolution and alias/overwrite validation | `prepare_test.go`, `run_copy_test.go`, `stream_test.go`, `fs_test.go`, `target_test.go` | Public stream and shell copies in `library_e2e_test.go` |
+| Source ownership, one content pass/hash, read modes, empty files and multiple targets | `copy_test.go`, `run_copy_test.go`, `fs_test.go` | Library and command E2E |
 | Staged replacement, failure preservation, final-path outcomes and owned temporary cleanup | `staged_target_test.go`, `target_test.go`, `internal/fileio/output_test.go`, `internal/fileio/temp_test.go` | Library/command E2E and rewrite failure/resume tests |
-| Encoded native content: plaintext facts, stored size, staging without preallocation, the encoded-file entry and its write failure, decoded read-back, `ErrEncodedContent` versus native read errors, encoder/decoder failure cleanup | `encoded_test.go`, `decoded_close_test.go`, `signature_decoded_test.go` | Random/linear target and buffered/mapped/linear source stream copies in `encoded_test.go` |
-| Source-failure tagging and member-only endpoint failures: `ErrSourceRead` versus target failures and stops, settled content-source, target-refusal and writer-Finish failures, cause isolation, refused-member draining | `source_tag_test.go`, `source_timeout_test.go`, `member_settled_test.go`, `member_settled_*_test.go` | Linear content-endpoint stream copies in those tests |
+| Encoded native content: plaintext facts, stored size and hash, staging without preallocation, the encoded-file entry and its write failure, decoded read-back, `ErrEncodedContent` versus native read errors, encoder/decoder failure cleanup | `encoded_test.go`, `decoded_close_test.go`, `signature_decoded_test.go` | Random/linear target and buffered/mapped/linear source stream copies in `encoded_test.go` |
+| Source-failure tagging and member-only endpoint failures: `ErrSourceRead` versus target failures and stops, settled content-source, target-refusal and writer-Finish failures, cause isolation, refused-member draining | `source_tag_test.go`, `source_timeout_test.go`, `member_settled_test.go` | Linear content-endpoint stream copies in those tests |
 | Ordered completion of native path aliases without blocking independent outputs | `publication_serial_test.go`, `pipeline_liveness_test.go` | Native case/decomposition and relative/absolute copies in `target_identity_test.go` |
-| Metadata, hash policies, between-run cache staleness, cache warnings and descriptor use; Protobuf and legacy entry codec, plain and decoding reuse and refresh merging | `signature_test.go`, `signature_entry_test.go`, `signature_decoded_test.go`, `signature_xattr_copy_test.go`, `cleanup_test.go` | Real cache copies in those tests; metadata and report hashes in library/command E2E |
-| Results, batching, cancellation, backpressure, linear ordering and event delivery | `item_test.go`, `stream_test.go`, `copy_test.go`, `opt_test.go` | Command interrupt, report and progress tests in `e2e_test.go` |
-| Panic handling, channel completion and resource release | `recover_test.go`, `copy_test.go`, `stream_test.go` | Caller callback/handler panic tests driving a real stream |
+| Metadata, hash policies, between-run cache staleness, cache warnings and descriptor use; Protobuf and legacy entry codec, plain and decoding reuse and refresh merging | `signature_test.go`, `signature/signature_test.go`, `signature_decoded_test.go`, `signature_policy_test.go`, `signature_publication_test.go`, `signature_resilience_test.go`, `signature_xattr_copy_test.go`, `cleanup_test.go` | Real cache copies in those tests; metadata and report hashes in library/command E2E |
+| Results, batching, cancellation, backpressure, linear ordering and event delivery | `run_lifecycle_test.go`, `run_delivery_test.go`, `stream_test.go`, `copy_test.go`, `opt_test.go` | Command interrupt, report and progress tests in `e2e_test.go` |
+| Panic handling, channel completion and resource release | `recover_test.go`, `panic_log_test.go`, `run_delivery_test.go`, `copy_test.go`, `stream_test.go` | Caller callback/handler panic tests driving a real stream |
 | Independent cache initialization, asynchronous capacity polling and filesystem error identities | `cache_test.go`, `fs_test.go`, `disk_usage_test.go`, `linear_space_test.go`, `full_linux_test.go` | Real copies with blocked capacity queries and Linux device/filled-volume cases |
 | JSON round trips, report keys, native path bytes and persisted input validation | `report_test.go`, `report_paths_test.go`, `cmd/acp/report_test.go`, `cmd/acp-rewrite/load_test.go`, rewrite path tests | Command report, exit-status and invalid-input tests |
 | Rewrite selection, hardlinks, pending work, saved history, persistence failure and resume | `cmd/acp-rewrite/main_test.go`, `cmd/acp-rewrite/repair_test.go` | `cmd/acp-rewrite/e2e_test.go` |
@@ -109,7 +109,7 @@ Close/Finish and member Open, bounded native-target completion overlapping the n
 unchanged publication order, per-item failures and hard-stop cleanup, no overlap without ordered
 publication, lane members and native items after overlapped completions, mapped native sources, exact display identifiers, cached-only policy,
 short read/write, original error causes and cancellation without payload draining.
-`content_source_test.go` verifies lazy fs.FS binding, one Open/Stat/Xattrs observation, plain standard
+`content_source_test.go` verifies one Open/Stat/Xattrs observation, plain standard
 files, empty members, opaque display identifiers, independent snapshot ownership, observation
 errors/panics/cancellation and exactly-once cleanup of Open-returned files alongside errors.
 `content_buffer_test.go` checks bounded chunks under target backpressure;
@@ -184,7 +184,7 @@ Release collection and evidence validation use `make performance-collect` and
 
 ## Bounded pipeline and LTFS model
 
-`pipeline_b_test.go`, `pipeline_liveness_test.go`, `ltfs_mock_test.go`, `tape_drive_test.go` and `tape_speed_test.go` exercise the private filesystem
+`pipeline_overlap_test.go`, `read_ahead_test.go`, `pipeline_liveness_test.go`, `ltfs_mock_test.go`, `tape_drive_test.go` and `tape_speed_test.go` exercise the private filesystem
 seam, shared content credits, ordered head admission, parallel hash/target consumers and independent
 source/target Close. Keep EOF, cancellation, late no-space, same-path publication, cache and
 multi-target outcomes in semantic coverage; do not assert the removed small-file prehash threshold.

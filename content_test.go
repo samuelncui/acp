@@ -18,6 +18,8 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"github.com/samuelncui/acp/signature"
 )
 
 type testContentItem struct {
@@ -117,7 +119,7 @@ func TestContentSourceObservedMetadataPrecedesNativeOutput(t *testing.T) {
 	}
 	digest := sha256.Sum256(data)
 	if result.Err != nil || result.Targets[0].Err != nil || result.Size != int64(len(data)) ||
-		!bytes.Equal(result.SHA256, digest[:]) {
+		!bytes.Equal(result.SHA256, digest[:]) || !bytes.Equal(result.Targets[0].StoredSHA256, digest[:]) {
 		t.Fatalf("result=%#v", result)
 	}
 }
@@ -383,8 +385,8 @@ func TestContentSourceHashPoliciesIgnoreForeignCache(t *testing.T) {
 			// A valid decoy matches the observed facts but cannot opt a foreign file into cache reuse.
 			data := []byte("actual content")
 			mtime := time.Unix(1700000000, 0)
-			decoy := encodeCachedSignature(CachedSignature{
-				Size: int64(len(data)), MtimeNS: mtime.UnixNano(), SHA256: [32]byte{1},
+			decoy := legacyLayout(signature.Entry{
+				Size: int64(len(data)), MtimeNS: mtime.UnixNano(), SHA256: append([]byte{1}, make([]byte, 31)...),
 			})
 			opens, closes := 0, 0
 			item := &testContentItem{
@@ -913,4 +915,64 @@ func TestContentNativeItemAfterOverlappedMemberPublishesInOrder(t *testing.T) {
 			t.Fatalf("commits=%v", commits)
 		}
 	})
+}
+
+type contentSourceOnlyItem struct {
+	*SimpleJob
+	source ContentSource
+}
+
+func (i *contentSourceOnlyItem) ContentSource() ContentSource { return i.source }
+
+type contentTargetOnlyItem struct {
+	*SimpleJob
+	targets []ContentTarget
+}
+
+func (i *contentTargetOnlyItem) ContentTargets() []ContentTarget { return i.targets }
+
+func TestContentEndpointsAreIndependentOptionalInterfaces(t *testing.T) {
+	data := []byte("one side only")
+	root := t.TempDir()
+
+	// A content source alone feeds a native target.
+	source := &contentSourceOnlyItem{
+		SimpleJob: &SimpleJob{Path: "member", Dsts: []string{filepath.Join(root, "copy")}},
+		source: testContentSource(func(context.Context) (fs.File, error) {
+			return &testContentFile{
+				ReadCloser: io.NopCloser(bytes.NewReader(data)),
+				metadata:   ContentMetadata{Info: contentInfo{name: "member", size: int64(len(data)), mode: 0600}},
+			}, nil
+		}),
+	}
+	if _, ok := any(source).(ContentTargetItem); ok {
+		t.Fatal("a source-only item implements ContentTargetItem")
+	}
+	callback, batches := collectResults()
+	if err := runStream(context.Background(), callback, []Item{source}, SetFromDevice(LinearDevice(true))); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(source.Dsts[0]); err != nil || !bytes.Equal(got, data) || batches()[0][0].Err != nil {
+		t.Fatalf("native copy of a content source = %q / %v / %#v", got, err, batches())
+	}
+
+	// A content target alone receives a native source.
+	input := writeSourceFile(t, root, "input", data)
+	var written bytes.Buffer
+	target := &contentTargetOnlyItem{
+		SimpleJob: &SimpleJob{Path: input, Dsts: []string{"stream target"}},
+		targets: []ContentTarget{testContentTarget(func(context.Context, ContentMetadata) (ContentWriter, error) {
+			return &testContentWriter{Writer: &written, finish: func(error) error { return nil }}, nil
+		})},
+	}
+	if _, ok := any(target).(ContentSourceItem); ok {
+		t.Fatal("a target-only item implements ContentSourceItem")
+	}
+	callback, batches = collectResults()
+	if err := runStream(context.Background(), callback, []Item{target}, SetToDevice(LinearDevice(true))); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(written.Bytes(), data) || batches()[0][0].Err != nil || batches()[0][0].Targets[0].Err != nil {
+		t.Fatalf("content target of a native source wrote %q / %#v", written.Bytes(), batches())
+	}
 }

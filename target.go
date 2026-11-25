@@ -12,13 +12,8 @@ import (
 	"github.com/samuelncui/acp/internal/fileio"
 )
 
-// Allocation and metadata restoration retain their platform-specific implementations.
-var (
-	allocateTarget   = truncate
-	restoreTarget    = writeSysStat
-	commitTarget     = (*fileio.Output).Commit
-	resolveDirectory = filepath.EvalSymlinks
-)
+// resolveDirectory is a variable so a test can count and fail directory resolution at indexing.
+var resolveDirectory = filepath.EvalSymlinks
 
 // targetSpec holds decisions made once during indexing. name is the caller's logical path;
 // path is its resolved destination, which may be a symlink referent.
@@ -75,7 +70,7 @@ func (c *StreamCopyer) indexTarget(name string, source os.FileInfo) (targetSpec,
 		if source != nil && os.SameFile(source, info) {
 			return target, fmt.Errorf("source and target are the same file")
 		}
-		if c.createFlag&os.O_TRUNC == 0 {
+		if !c.overwrite {
 			return target, fmt.Errorf("target already exists, %w", os.ErrExist)
 		}
 		target.direct = info.Mode()&os.ModeDevice != 0
@@ -156,9 +151,7 @@ func (c *StreamCopyer) prepareTarget(job *writeJob, target targetSpec) (out *fil
 	out = target.output
 	defer func() {
 		if value := recover(); value != nil {
-			err = panicError("prepare target", value)
-			c.setError(err)
-			c.stopHard()
+			err = c.fatalPanic("prepare target", value)
 		}
 		if err != nil && out != nil {
 			err = errors.Join(err, out.Discard())
@@ -184,7 +177,7 @@ func (c *StreamCopyer) prepareTarget(job *writeJob, target targetSpec) (out *fil
 	}
 	// An encoded output's stored size is unknown until its encoder closes.
 	if !c.toDevice.linear && job.stat.size > 0 && job.encode == nil {
-		if err := allocateTarget(out.File, job.stat.size); err != nil {
+		if err := c.fs().Allocate(out.File, job.stat.size); err != nil {
 			return out, fmt.Errorf("preallocate target failed, %w", err)
 		}
 	}

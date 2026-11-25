@@ -1,11 +1,10 @@
 package acp
 
 import (
-	"context"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -70,8 +69,8 @@ func (p *publicationOrder) reserve(path string) publicationTurn {
 	return turn
 }
 
-// ordersPublication reports whether conflicting outputs publish in dispatch order. Formerly
-// serialized configurations keep their winners across asynchronous completion.
+// ordersPublication reports whether conflicting outputs publish in dispatch order. Linear
+// and single-threaded configurations keep their winners across asynchronous completion.
 func (c *StreamCopyer) ordersPublication() bool {
 	return c.toDevice.linear || c.toDevice.threads == 1 || c.fromDevice.linear
 }
@@ -103,29 +102,42 @@ func (t *transfer) reservePublications(order *publicationOrder) {
 }
 
 type targetTransfer struct {
-	spec        targetSpec
-	output      transferOutput
-	content     ContentWriter
-	encoder     io.WriteCloser
-	stored      int64
-	chunks      chan *chunkBuffer
-	err         error
-	publication publicationTurn
+	spec    targetSpec
+	output  transferOutput
+	content ContentWriter
+	encoder io.WriteCloser
+	stored  int64
+	// storedHash hashes the encoded bytes while the transfer hashes its content; storedSHA256 is
+	// its sum once the encoder has closed.
+	storedHash   hash.Hash
+	storedSHA256 []byte
+	chunks       chan *chunkBuffer
+	err          error
+	publication  publicationTurn
 }
 
-// storedWriter counts the bytes a native output stores, beneath any item encoder.
+// storedWriter counts, and for an encoded output hashes, the bytes a native output stores,
+// beneath any item encoder.
 type storedWriter struct{ target *targetTransfer }
 
 func (w storedWriter) Write(data []byte) (int, error) {
 	n, err := w.target.output.Write(data)
 	w.target.stored += int64(n)
+	if w.target.storedHash != nil {
+		_, _ = w.target.storedHash.Write(data[:n])
+	}
 	return n, err
 }
 
-// startEncoder wraps a created native output in the item's encoder.
-func (target *targetTransfer) startEncoder(encode func(io.Writer) (io.WriteCloser, error)) error {
+// startEncoder wraps a created native output in the item's encoder, hashing what it stores when
+// the transfer hashes its content.
+func (target *targetTransfer) startEncoder(c *StreamCopyer, encode func(io.Writer) (io.WriteCloser, error), hashed bool) error {
+	if hashed {
+		target.storedHash = sha256Pool.Get().(hash.Hash)
+		target.storedHash.Reset()
+	}
 	var err error
-	panicErr := protectCall("item target encoder", func() { target.encoder, err = encode(storedWriter{target}) })
+	panicErr := c.protectCall("item target encoder", func() { target.encoder, err = encode(storedWriter{target}) })
 	err = errors.Join(err, panicErr)
 	if err == nil && target.encoder == nil {
 		err = fmt.Errorf("target encoder returned no writer")
@@ -137,54 +149,41 @@ func (target *targetTransfer) startEncoder(encode func(io.Writer) (io.WriteClose
 }
 
 // closeEncoder flushes the encoded tail once, including after a failed write.
-func (target *targetTransfer) closeEncoder() error {
+func (target *targetTransfer) closeEncoder(c *StreamCopyer) error {
 	var err error
-	panicErr := protectCall("item target encoder Close", func() { err = target.encoder.Close() })
-	if err = errors.Join(err, panicErr); err != nil {
+	panicErr := c.protectCall("item target encoder Close", func() { err = target.encoder.Close() })
+	err = errors.Join(err, panicErr)
+	if target.storedHash != nil {
+		// Close returns only after every write into the target finished, so the hash is idle.
+		if err == nil {
+			target.storedSHA256 = target.storedHash.Sum(nil)
+		}
+		sha256Pool.Put(target.storedHash)
+		target.storedHash = nil
+	}
+	if err != nil {
 		return fmt.Errorf("close target encoder failed, %w", err)
 	}
 	return nil
 }
 
+// contentWrite is the state of one item's data stage: the targets it feeds, their random-target
+// data consumers, and whether the item stopped its own read early so that stop is no failure.
+type contentWrite struct {
+	targets []*targetTransfer
+	data    sync.WaitGroup
+	aborted bool
+}
+
 func (t *transfer) writeContent(cntr *counter, exhausted mapset.Set[string]) {
 	// Data consumers settle before ownership moves to independent completion workers.
-	c := t.copyer
-	var targets []*targetTransfer
-	var data sync.WaitGroup
-	// aborted records that this item stopped its own read early, so the read's stop is no failure.
-	var aborted bool
+	w := &contentWrite{}
 	defer func() {
 		var failure error
 		if value := recover(); value != nil {
-			failure = t.panicFailure("target data", value)
+			failure = t.copyer.fatalPanic("target data", value)
 		}
-		for _, target := range targets {
-			if target.chunks != nil {
-				close(target.chunks)
-			}
-		}
-		data.Wait()
-		<-t.readDone
-		for _, target := range targets {
-			target.err = errors.Join(target.err, t.readErr, failure)
-			// The encoded tail belongs to this file's data writing, before a linear writer moves on.
-			if target.encoder != nil {
-				if err := target.closeEncoder(); err != nil {
-					target.err = errors.Join(target.err, err)
-					c.endLinearTarget(err)
-				}
-			}
-			t.targets.Add(1)
-			go c.wrap(context.Background(), func() {
-				defer t.targets.Done()
-				t.finishTarget(target, exhausted)
-			})
-		}
-		// With no target to carry it, a read failure is the item's own; a drained member reports it
-		// too, while an item that aborted its read keeps the stop out of its result.
-		if t.readErr != nil && len(targets) == 0 && (t.hashes != nil || !aborted) {
-			t.job.itemError = t.readErr
-		}
+		t.settleTargets(w, failure, exhausted)
 	}()
 
 	// Source endpoint Open must settle before any output allocation or endpoint header emission.
@@ -197,96 +196,161 @@ func (t *transfer) writeContent(cntr *counter, exhausted mapset.Set[string]) {
 
 	// Prepare each independent outcome before transferring output ownership to its consumer.
 	for i, spec := range t.job.outputs {
-		// A direct device becomes visible during Write and may require the preceding handle to close.
-		if i < len(t.publications) && !t.wait(t.publications[i].directTurn) {
-			t.job.fail(spec.name, fmt.Errorf("direct target stopped by pipeline failure"))
-			continue
-		}
-		// A preceding Close may have exhausted this device while its handle was still owned.
-		if exhausted.Contains(spec.device) {
-			t.job.fail(spec.name, ErrTargetNoSpace)
-			continue
-		}
-		var output transferOutput
-		var content ContentWriter
-		var err error
-		if spec.content != nil {
-			metadata, metadataErr := snapshotContentMetadata(t.job.metadata)
-			err = metadataErr
-			if err == nil {
-				panicErr := protectCall("ContentTarget.Open", func() { content, err = spec.content.Open(c.ctx, metadata) })
-				err = errors.Join(err, panicErr)
-			}
-			if err == nil && content == nil {
-				err = fmt.Errorf("content target returned no writer")
-			}
-		} else {
-			output, err = c.fs().Create(t.job, spec)
-		}
-		if err != nil {
-			if spec.content != nil {
-				// A writer that refused the member before emitting anything fails only this target.
-				if content == nil && errors.Is(err, ErrMemberSettled) {
-					c.targetFailed(t.job.baseJob, spec.name, spec.device, err, exhausted)
-					continue
-				}
-				if content != nil {
-					// Even an errored Open can return an owned handle; Finish still waits for Close.
-					targets = append(targets, &targetTransfer{spec: spec, content: content, err: err})
-				} else {
-					c.targetFailed(t.job.baseJob, spec.name, spec.device, err, exhausted)
-				}
-				for _, remaining := range t.job.outputs[i+1:] {
-					t.job.fail(remaining.name, err)
-				}
-				t.stopEndpoint(err)
-				aborted = true
-				t.abort()
-				break
-			}
-			c.targetFailed(t.job.baseJob, spec.name, spec.device, err, exhausted)
-			continue
-		}
-		target := &targetTransfer{spec: spec, output: output, content: content}
-		if spec.content == nil && t.job.encode != nil {
-			// A refused encoder leaves its output unpublished, like any other creation failure.
-			if err := target.startEncoder(t.job.encode); err != nil {
-				c.targetFailed(t.job.baseJob, spec.name, spec.device, errors.Join(err, output.Discard()), exhausted)
-				continue
-			}
-		}
-		if i < len(t.publications) {
-			target.publication = t.publications[i]
-			t.publications[i] = publicationTurn{}
-		}
-		targets = append(targets, target)
-		if !c.toDevice.linear {
-			target.chunks = make(chan *chunkBuffer, 4)
-			data.Add(1)
-			go c.wrap(context.Background(), func() {
-				defer data.Done()
-				t.writeTargetData(target)
-			})
+		if t.openOutput(w, i, spec, exhausted) {
+			break
 		}
 	}
 
 	// Failed consumers keep draining; only a native item with no content consumer stops reading
 	// early. A content source always reads its member to the end, keeping its stream's boundary.
-	if len(targets) == 0 && t.hashes == nil && t.job.contentSource == nil {
-		aborted = true
+	if len(w.targets) == 0 && t.hashes == nil && t.job.contentSource == nil {
+		w.aborted = true
 		t.abort()
 	}
+	t.distribute(w, cntr)
+}
+
+// settleTargets runs when the data stage ends, normally or by panic: it closes the consumers,
+// waits for the read, closes each encoder and hands every target to its completion worker.
+func (t *transfer) settleTargets(w *contentWrite, failure error, exhausted mapset.Set[string]) {
+	c := t.copyer
+	for _, target := range w.targets {
+		if target.chunks != nil {
+			close(target.chunks)
+		}
+	}
+	w.data.Wait()
+	<-t.readDone
+	for _, target := range w.targets {
+		target.err = errors.Join(target.err, t.readErr, failure)
+		// The encoded tail belongs to this file's data writing, before a linear writer moves on.
+		if target.encoder != nil {
+			if err := target.closeEncoder(t.copyer); err != nil {
+				target.err = errors.Join(target.err, err)
+				c.endLinearTarget(err)
+			}
+		}
+		t.targets.Add(1)
+		go c.wrap(func() {
+			defer t.targets.Done()
+			t.finishTarget(target, exhausted)
+		})
+	}
+	// With no target to carry it, a read failure is the item's own; a drained member reports it
+	// too, while an item that aborted its read keeps the stop out of its result.
+	if t.readErr != nil && len(w.targets) == 0 && (t.hashes != nil || !w.aborted) {
+		t.job.itemError = t.readErr
+	}
+}
+
+// openOutput opens output i and registers its target. It reports true when the item must stop
+// opening further outputs.
+func (t *transfer) openOutput(w *contentWrite, i int, spec targetSpec, exhausted mapset.Set[string]) bool {
+	c := t.copyer
+
+	// A direct device becomes visible during Write and may require the preceding handle to close.
+	if i < len(t.publications) && !t.wait(t.publications[i].directTurn) {
+		t.job.fail(spec.name, fmt.Errorf("direct target stopped by pipeline failure"))
+		return false
+	}
+	// A preceding Close may have exhausted this device while its handle was still owned.
+	if exhausted.Contains(spec.device) {
+		t.job.fail(spec.name, ErrTargetNoSpace)
+		return false
+	}
+
+	if spec.content != nil {
+		return t.openContentOutput(w, i, spec, exhausted)
+	}
+	output, err := c.fs().Create(t.job, spec)
+	if err != nil {
+		c.targetFailed(t.job.baseJob, spec.name, spec.device, err, exhausted)
+		return false
+	}
+	target := &targetTransfer{spec: spec, output: output}
+	if t.job.encode != nil {
+		// A refused encoder leaves its output unpublished, like any other creation failure.
+		if err := target.startEncoder(t.copyer, t.job.encode, t.hashes != nil); err != nil {
+			c.targetFailed(t.job.baseJob, spec.name, spec.device, errors.Join(err, output.Discard()), exhausted)
+			return false
+		}
+	}
+	t.addTarget(w, i, target)
+	return false
+}
+
+// openContentOutput opens a content target. Its failure stops the endpoint and every later
+// output, unless the writer refused the member before emitting anything.
+func (t *transfer) openContentOutput(w *contentWrite, i int, spec targetSpec, exhausted mapset.Set[string]) bool {
+	c := t.copyer
+	var content ContentWriter
+	metadata, err := snapshotContentMetadata(t.job.metadata)
+	if err == nil {
+		panicErr := t.copyer.protectCall("ContentTarget.Open", func() { content, err = spec.content.Open(c.ctx, metadata) })
+		err = errors.Join(err, panicErr)
+	}
+	if err == nil && content == nil {
+		err = fmt.Errorf("content target returned no writer")
+	}
+	if err == nil {
+		t.addTarget(w, i, &targetTransfer{spec: spec, content: content})
+		return false
+	}
+
+	// A writer that refused the member before emitting anything fails only this target.
+	if content == nil && errors.Is(err, ErrMemberSettled) {
+		c.targetFailed(t.job.baseJob, spec.name, spec.device, err, exhausted)
+		return false
+	}
+	if content != nil {
+		// Even an errored Open can return an owned handle; Finish still waits for Close.
+		w.targets = append(w.targets, &targetTransfer{spec: spec, content: content, err: err})
+	} else {
+		c.targetFailed(t.job.baseJob, spec.name, spec.device, err, exhausted)
+	}
+	for _, remaining := range t.job.outputs[i+1:] {
+		t.job.fail(remaining.name, err)
+	}
+	t.stopEndpoint(err)
+	w.aborted = true
+	t.abort()
+	return true
+}
+
+// addTarget registers an opened target with its publication turn and, for a random target, its
+// data consumer.
+func (t *transfer) addTarget(w *contentWrite, i int, target *targetTransfer) {
+	if i < len(t.publications) {
+		target.publication = t.publications[i]
+		t.publications[i] = publicationTurn{}
+	}
+	w.targets = append(w.targets, target)
+	if t.copyer.toDevice.linear {
+		return
+	}
+	target.chunks = make(chan *chunkBuffer, 4)
+	w.data.Add(1)
+	go t.copyer.wrap(func() {
+		defer w.data.Done()
+		t.writeTargetData(target)
+	})
+}
+
+// distribute hands every chunk of the read to the targets until the read ends or the pipeline
+// stops hard, and advances the read-ahead window by what was consumed.
+func (t *transfer) distribute(w *contentWrite, cntr *counter) {
+	c := t.copyer
 	var consumed int64
 	for chunk := range t.chunks {
 		continued := func() bool {
 			defer chunk.release()
-			if len(targets) == 0 && t.hashes == nil {
+			if len(w.targets) == 0 && t.hashes == nil {
 				// A drained member still advances the read-ahead window, or its reader waits forever.
 				consumed += int64(len(chunk.data))
 				t.ahead.advance(t.job.order, t.start+consumed)
 				return true
 			}
-			for _, target := range targets {
+			for _, target := range w.targets {
 				if c.toDevice.linear {
 					// All linear outputs share this one application data writer.
 					if target.err == nil {
@@ -324,7 +388,7 @@ func (t *transfer) writeTargetData(target *targetTransfer) {
 	// Each random output owns its errors and drains every reference after failure or panic.
 	defer func() {
 		if value := recover(); value != nil {
-			target.err = errors.Join(target.err, t.panicFailure("target data consumer", value))
+			target.err = errors.Join(target.err, t.copyer.fatalPanic("target data consumer", value))
 		}
 		for chunk := range target.chunks {
 			chunk.release()
@@ -362,9 +426,9 @@ func (t *transfer) finishTarget(target *targetTransfer, exhausted mapset.Set[str
 	c, out := t.copyer, target.output
 	defer func() {
 		if value := recover(); value != nil {
-			target.err = errors.Join(target.err, t.panicFailure("target completion", value))
+			target.err = errors.Join(target.err, t.copyer.fatalPanic("target completion", value))
 		}
-		cleanup := protectCall("discard target", func() { target.err = errors.Join(target.err, out.Discard()) })
+		cleanup := t.copyer.protectCall("discard target", func() { target.err = errors.Join(target.err, out.Discard()) })
 		if cleanup != nil {
 			target.err = errors.Join(target.err, cleanup)
 			c.setError(cleanup)
@@ -373,11 +437,17 @@ func (t *transfer) finishTarget(target *targetTransfer, exhausted mapset.Set[str
 		if target.err != nil {
 			c.targetFailed(t.job.baseJob, target.spec.name, target.spec.device, target.err, exhausted)
 		} else {
-			t.job.success(target.spec.name, target.stored)
+			storedHash := target.storedSHA256
+			if target.content == nil && t.job.encode == nil && t.hashes != nil && !t.noContent {
+				// A plaintext native target stores the bytes the content hash describes.
+				storedHash = t.digest
+			}
+			t.job.success(target.spec.name, target.stored, storedHash)
 		}
 	}()
 
 	// Linear Close is independent of hash and the next data producer, and its error is authoritative.
+	// It ends the linear target at once; every other failure reaches targetFailed, which ends it.
 	if c.toDevice.linear {
 		if err := out.Close(); err != nil {
 			target.err = errors.Join(target.err, fmt.Errorf("close target failed, %w", err))
@@ -419,14 +489,12 @@ func (t *transfer) finishTarget(target *targetTransfer, exhausted mapset.Set[str
 
 	// Managed metadata precedes restrictive permissions; ordinary random targets retain their sync order.
 	if !target.spec.direct {
-		if err := out.Cache(t.job.baseJob, c.toDevice.linear, target.stored); err != nil {
+		if err := out.Cache(t.job.baseJob, target.stored, target.storedSHA256); err != nil {
 			target.err = fmt.Errorf("write target signature failed, %w", err)
-			c.endLinearTarget(target.err)
 			return
 		}
 		if err := out.Restore(t.job.stat); err != nil {
 			target.err = fmt.Errorf("restore target metadata failed, %w", err)
-			c.endLinearTarget(target.err)
 			return
 		}
 	}
@@ -449,9 +517,8 @@ func (t *transfer) finishTarget(target *targetTransfer, exhausted mapset.Set[str
 		target.err = fmt.Errorf("publication stopped by pipeline failure")
 		return
 	}
-	if err := out.Commit(c.createFlag&os.O_TRUNC != 0); err != nil {
+	if err := out.Commit(c.overwrite); err != nil {
 		target.err = fmt.Errorf("commit target failed, %w", err)
-		c.endLinearTarget(target.err)
 	}
 }
 
@@ -477,7 +544,7 @@ func (t *transfer) finishContentTarget(target *targetTransfer) {
 		cause = &finishCause{err: target.err}
 	}
 	var finishErr error
-	panicErr := protectCall("ContentWriter.Finish", func() {
+	panicErr := t.copyer.protectCall("ContentWriter.Finish", func() {
 		finishErr = target.content.Finish(cause)
 	})
 	target.err = errors.Join(target.err, finishErr, panicErr)
@@ -492,7 +559,7 @@ func (t *transfer) finishContentTarget(target *targetTransfer) {
 		t.job.fail(target.spec.name, target.err)
 		return
 	}
-	t.job.success(target.spec.name, 0)
+	t.job.success(target.spec.name, 0, nil)
 }
 
 // finishCause carries a failed member's cause into ContentWriter.Finish as a node of its own. It

@@ -70,19 +70,17 @@ func TestItemsOverrideTheStreamReadMode(t *testing.T) {
 
 			// Observe the mode ACP actually passes to its source opener, including the item that
 			// has no override. Source preparation may run concurrently.
-			previous := openSourceContent
 			var lock sync.Mutex
 			opened := make(map[string]ReadMode)
-			openSourceContent = func(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
+			observe := withFS(fsHooks{open: func(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
 				lock.Lock()
 				opened[path] = mode
 				lock.Unlock()
-				return previous(path, mode, info)
-			}
-			t.Cleanup(func() { openSourceContent = previous })
+				return openNativeSource(path, mode, info)
+			}})
 
 			callback, batches := collectResults()
-			opts := []Option{WithHashPolicy(HashReadRefresh)}
+			opts := []Option{WithHashPolicy(HashReadRefresh), observe}
 			if tc.withOption {
 				opts = append(opts, SetFromDevice(WithReadMode(tc.streamMode)))
 			}
@@ -338,6 +336,17 @@ func TestSuccessResultsAreBatchedAndFlushedOnClose(t *testing.T) {
 	})
 }
 
+// heldItem blocks in Source until its hold returns.
+type heldItem struct {
+	*fixtureItem
+	hold func()
+}
+
+func (i *heldItem) Source() string {
+	i.hold()
+	return i.fixtureItem.Source()
+}
+
 // TestResultsCallbackErrorActsAsACancellation pins error rule 3: an error returned by the
 // results callback stops the feed, reports the items it had not started with that error, keeps
 // the items already past the read stage, and is the run's terminal error.
@@ -345,11 +354,26 @@ func TestResultsCallbackErrorActsAsACancellation(t *testing.T) {
 	root := t.TempDir()
 	const total = 24
 
+	// The pipeline outruns the results delivery, so nothing in the library keeps an item
+	// unstarted when the callback fails. The items after the second one therefore wait in
+	// preparation until the callback error is recorded, which leaves them in the read pipeline.
+	var stream *StreamCopyer
+	holdUntilStopped := func() {
+		for deadline := time.Now().Add(5 * time.Second); stream.callbackStop() == nil && time.Now().Before(deadline); {
+			time.Sleep(time.Millisecond)
+		}
+	}
+
 	items := make([]Item, 0, total)
 	for index := 0; index < total; index++ {
 		name := fmt.Sprintf("%02d.txt", index)
 		source := writeSourceFile(t, root, name, []byte(strings.Repeat(name, 64)))
-		items = append(items, newFixtureItem(source, filepath.Join(root, "target", name)))
+		item := newFixtureItem(source, filepath.Join(root, "target", name))
+		if index < 2 {
+			items = append(items, item)
+			continue
+		}
+		items = append(items, &heldItem{fixtureItem: item, hold: holdUntilStopped})
 	}
 
 	stopErr := errors.New("results sink failed")
@@ -371,9 +395,9 @@ func TestResultsCallbackErrorActsAsACancellation(t *testing.T) {
 		return nil
 	}
 
-	// One writer serializes the items, so a stop still finds work inside the read pipeline, and
-	// one result per delivery lets the callback fail on its second call.
-	stream, err := NewStream(context.Background(), onResults, WithResultBuffer(1), WithResultBatch(1), SetToDevice(DeviceThreads(1)))
+	// One result per delivery lets the callback fail on its second call.
+	var err error
+	stream, err = NewStream(context.Background(), onResults, WithResultBuffer(1), WithResultBatch(1), SetToDevice(DeviceThreads(1)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +444,7 @@ func TestResultsCallbackErrorActsAsACancellation(t *testing.T) {
 	for _, item := range items {
 		result, ok := outcomes[item]
 		if !ok {
-			t.Fatalf("item %q received no result", item.(*fixtureItem).source)
+			t.Fatalf("item %v received no result", item)
 		}
 		if result.Err != nil {
 			if !errors.Is(result.Err, stopErr) {
@@ -488,7 +512,7 @@ func TestWrapStopsAPanickingPipeline(t *testing.T) {
 	blocked := make(chan error, 1)
 	go func() { blocked <- copyer.Submit(newFixtureItem(input)) }()
 
-	copyer.wrap(context.Background(), func() { panic("worker fixture") })
+	copyer.wrap(func() { panic("worker fixture") })
 
 	select {
 	case err := <-blocked:
@@ -797,10 +821,10 @@ func TestSubmitRacingCloseKeepsTheFeedCountersSafe(t *testing.T) {
 	}()
 
 	time.Sleep(5 * time.Millisecond)
-	if err := stream.Close(); err != nil {
-		t.Fatalf("Close() error = %v", err)
+	waitErr := stream.Close()
+	if err := stream.Wait(); err != waitErr {
+		t.Fatalf("Wait() error = %v, want Close's %v", err, waitErr)
 	}
-	waitErr := stream.Wait()
 
 	// A refusal is a submission error and therefore the run's error; a feeder that finished
 	// before Close leaves the run successful.
@@ -887,8 +911,8 @@ func TestSubmitCountsOnlyAcceptedItems(t *testing.T) {
 	if files, size := stream.countFiles.Load(), stream.countBytes.Load(); files != 1 || size != int64(len("fixture")) {
 		t.Fatalf("indexed files/bytes = %d/%d, want 1/%d", files, size, len("fixture"))
 	}
-	if err := stream.Close(); err != nil {
-		t.Fatal(err)
+	if err := stream.Close(); !errors.Is(err, errStreamStopped) {
+		t.Fatalf("Close() error = %v, want the terminal fatal-stop error", err)
 	}
 }
 

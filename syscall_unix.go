@@ -10,6 +10,7 @@ import (
 	"os"
 	"syscall"
 
+	"github.com/samuelncui/acp/signature"
 	"golang.org/x/sys/unix"
 )
 
@@ -24,10 +25,6 @@ type xattr struct {
 type sysStat struct {
 	*syscall.Stat_t
 	xattrs []xattr
-}
-
-func readSysStat(path string, stat fs.FileInfo) (*sysStat, error) {
-	return readSysStatWithContent(path, stat, false)
 }
 
 func readSysStatWithContent(path string, stat fs.FileInfo, bounded bool) (*sysStat, error) {
@@ -76,7 +73,7 @@ func readXattrsWithContent(path string, bounded bool) ([]xattr, error) {
 	// Refuse unbounded name lists before allocating their buffers.
 	size, err := listOrdinaryXattrs(path, nil)
 	if err != nil {
-		if errors.Is(err, unix.ENOTSUP) || isNoAttrErr(err) {
+		if signature.Ignorable(err) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("count xattrs failed, %w", err)
@@ -85,13 +82,13 @@ func readXattrsWithContent(path string, bounded bool) ([]xattr, error) {
 		return nil, nil
 	}
 
-	if bounded && size > ContentMaxXattrCount*(ContentMaxXattrNameBytes+1) {
+	if bounded && size > contentMaxXattrCount*(contentMaxXattrNameBytes+1) {
 		return nil, fmt.Errorf("content xattr name list exceeds metadata limits")
 	}
 	keyBuf := make([]byte, size)
 	n, err := listOrdinaryXattrs(path, keyBuf)
 	if err != nil {
-		if errors.Is(err, unix.ENOTSUP) || isNoAttrErr(err) {
+		if signature.Ignorable(err) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("list xattrs failed, %w", err)
@@ -110,7 +107,7 @@ func readXattrsWithContent(path string, bounded bool) ([]xattr, error) {
 			continue
 		}
 
-		if bounded && i-start > ContentMaxXattrNameBytes {
+		if bounded && i-start > contentMaxXattrNameBytes {
 			return nil, fmt.Errorf("content xattr name exceeds metadata limits")
 		}
 		name := string(keyBuf[start:i])
@@ -124,7 +121,7 @@ func readXattrsWithContent(path string, bounded bool) ([]xattr, error) {
 
 		valSize, err := readOrdinaryXattr(path, name, nil)
 		if err != nil {
-			if isNoAttrErr(err) {
+			if signature.Ignorable(err) {
 				continue
 			}
 			return nil, err
@@ -143,7 +140,7 @@ func readXattrsWithContent(path string, bounded bool) ([]xattr, error) {
 		val := make([]byte, valSize)
 		n, err := readOrdinaryXattr(path, name, val)
 		if err != nil {
-			if isNoAttrErr(err) {
+			if signature.Ignorable(err) {
 				continue
 			}
 			return nil, err

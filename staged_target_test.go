@@ -39,44 +39,41 @@ func TestStagedOverwritePreservesOldTargetOnFailure(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			oldAllocate, oldRestore, oldCommit, oldOpen := allocateTarget, restoreTarget, commitTarget, openSourceContent
-			t.Cleanup(func() {
-				allocateTarget, restoreTarget, commitTarget, openSourceContent = oldAllocate, oldRestore, oldCommit, oldOpen
-			})
 			sentinel := errors.New("injected output failure")
+			var hooks fsHooks
 			switch phase {
 			case "allocation":
-				allocateTarget = func(*os.File, int64) error { return sentinel }
+				hooks.allocate = func(*os.File, int64) error { return sentinel }
 			case "read":
-				openSourceContent = func(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
-					src, err := oldOpen(path, mode, info)
+				hooks.open = func(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
+					src, err := openNativeSource(path, mode, info)
 					if err == nil {
 						src.reader = &interruptedSource{File: src.file}
 					}
 					return src, err
 				}
 			case "metadata":
-				restoreTarget = func(string, *stat) error { return sentinel }
+				hooks.restore = func(string, *stat) error { return sentinel }
 			case "sync":
-				allocateTarget = func(file *os.File, size int64) error {
-					if err := oldAllocate(file, size); err != nil {
+				// Closing the descriptor after metadata makes the later Sync fail.
+				var allocated *os.File
+				hooks.allocate = func(file *os.File, size int64) error {
+					allocated = file
+					return truncate(file, size)
+				}
+				hooks.restore = func(path string, info *stat) error {
+					if err := writeSysStat(path, info); err != nil {
 						return err
 					}
-					restoreTarget = func(path string, info *stat) error {
-						if err := oldRestore(path, info); err != nil {
-							return err
-						}
-						return file.Close()
-					}
-					return nil
+					return allocated.Close()
 				}
 			case "close":
-				commitTarget = func(out *fileio.Output, overwrite bool) error {
+				hooks.commit = func(out *fileio.Output, overwrite bool) error {
 					_ = out.File.Close()
 					return out.Commit(overwrite)
 				}
 			case "rename":
-				commitTarget = func(out *fileio.Output, overwrite bool) error {
+				hooks.commit = func(out *fileio.Output, overwrite bool) error {
 					if err := out.Close(); err != nil {
 						return err
 					}
@@ -86,7 +83,7 @@ func TestStagedOverwritePreservesOldTargetOnFailure(t *testing.T) {
 
 			// The public result names only the final path; cleanup must not replace or remove it.
 			item := newFixtureItem(source, target)
-			if err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, Overwrite(true)); err != nil {
+			if err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, Overwrite(true), withFS(hooks)); err != nil {
 				t.Fatal(err)
 			}
 			result, err := item.terminal(t)
@@ -125,9 +122,8 @@ func TestStagedCopyFollowsTargetLinkAndReplacesOneInode(t *testing.T) {
 	if err := os.Chtimes(source, fixed, fixed); err != nil {
 		t.Fatal(err)
 	}
-	previous := commitTarget
 	commits := 0
-	commitTarget = func(out *fileio.Output, overwrite bool) error {
+	countCommit := withFS(fsHooks{commit: func(out *fileio.Output, overwrite bool) error {
 		commits++
 		data, err := os.ReadFile(target)
 		if err != nil || string(data) != "old" {
@@ -140,11 +136,10 @@ func TestStagedCopyFollowsTargetLinkAndReplacesOneInode(t *testing.T) {
 		if !strings.HasPrefix(filepath.Base(out.Temporary), ".tmp_") {
 			t.Errorf("unexpected temporary name: %q", out.Temporary)
 		}
-		return previous(out, overwrite)
-	}
-	t.Cleanup(func() { commitTarget = previous })
+		return out.Commit(overwrite)
+	}})
 	item := newFixtureItem(source, link)
-	if err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, Overwrite(true)); err != nil {
+	if err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, Overwrite(true), countCommit); err != nil {
 		t.Fatal(err)
 	}
 	result, err := item.terminal(t)
@@ -212,15 +207,13 @@ func TestStagedNoOverwriteHandlesTwoItemsForOneDestination(t *testing.T) {
 			first := newFixtureItem(writeSourceFile(t, root, "first", []byte("first")), filepath.Join(dir, "target"))
 			second := newFixtureItem(writeSourceFile(t, root, "second", []byte("second")), filepath.Join(alias, "target"))
 			fixture := newStreamFixture(first, second)
-			stream, err := NewStream(context.Background(), fixture.onResults, SetToDevice(LinearDevice(linear)))
+			allowCommit := make(chan struct{})
+			stream, err := NewStream(context.Background(), fixture.onResults, SetToDevice(LinearDevice(linear)),
+				withFS(fsHooks{commit: func(out *fileio.Output, overwrite bool) error { <-allowCommit; return out.Commit(overwrite) }}))
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer stream.Close()
-			previous := commitTarget
-			allowCommit := make(chan struct{})
-			commitTarget = func(out *fileio.Output, overwrite bool) error { <-allowCommit; return previous(out, overwrite) }
-			t.Cleanup(func() { commitTarget = previous })
 			err = stream.Submit(first, second)
 			close(allowCommit)
 			if err != nil {
@@ -267,21 +260,18 @@ func TestStagedNoOverwriteCommitsIndependentTargetsConcurrently(t *testing.T) {
 	item := newFixtureItem(writeSourceFile(t, root, "source", []byte("content")),
 		filepath.Join(root, "first"), filepath.Join(root, "second"))
 	fixture := newStreamFixture(item)
-	stream, err := NewStream(context.Background(), fixture.onResults)
-	if err != nil {
-		t.Fatal(err)
-	}
-	previous := commitTarget
 	started, release := make(chan struct{}, 2), make(chan struct{})
-	commitTarget = func(out *fileio.Output, overwrite bool) error {
+	stream, err := NewStream(context.Background(), fixture.onResults, withFS(fsHooks{commit: func(out *fileio.Output, overwrite bool) error {
 		started <- struct{}{}
 		<-release
-		return previous(out, overwrite)
+		return out.Commit(overwrite)
+	}}))
+	if err != nil {
+		t.Fatal(err)
 	}
 	defer func() {
 		close(release)
 		_ = stream.Close()
-		commitTarget = previous
 	}()
 	if err := stream.Submit(item); err != nil {
 		t.Fatal(err)
@@ -398,26 +388,26 @@ func TestRewriteClosesSourceBeforeReplacement(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer out.Discard()
-			oldOpen, oldCommit := openSourceContent, commitTarget
-			t.Cleanup(func() { openSourceContent, commitTarget = oldOpen, oldCommit })
 			var source *os.File
-			openSourceContent = func(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
-				opened, err := oldOpen(path, mode, info)
-				source = opened.file
-				return opened, err
-			}
-			commitTarget = func(out *fileio.Output, overwrite bool) error {
-				if _, err := source.Stat(); !errors.Is(err, os.ErrClosed) {
-					return errors.New("source is still open at replacement")
-				}
-				return oldCommit(out, overwrite)
-			}
+			checkSource := withFS(fsHooks{
+				open: func(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
+					opened, err := openNativeSource(path, mode, info)
+					source = opened.file
+					return opened, err
+				},
+				commit: func(out *fileio.Output, overwrite bool) error {
+					if _, err := source.Stat(); !errors.Is(err, os.ErrClosed) {
+						return errors.New("source is still open at replacement")
+					}
+					return out.Commit(overwrite)
+				},
+			})
 
 			// Enforce the sharing restriction on every host instead of waiting for a Windows failure.
 			var results []Result
 			err = runStream(context.Background(), func(batch []Result) error { results = append(results, batch...); return nil },
 				[]Item{&fileio.RewriteItem{Path: path, Info: info, Output: out}},
-				Overwrite(true), WithHashPolicy(HashRead), SetFromDevice(WithReadMode(mode)))
+				Overwrite(true), WithHashPolicy(HashRead), SetFromDevice(WithReadMode(mode)), checkSource)
 			if err != nil || len(results) != 1 || results[0].Err != nil || len(results[0].Targets) != 1 || results[0].Targets[0].Err != nil {
 				t.Fatalf("rewrite outcome=%+v / %v", results, err)
 			}

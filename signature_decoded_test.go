@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/samuelncui/acp/signature"
 )
 
 // entryFile is an encoded fixture file together with the facts of its fresh entries.
@@ -35,26 +37,26 @@ func newEntryFile(t *testing.T) entryFile {
 }
 
 // fresh returns an entry bound to the file's current size and mtime.
-func (f entryFile) fresh(t *testing.T, sha []byte, decoded *DecodedSignature) SignatureEntry {
+func (f entryFile) fresh(t *testing.T, sha []byte, decoded *signature.Decoded) signature.Entry {
 	t.Helper()
 	info, err := os.Stat(f.path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return SignatureEntry{Size: info.Size(), MtimeNS: info.ModTime().UnixNano(), SHA256: sha, Decoded: decoded}
+	return signature.Entry{Size: info.Size(), MtimeNS: info.ModTime().UnixNano(), SHA256: sha, Decoded: decoded}
 }
 
-func (f entryFile) decoded(sha []byte) *DecodedSignature {
-	return &DecodedSignature{Encoding: "rle", Size: int64(len(f.plain)), SHA256: sha}
+func (f entryFile) decoded(sha []byte) *signature.Decoded {
+	return &signature.Decoded{Encoding: "rle", Size: int64(len(f.plain)), SHA256: sha}
 }
 
 func (f entryFile) decodeItem() *decodedItem {
 	return &decodedItem{SimpleJob: &SimpleJob{Path: f.path}, decode: newRLEDecoder, size: int64(len(f.plain))}
 }
 
-func storedEntry(t *testing.T, path string) SignatureEntry {
+func storedEntry(t *testing.T, path string) signature.Entry {
 	t.Helper()
-	entry, _, err := ReadSignatureEntry(path)
+	entry, _, err := signature.Read(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,13 +90,12 @@ func TestLegacyEntryIsReadAndRewritten(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacy := CachedSignature{Size: info.Size(), MtimeNS: info.ModTime().UnixNano()}
-	copy(legacy.SHA256[:], sha("not the content"))
+	legacy := signature.Entry{Size: info.Size(), MtimeNS: info.ModTime().UnixNano(), SHA256: sha("not the content")}
 	file, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = writeSignatureXattr(file, encodeCachedSignature(legacy))
+	err = writeRawSignature(file, legacyLayout(legacy))
 	_ = file.Close()
 	if err != nil {
 		t.Fatal(err)
@@ -102,7 +103,7 @@ func TestLegacyEntryIsReadAndRewritten(t *testing.T) {
 
 	// The legacy layout is a plain hit.
 	result, _ := runOne(t, &SimpleJob{Path: path}, WithHashPolicy(HashCachedOnly))
-	if !result.SignatureCacheHit || !bytes.Equal(result.SHA256, legacy.SHA256[:]) {
+	if !result.SignatureCacheHit || !bytes.Equal(result.SHA256, legacy.SHA256) {
 		t.Fatalf("legacy entry result = %#v", result)
 	}
 
@@ -112,15 +113,15 @@ func TestLegacyEntryIsReadAndRewritten(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := readSignatureXattr(file)
+	raw, err := readRawSignature(file)
 	_ = file.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := sha256.Sum256([]byte("legacy fixture"))
-	entry, err := DecodeSignatureEntry(raw)
-	if err != nil || strings.HasPrefix(string(raw), signatureMagic) || !bytes.Equal(entry.SHA256, want[:]) {
-		t.Fatalf("rewritten entry = %x / %#v / %v", raw, entry, err)
+	entry, status, err := signature.Read(path)
+	if err != nil || status != signature.Fresh || strings.HasPrefix(string(raw), "ACPS") || !bytes.Equal(entry.SHA256, want[:]) {
+		t.Fatalf("rewritten entry = %x / %#v %v / %v", raw, entry, status, err)
 	}
 }
 
@@ -136,21 +137,21 @@ func TestPlainAndDecodingRefreshesKeepEachOthersHash(t *testing.T) {
 	// A decoding refresh keeps the fresh outer hash and adds the decoded part.
 	runOne(t, f.decodeItem(), WithHashPolicy(HashReadRefresh))
 	want := f.fresh(t, f.disk, f.decoded(f.hash))
-	if got := storedEntry(t, f.path); !got.equal(want) {
+	if got := storedEntry(t, f.path); !got.Equal(want) {
 		t.Fatalf("decoding refresh entry = %#v, want %#v", got, want)
 	}
 
 	// A plain refresh over a changed outer hash keeps the fresh decoded part.
 	seedEntry(t, f.path, f.fresh(t, sha("decoy"), f.decoded(f.hash)))
 	runOne(t, &SimpleJob{Path: f.path}, WithHashPolicy(HashReadRefresh))
-	if got := storedEntry(t, f.path); !got.equal(want) {
+	if got := storedEntry(t, f.path); !got.Equal(want) {
 		t.Fatalf("plain refresh entry = %#v, want %#v", got, want)
 	}
 
 	// A decoding refresh over a changed decoded hash keeps the fresh outer hash.
 	seedEntry(t, f.path, f.fresh(t, f.disk, f.decoded(sha("decoy"))))
 	runOne(t, f.decodeItem(), WithHashPolicy(HashReadRefresh))
-	if got := storedEntry(t, f.path); !got.equal(want) {
+	if got := storedEntry(t, f.path); !got.Equal(want) {
 		t.Fatalf("decoding refresh entry = %#v, want %#v", got, want)
 	}
 
@@ -165,7 +166,7 @@ func TestPlainAndDecodingRefreshesKeepEachOthersHash(t *testing.T) {
 	stale.MtimeNS++
 	seedEntry(t, f.path, stale)
 	runOne(t, f.decodeItem(), WithHashPolicy(HashReadRefresh))
-	if got := storedEntry(t, f.path); !got.equal(f.fresh(t, nil, f.decoded(f.hash))) {
+	if got := storedEntry(t, f.path); !got.Equal(f.fresh(t, nil, f.decoded(f.hash))) {
 		t.Fatalf("refresh from a stale entry = %#v", got)
 	}
 }
@@ -173,26 +174,26 @@ func TestPlainAndDecodingRefreshesKeepEachOthersHash(t *testing.T) {
 func TestReuseTrustsOnlyItsOwnHash(t *testing.T) {
 	f := newEntryFile(t)
 	outer, inner := sha("outer"), sha("inner")
-	both := func(t *testing.T) SignatureEntry { return f.fresh(t, outer, f.decoded(inner)) }
+	both := func(t *testing.T) signature.Entry { return f.fresh(t, outer, f.decoded(inner)) }
 	tests := []struct {
 		name    string
 		decode  bool
-		entry   func(t *testing.T) SignatureEntry
+		entry   func(t *testing.T) signature.Entry
 		want    []byte
 		stale   bool
 		encoder string
 	}{
 		{name: "plain reuses the outer hash", entry: both, want: outer},
-		{name: "plain misses a decoded-only entry", entry: func(t *testing.T) SignatureEntry { return f.fresh(t, nil, f.decoded(inner)) }},
+		{name: "plain misses a decoded-only entry", entry: func(t *testing.T) signature.Entry { return f.fresh(t, nil, f.decoded(inner)) }},
 		{name: "decoding reuses the decoded hash", decode: true, entry: both, want: inner},
-		{name: "decoding misses an outer-only entry", decode: true, entry: func(t *testing.T) SignatureEntry { return f.fresh(t, outer, nil) }},
-		{name: "decoding misses a missing decoded hash", decode: true, entry: func(t *testing.T) SignatureEntry { return f.fresh(t, outer, f.decoded(nil)) }},
-		{name: "decoding misses another encoding", decode: true, entry: func(t *testing.T) SignatureEntry {
+		{name: "decoding misses an outer-only entry", decode: true, entry: func(t *testing.T) signature.Entry { return f.fresh(t, outer, nil) }},
+		{name: "decoding misses a missing decoded hash", decode: true, entry: func(t *testing.T) signature.Entry { return f.fresh(t, outer, f.decoded(nil)) }},
+		{name: "decoding misses another encoding", decode: true, entry: func(t *testing.T) signature.Entry {
 			entry := both(t)
 			entry.Decoded.Encoding = "zstd"
 			return entry
 		}},
-		{name: "decoding misses another declared size", decode: true, entry: func(t *testing.T) SignatureEntry {
+		{name: "decoding misses another declared size", decode: true, entry: func(t *testing.T) signature.Entry {
 			entry := both(t)
 			entry.Decoded.Size++
 			return entry
@@ -242,7 +243,7 @@ func TestTargetlessDecodingPolicies(t *testing.T) {
 	if result.SignatureCacheHit || !bytes.Equal(result.SHA256, f.hash) {
 		t.Fatalf("cached-or-read result = %#v", result)
 	}
-	if _, status, _ := ReadSignatureEntry(f.path); status != SignatureMissing {
+	if _, status, _ := signature.Read(f.path); status != signature.Missing {
 		t.Fatalf("cached-or-read stored an entry, status = %v", status)
 	}
 
@@ -251,7 +252,7 @@ func TestTargetlessDecodingPolicies(t *testing.T) {
 	if result.SignatureCacheHit || !bytes.Equal(result.SHA256, f.hash) || summary.Writes != 1 {
 		t.Fatalf("refresh result = %#v summary = %#v", result, summary)
 	}
-	if got := storedEntry(t, f.path); !got.equal(f.fresh(t, nil, f.decoded(f.hash))) {
+	if got := storedEntry(t, f.path); !got.Equal(f.fresh(t, nil, f.decoded(f.hash))) {
 		t.Fatalf("stored entry = %#v", got)
 	}
 	for _, policy := range []HashPolicy{HashCachedOnly, HashCachedOrRead, HashCachedOrReadRefresh} {
@@ -292,6 +293,7 @@ type markerRun struct {
 	written    []string // paths the entry write named, with whether the final path existed
 	finalSeen  []bool
 	storedSize int64
+	storedHash []byte
 }
 
 func runEncodedTarget(t *testing.T, linear bool, opts ...Option) *markerRun {
@@ -307,8 +309,6 @@ func runEncodedTarget(t *testing.T, linear bool, opts ...Option) *markerRun {
 	run.target = filepath.Join(run.out, "source.enc")
 
 	// Observe every managed write: the entry must exist before the file reaches its final name.
-	previousFile, previousPath := writeManagedXattr, writeManagedPathXattr
-	t.Cleanup(func() { writeManagedXattr, writeManagedPathXattr = previousFile, previousPath })
 	record := func(path string) {
 		run.lock.Lock()
 		defer run.lock.Unlock()
@@ -316,21 +316,23 @@ func runEncodedTarget(t *testing.T, linear bool, opts ...Option) *markerRun {
 		run.written = append(run.written, path)
 		run.finalSeen = append(run.finalSeen, err == nil)
 	}
-	writeManagedXattr = func(file *os.File, value []byte) error {
-		record(file.Name())
-		return previousFile(file, value)
-	}
-	writeManagedPathXattr = func(path string, value []byte) error {
-		record(path)
-		return previousPath(path, value)
-	}
+	opts = append(opts, withFS(fsHooks{
+		writeEntry: func(file *os.File, entry signature.Entry) error {
+			record(file.Name())
+			return signature.WriteFile(file, entry)
+		},
+		writeEntryPath: func(path string, entry signature.Entry) error {
+			record(path)
+			return signature.WritePath(path, entry)
+		},
+	}))
 
 	item := &encodedItem{SimpleJob: &SimpleJob{Path: run.source, Dsts: []string{run.target}}, encode: newRLEEncoder}
 	if linear {
 		opts = append(opts, SetToDevice(LinearDevice(true)))
 	}
 	result, _ := runOne(t, item, opts...)
-	run.storedSize = result.Targets[0].StoredSize
+	run.storedSize, run.storedHash = result.Targets[0].StoredSize, result.Targets[0].StoredSHA256
 	if result.Targets[0].Err != nil {
 		t.Fatalf("target failed: %v", result.Targets[0].Err)
 	}
@@ -345,14 +347,16 @@ func TestEncodedTargetEntryIsWrittenBeforePublication(t *testing.T) {
 		linear bool
 	}{{"random", false}, {"linear", true}} {
 		for _, test := range []struct {
-			name     string
-			opts     []Option
-			wantHash bool
+			name string
+			opts []Option
+			// hashed expects both hashes in the entry and the stored hash in the result: the marker
+			// holds whatever the transfer computed, whatever the refresh policy.
+			hashed bool
 		}{
 			{"refreshing policy", []Option{WithHashPolicy(HashReadRefresh)}, true},
 			{"default policy", nil, false},
-			{"read policy", []Option{WithHashPolicy(HashRead)}, false},
-			{"target opted out", []Option{WithHashPolicy(HashReadRefresh), SetToDevice(RefreshSignatureCache(false))}, false},
+			{"read policy", []Option{WithHashPolicy(HashRead)}, true},
+			{"target opted out", []Option{WithHashPolicy(HashReadRefresh), SetToDevice(RefreshSignatureCache(false))}, true},
 		} {
 			t.Run(device.name+"/"+test.name, func(t *testing.T) {
 				run := runEncodedTarget(t, device.linear, test.opts...)
@@ -360,17 +364,26 @@ func TestEncodedTargetEntryIsWrittenBeforePublication(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				content, err := os.ReadFile(run.target)
+				if err != nil {
+					t.Fatal(err)
+				}
+				storedSum := sha256.Sum256(content)
+				if test.hashed != (run.storedHash != nil) || (test.hashed && !bytes.Equal(run.storedHash, storedSum[:])) {
+					t.Fatalf("stored hash = %x, want the hash of the file on disk %x: %t", run.storedHash, storedSum, test.hashed)
+				}
 
 				// The entry on the final file carries the marker and the stored facts.
-				want := SignatureEntry{
+				want := signature.Entry{
 					Size: run.storedSize, MtimeNS: info.ModTime().UnixNano(),
-					Decoded: &DecodedSignature{Encoding: "rle", Size: int64(len(plain))},
+					Decoded: &signature.Decoded{Encoding: "rle", Size: int64(len(plain))},
 				}
-				if test.wantHash {
+				if test.hashed {
+					want.SHA256 = storedSum[:]
 					want.Decoded.SHA256 = plainSum[:]
 				}
-				got, status, err := ReadSignatureEntry(run.target)
-				if err != nil || status != SignatureFresh || !got.equal(want) || info.Size() != run.storedSize {
+				got, status, err := signature.Read(run.target)
+				if err != nil || status != signature.Fresh || !got.Equal(want) || info.Size() != run.storedSize {
 					t.Fatalf("entry = %#v %v / %v, want %#v", got, status, err, want)
 				}
 				sourceInfo, err := os.Stat(run.source)
@@ -403,7 +416,7 @@ func TestEncodedTargetEntryIsWrittenBeforePublication(t *testing.T) {
 
 func TestEncodedTargetMarkerFailureFailsTheTarget(t *testing.T) {
 	requireSignatureXattrSupport(t)
-	for _, failure := range []error{errors.New("injected xattr failure"), errSignatureXattrUnsupported} {
+	for _, failure := range []error{errors.New("injected xattr failure"), errors.ErrUnsupported} {
 		for _, device := range []struct {
 			name   string
 			linear bool
@@ -411,13 +424,12 @@ func TestEncodedTargetMarkerFailureFailsTheTarget(t *testing.T) {
 			t.Run(device.name+"/"+failure.Error(), func(t *testing.T) {
 				root, out := t.TempDir(), t.TempDir()
 				source := writeSourceFile(t, root, "source", runPlaintext())
-				previousFile, previousPath := writeManagedXattr, writeManagedPathXattr
-				t.Cleanup(func() { writeManagedXattr, writeManagedPathXattr = previousFile, previousPath })
-				writeManagedXattr = func(*os.File, []byte) error { return failure }
-				writeManagedPathXattr = func(string, []byte) error { return failure }
 
 				encoded := &encodedItem{SimpleJob: &SimpleJob{Path: source, Dsts: []string{filepath.Join(out, "encoded")}}, encode: newRLEEncoder}
-				var opts []Option
+				opts := []Option{withFS(fsHooks{
+					writeEntry:     func(*os.File, signature.Entry) error { return failure },
+					writeEntryPath: func(string, signature.Entry) error { return failure },
+				})}
 				if device.linear {
 					opts = append(opts, SetToDevice(LinearDevice(true)))
 				}
@@ -438,7 +450,7 @@ func TestEncodedTargetMarkerFailureFailsTheTarget(t *testing.T) {
 func TestEncodingNameIsRequired(t *testing.T) {
 	root, out := t.TempDir(), t.TempDir()
 	source := writeSourceFile(t, root, "source", []byte("content"))
-	for name, encoding := range map[string]string{"empty": "", "too long": strings.Repeat("x", signatureMaxEncoding+1)} {
+	for name, encoding := range map[string]string{"empty": "", "too long": strings.Repeat("x", signature.MaxEncoding+1)} {
 		t.Run(name, func(t *testing.T) {
 			encoded := &encodedItem{SimpleJob: &SimpleJob{Path: source, Dsts: []string{filepath.Join(out, name)}}, encode: newRLEEncoder}
 			decoded := &decodedItem{SimpleJob: &SimpleJob{Path: source}, decode: newRLEDecoder, size: 1}
@@ -496,7 +508,7 @@ func TestFailedDecoderCloseRefreshesNothing(t *testing.T) {
 	if result := resultsByItem(t, snapshot())[item]; !errors.Is(result.Err, failure) {
 		t.Fatalf("failed decode result = %#v", result)
 	}
-	if _, status, err := ReadSignatureEntry(f.path); err != nil || status != SignatureMissing {
+	if _, status, err := signature.Read(f.path); err != nil || status != signature.Missing {
 		t.Fatalf("failed decode stored an entry, status = %v err = %v", status, err)
 	}
 	if result, summary := runOne(t, f.decodeItem(), WithHashPolicy(HashCachedOnly)); result.SignatureCacheHit || summary.Hits != 0 {

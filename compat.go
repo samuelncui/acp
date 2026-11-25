@@ -61,9 +61,7 @@ func (c *Copyer) Wait() {
 func (c *Copyer) WaitErr() error {
 	<-c.feedDone
 	c.stream.setError(c.feedErr)
-	_ = c.stream.Close()
-
-	return c.stream.Wait()
+	return c.stream.Close()
 }
 
 // feed enumerates the job options and submits everything as one batch. One batch matters: the

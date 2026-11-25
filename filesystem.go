@@ -5,14 +5,19 @@ import (
 	"os"
 
 	"github.com/samuelncui/acp/internal/fileio"
+	"github.com/samuelncui/acp/signature"
 )
-
-var closeTarget = (*fileio.Output).Close
 
 // transferFilesystem substitutes file operations without exposing transfer ownership to callers.
 type transferFilesystem interface {
 	Open(path string, mode ReadMode, info os.FileInfo) (itemSource, error)
 	Create(job *writeJob, target targetSpec) (transferOutput, error)
+	// Allocate preallocates a random output.
+	Allocate(file *os.File, size int64) error
+	// ReadEntry, WriteEntry and WriteEntryPath operate on the managed signature entry of a file.
+	ReadEntry(file *os.File, info os.FileInfo) (signature.Entry, signature.Status, error)
+	WriteEntry(file *os.File, entry signature.Entry) error
+	WriteEntryPath(path string, entry signature.Entry) error
 }
 
 // transferOutput retains the owned path after Close until Commit or Discard settles it.
@@ -21,7 +26,7 @@ type transferOutput interface {
 	Sync() error
 	// Cache publishes the output's managed signature entry. An encoded output always has one and
 	// reports its write failure; a plain output's entry is optional and never fails.
-	Cache(job *baseJob, linear bool, stored int64) error
+	Cache(job *baseJob, stored int64, storedHash []byte) error
 	Restore(*stat) error
 	Commit(overwrite bool) error
 	Discard() error
@@ -32,7 +37,7 @@ type nativeTransferFilesystem struct {
 }
 
 func (f nativeTransferFilesystem) Open(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
-	return openSourceContent(path, mode, info)
+	return openNativeSource(path, mode, info)
 }
 
 func (f nativeTransferFilesystem) Create(job *writeJob, target targetSpec) (transferOutput, error) {
@@ -42,6 +47,22 @@ func (f nativeTransferFilesystem) Create(job *writeJob, target targetSpec) (tran
 		return nil, err
 	}
 	return &nativeTransferOutput{copyer: f.copyer, target: target, output: output}, nil
+}
+
+func (nativeTransferFilesystem) Allocate(file *os.File, size int64) error {
+	return truncate(file, size)
+}
+
+func (nativeTransferFilesystem) ReadEntry(file *os.File, info os.FileInfo) (signature.Entry, signature.Status, error) {
+	return signature.ReadFile(file, info)
+}
+
+func (nativeTransferFilesystem) WriteEntry(file *os.File, entry signature.Entry) error {
+	return signature.WriteFile(file, entry)
+}
+
+func (nativeTransferFilesystem) WriteEntryPath(path string, entry signature.Entry) error {
+	return signature.WritePath(path, entry)
 }
 
 type nativeTransferOutput struct {
@@ -55,21 +76,21 @@ func (o *nativeTransferOutput) Write(data []byte) (int, error) {
 }
 
 func (o *nativeTransferOutput) Close() error {
-	return closeTarget(o.output)
+	return o.output.Close()
 }
 
 func (o *nativeTransferOutput) Sync() error {
 	return o.output.File.Sync()
 }
 
-func (o *nativeTransferOutput) Cache(job *baseJob, linear bool, stored int64) error {
+func (o *nativeTransferOutput) Cache(job *baseJob, stored int64, storedHash []byte) error {
 	// The entry of an encoded file is its marker, so its failure belongs to the target.
 	if job.encode != nil {
-		return o.copyer.writeEncodedMarker(o.output.File, o.output.Temporary, job, stored, linear)
+		return o.copyer.writeEncodedMarker(o.output.File, o.output.Temporary, job, stored, storedHash)
 	}
 
 	// Linear completion has closed its descriptor but still owns the temporary path.
-	if linear {
+	if o.output.File == nil {
 		o.copyer.refreshCachePath(o.output.Temporary, job, true)
 		return nil
 	}
@@ -80,11 +101,11 @@ func (o *nativeTransferOutput) Cache(job *baseJob, linear bool, stored int64) er
 }
 
 func (o *nativeTransferOutput) Restore(info *stat) error {
-	return restoreTarget(o.output.Temporary, info)
+	return writeSysStat(o.output.Temporary, info)
 }
 
 func (o *nativeTransferOutput) Commit(overwrite bool) error {
-	return commitTarget(o.output, overwrite)
+	return o.output.Commit(overwrite)
 }
 
 func (o *nativeTransferOutput) Discard() error {

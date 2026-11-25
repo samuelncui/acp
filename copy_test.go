@@ -344,7 +344,13 @@ func TestBaseJobFailureMovesSuccessfulTarget(t *testing.T) {
 	item := newFixtureItem("source", "target")
 	job := &baseJob{
 		copyer: copyer, item: item, stat: &stat{},
-		targets: []string{"target"}, successTargets: []string{"target"},
+		targets: []string{"target"},
+	}
+
+	stored := sha256.Sum256([]byte("stored"))
+	job.success("target", 1, stored[:])
+	if result := job.result(); result.Targets[0].StoredSize != 1 || !bytes.Equal(result.Targets[0].StoredSHA256, stored[:]) {
+		t.Fatalf("recorded success = %#v", result.Targets)
 	}
 
 	// A late target failure must remove the target from the successful result.
@@ -353,11 +359,11 @@ func TestBaseJobFailureMovesSuccessfulTarget(t *testing.T) {
 	if len(result.Targets) != 1 || result.Targets[0].Err == nil {
 		t.Fatalf("targets = %#v, want one failed outcome", result.Targets)
 	}
-	if len(job.successTargets) != 0 {
-		t.Fatalf("success targets = %v, want none", job.successTargets)
-	}
 	if !errors.Is(result.Targets[0].Err, syscall.ENOSPC) {
 		t.Fatalf("target failure = %v, want %v", result.Targets[0].Err, syscall.ENOSPC)
+	}
+	if result.Targets[0].StoredSize != 0 || result.Targets[0].StoredSHA256 != nil {
+		t.Fatalf("failed target kept stored facts, size=%d hash=%x", result.Targets[0].StoredSize, result.Targets[0].StoredSHA256)
 	}
 }
 
@@ -561,11 +567,12 @@ func TestSubmitRejectsANilItem(t *testing.T) {
 	if err := stream.Submit(after); err != nil {
 		t.Fatalf("Submit() after a rejected item error = %v, want the item accepted", err)
 	}
-	if err := stream.Close(); err != nil {
-		t.Fatalf("Close() error = %v", err)
+	closeErr := stream.Close()
+	if closeErr == nil {
+		t.Fatal("Close() error = nil, want the rejected item")
 	}
-	if err := stream.Wait(); err == nil {
-		t.Fatal("Wait() error = nil, want the rejected item")
+	if err := stream.Wait(); err != closeErr {
+		t.Fatalf("Wait() error = %v, want Close's %v", err, closeErr)
 	}
 	for _, submitted := range []*fixtureItem{item, after} {
 		if _, err := submitted.terminal(t); err != nil {
@@ -583,7 +590,7 @@ func TestStreamCopyReleasesAChunkHandoffAfterHardStop(t *testing.T) {
 	job := newWriteJob(&baseJob{copyer: copyer, stat: &stat{size: 7}}, io.NopCloser(strings.NewReader("fixture")))
 	transfer := newTransfer(copyer, job, newReadAhead(copyer), 0)
 	transfer.chunks = make(chan *chunkBuffer)
-	go copyer.wrap(context.Background(), transfer.readContent)
+	go copyer.wrap(transfer.readContent)
 	time.Sleep(50 * time.Millisecond)
 	copyer.stopHard()
 
@@ -617,32 +624,5 @@ func TestSubmitDropsAnEventAfterHardStop(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("submit stayed blocked on the event handoff after a hard stop")
-	}
-}
-
-// TestFailAllReportsEveryTargetAsFailed pins the exhausted-device path: when no requested target
-// can be written, the item still completes and every target carries the failure, which is what
-// keeps the caller from reading a phantom success.
-func TestFailAllReportsEveryTargetAsFailed(t *testing.T) {
-	copyer := newTestStream(t)
-	job := &baseJob{
-		copyer:  copyer,
-		item:    newFixtureItem("source"),
-		path:    "source",
-		targets: []string{"first", "second"},
-	}
-
-	job.failAll(ErrTargetNoSpace)
-	result := job.result()
-	if result.Err != nil {
-		t.Fatalf("item error = %v, want nil: an exhausted target is a target outcome", result.Err)
-	}
-	if len(result.Targets) != 2 {
-		t.Fatalf("target outcomes = %#v, want one per requested target", result.Targets)
-	}
-	for index, target := range result.Targets {
-		if target.Path != job.targets[index] || !errors.Is(target.Err, ErrTargetNoSpace) {
-			t.Fatalf("target outcome %d = %#v, want %v on %q", index, target, ErrTargetNoSpace, job.targets[index])
-		}
 	}
 }

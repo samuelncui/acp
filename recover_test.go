@@ -1,7 +1,6 @@
 package acp
 
 import (
-	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -15,7 +14,7 @@ func TestWrapRecordsAFatalPanic(t *testing.T) {
 		// Recover a worker's string panic under the stage-level safety net.
 		captureLogs(t)
 		copyer := newTestStream(t)
-		copyer.wrap(context.Background(), func() { panic("worker fixture") })
+		copyer.wrap(func() { panic("worker fixture") })
 
 		// The run must retain the panic value as its terminal error.
 		err := copyer.Wait()
@@ -32,7 +31,7 @@ func TestWrapRecordsAFatalPanic(t *testing.T) {
 		captureLogs(t)
 		copyer := newTestStream(t)
 		panicErr := errors.New("worker fixture")
-		copyer.wrap(context.Background(), func() { panic(panicErr) })
+		copyer.wrap(func() { panic(panicErr) })
 
 		// Callers must still be able to classify the error with errors.Is.
 		if err := copyer.Wait(); !errors.Is(err, panicErr) {
@@ -45,7 +44,7 @@ func TestWrapRecordsAFatalPanic(t *testing.T) {
 		captureLogs(t)
 		copyer := newTestStream(t)
 		copyer.setError(errors.New("earlier failure"))
-		copyer.wrap(context.Background(), func() { panic("worker fixture") })
+		copyer.wrap(func() { panic("worker fixture") })
 
 		// Wait remains the authoritative outlet for the original failure.
 		if err := copyer.Wait(); err == nil || err.Error() != "earlier failure" {

@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/samuelncui/acp/signature"
 )
 
 func TestLinearTargetCapacityEstimateBoundaries(t *testing.T) {
@@ -194,18 +196,16 @@ func TestPreallocationFailureCleansOnlyOwnedOutput(t *testing.T) {
 	source := writeSourceFile(t, root, "source", []byte("new content"))
 	existing := writeSourceFile(t, root, "existing", []byte("old content"))
 	owned, good := filepath.Join(root, "owned"), filepath.Join(root, "good")
-	previous := allocateTarget
 	calls := 0
-	allocateTarget = func(file *os.File, size int64) error {
+	failAllocation := withFS(fsHooks{allocate: func(file *os.File, size int64) error {
 		calls++
 		if calls == 3 {
-			return previous(file, size)
+			return truncate(file, size)
 		}
 		return syscall.EIO
-	}
-	t.Cleanup(func() { allocateTarget = previous })
+	}})
 	item := newFixtureItem(source, existing, owned, good)
-	if err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, Overwrite(true)); err != nil {
+	if err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, Overwrite(true), failAllocation); err != nil {
 		t.Fatal(err)
 	}
 	result, err := item.terminal(t)
@@ -234,20 +234,25 @@ func TestSourceDescriptorClosesWhenCacheOperationPanics(t *testing.T) {
 			// Inject a panic after the item has acquired its real source descriptor.
 			root := t.TempDir()
 			source := writeSourceFile(t, root, "source", []byte("cache panic fixture"))
-			oldRead, oldWrite := readManagedXattr, writeManagedPathXattr
 			sentinel := errors.New("cache operation panic")
 			var opened *os.File
 			policy := HashCachedOnly
+			var hooks fsHooks
 			if stage == "lookup" {
-				readManagedXattr = func(file *os.File) ([]byte, error) { opened = file; panic(sentinel) }
+				hooks.readEntry = func(file *os.File, _ os.FileInfo) (signature.Entry, signature.Status, error) {
+					opened = file
+					panic(sentinel)
+				}
 			} else {
 				policy = HashReadRefresh
-				readManagedXattr = func(file *os.File) ([]byte, error) { opened = file; return nil, errSignatureXattrUnsupported }
-				writeManagedPathXattr = func(string, []byte) error { panic(sentinel) }
+				hooks.readEntry = func(file *os.File, _ os.FileInfo) (signature.Entry, signature.Status, error) {
+					opened = file
+					return signature.Entry{}, signature.Missing, nil
+				}
+				hooks.writeEntryPath = func(string, signature.Entry) error { panic(sentinel) }
 			}
-			t.Cleanup(func() { readManagedXattr, writeManagedPathXattr = oldRead, oldWrite })
 			item := newFixtureItem(source)
-			err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, WithHashPolicy(policy))
+			err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, WithHashPolicy(policy), withFS(hooks))
 			if !errors.Is(err, sentinel) {
 				t.Fatalf("panic identity=%v", err)
 			}
@@ -273,19 +278,17 @@ func TestSourceReadPanicReleasesBuffersAndTargets(t *testing.T) {
 	root := t.TempDir()
 	source := writeSourceFile(t, root, "source", bytes.Repeat([]byte("x"), 4096))
 	target := filepath.Join(root, "target")
-	old := openSourceContent
 	var opened *os.File
-	openSourceContent = func(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
-		src, err := old(path, mode, info)
+	panicRead := withFS(fsHooks{open: func(path string, mode ReadMode, info os.FileInfo) (itemSource, error) {
+		src, err := openNativeSource(path, mode, info)
 		if err == nil {
 			opened = src.file
 			src.reader = &panicSourceReader{src.file}
 		}
 		return src, err
-	}
-	t.Cleanup(func() { openSourceContent = old })
+	}})
 	item := newFixtureItem(source, target)
-	err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, WithHashPolicy(HashRead))
+	err := runFixture(context.Background(), newStreamFixture(item), []Item{item}, WithHashPolicy(HashRead), panicRead)
 	if err == nil {
 		t.Fatal("read panic succeeded")
 	}

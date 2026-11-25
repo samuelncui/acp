@@ -251,11 +251,18 @@ func TestWithEventHandlerIsLastWins(t *testing.T) {
 	// WithProgressBar installs its handler through the same option, so a later handler replaces
 	// the bar instead of running beside it.
 	silenceStderr(t)
-	option := newOption()
-	option = WithProgressBar()(option)
-	option = WithEventHandler(secondHandler)(option)
-	if len(option.eventHandlers) != 1 {
-		t.Fatalf("handlers after WithProgressBar and WithEventHandler = %d, want the bar replaced", len(option.eventHandlers))
+	item = newFixtureItem(input)
+	if err := runFixture(
+		context.Background(),
+		newStreamFixture(item),
+		[]Item{item},
+		WithProgressBar(),
+		WithEventHandler(secondHandler),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if second == 0 {
+		t.Fatal("the handler registered after WithProgressBar received no event")
 	}
 
 	// A nil handler clears the registration, so nothing is called and the run still succeeds.

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/samuelncui/acp/internal/fileio"
+	"github.com/samuelncui/acp/signature"
 	"github.com/sirupsen/logrus"
 )
 
@@ -46,15 +47,14 @@ type baseJob struct {
 	lock      sync.Mutex
 	writeTime time.Time
 
-	targets        []string
-	outputs        []targetSpec
-	cachedEntry    *SignatureEntry
-	successTargets []string
-	storedSizes    map[string]int64
-	failedTargets  map[string]error
-	hash           []byte
-	cacheHit       bool
-	hashValid      bool
+	targets       []string
+	outputs       []targetSpec
+	cachedEntry   *signature.Entry
+	stored        map[string]storedFacts
+	failedTargets map[string]error
+	hash          []byte
+	cacheHit      bool
+	hashValid     bool
 }
 
 // startWrite records when the copy stage took the item, which is the write time of every
@@ -100,52 +100,35 @@ func (j *baseJob) computedHash() ([]byte, bool) {
 	return j.hash, true
 }
 
-func (j *baseJob) success(path string, stored int64) {
+// storedFacts describes the bytes a written native target stores: their size and, when the
+// transfer hashed its content, their SHA-256.
+type storedFacts struct {
+	size   int64
+	sha256 []byte
+}
+
+func (j *baseJob) success(path string, stored int64, storedHash []byte) {
 	j.lock.Lock()
 	defer j.lock.Unlock()
 
-	j.successTargets = append(j.successTargets, path)
-	if j.storedSizes == nil {
-		j.storedSizes = make(map[string]int64, len(j.targets))
+	if j.stored == nil {
+		j.stored = make(map[string]storedFacts, len(j.targets))
 	}
-	j.storedSizes[path] = stored
+	j.stored[path] = storedFacts{size: stored, sha256: storedHash}
 }
 
 func (j *baseJob) fail(path string, err error) {
 	// One failed target is an item outcome, not a pipeline failure: the caller classifies
 	// target errors and decides whether the operation continues.
-	j.copyer.logf(logrus.ErrorLevel, "copy failed, source= %q target= %q, %v", j.path, path, err)
+	j.copyer.logf(logrus.ErrorLevel, "copy failed, source= %q target= %q, %+v", j.path, path, err)
 	j.lock.Lock()
 	defer j.lock.Unlock()
 
-	for index, target := range j.successTargets {
-		if target != path {
-			continue
-		}
-		j.successTargets = append(j.successTargets[:index], j.successTargets[index+1:]...)
-		break
-	}
 	if j.failedTargets == nil {
 		j.failedTargets = make(map[string]error, 1)
 	}
 
 	j.failedTargets[path] = err
-}
-
-// failAll marks every requested target failed with one error, which reports a job that could not
-// be written anywhere as a completed item with failed target outcomes.
-func (j *baseJob) failAll(err error) {
-	j.copyer.logf(logrus.ErrorLevel, "copy failed, source= %q targets= %v, %v", j.path, j.targets, err)
-
-	j.lock.Lock()
-	defer j.lock.Unlock()
-
-	for _, target := range j.targets {
-		if j.failedTargets == nil {
-			j.failedTargets = make(map[string]error, len(j.targets))
-		}
-		j.failedTargets[target] = err
-	}
 }
 
 // result reports the content facts of a finished job, one outcome per requested target in
@@ -167,7 +150,7 @@ func (j *baseJob) result() Result {
 		result.Size, result.Mode, result.ModTime = j.stat.size, j.stat.mode, j.stat.modTime
 	}
 	for _, target := range j.targets {
-		outcome := TargetResult{Path: target, Size: result.Size, WriteTime: j.writeTime}
+		outcome := TargetResult{Path: target}
 		switch err, failed := j.failedTargets[target]; {
 		case failed:
 			outcome.Err = err
@@ -176,7 +159,8 @@ func (j *baseJob) result() Result {
 			// a write that never happened.
 			outcome.Err = j.itemError
 		default:
-			outcome.StoredSize = j.storedSizes[target]
+			stored := j.stored[target]
+			outcome.StoredSize, outcome.StoredSHA256 = stored.size, append([]byte(nil), stored.sha256...)
 		}
 		result.Targets = append(result.Targets, outcome)
 	}

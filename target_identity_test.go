@@ -21,7 +21,7 @@ func (o *delayedPublicationOutput) Commit(overwrite bool) error {
 }
 
 func TestRelativeAndAbsoluteTargetsKeepSerialWinner(t *testing.T) {
-	// Both device modes formerly finished each file before admitting the next writer.
+	// Both device modes finish each file before admitting the next writer.
 	for _, config := range []struct {
 		name   string
 		linear bool

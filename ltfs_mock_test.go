@@ -407,7 +407,7 @@ func (o *ltfsOutput) Sync() error {
 	return o.flush()
 }
 
-func (o *ltfsOutput) Cache(_ *baseJob, _ bool, _ int64) error {
+func (o *ltfsOutput) Cache(_ *baseJob, _ int64, _ []byte) error {
 	release := o.model.request("cache", o.path)
 	defer release()
 	return nil

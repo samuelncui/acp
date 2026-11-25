@@ -19,7 +19,7 @@ changes. Files may change between runs.
 | Stage | Responsibility |
 | --- | --- |
 | `index` | Evaluate each needed `Item` method once, collect source facts (reusing available enumeration metadata), and resolve target paths and devices. Validate source/target aliases and overwrite rules before any target mutation. Pass the source facts unchanged to later stages. |
-| `prepare` | Open the source once when content or a cached hash is needed. Read the stored signature as required by the hash policy through that descriptor. Reserve a bounded file lifetime before dequeue; preparation does not read content ahead itself. |
+| `prepare` | Open the source once when content or a cached hash is needed. Read the stored signature as required by the hash policy through that descriptor. Admit files in request order within the in-flight limit; preparation does not read content ahead itself. |
 | `copy` | Read content once and, when enabled, compute one hash while fanning out to the targets. Complete ordinary-file metadata, cache work, synchronization and closure before final replacement; device nodes use direct output. |
 | `results` | Form one `Result` per accepted item and deliver it through one callback goroutine. Fatal pipeline failures are the exception to per-item completion; see [delivery and lifecycle](#delivery-and-lifecycle). |
 
@@ -33,25 +33,19 @@ target has one application Write lane: the next file may start after the previou
 Write, while target Close, hash completion and metadata/publication settle asynchronously.
 This permits application overlap; the filesystem and device still decide physical scheduling.
 
-The per-run pool allocates lazily, with at most 512 backing buffers of 1 MiB (512 MiB of content
-backing, not a total RSS limit). After all consumers and completion workers exit, backing returns
-to the shared reusable pool with no reference to the completed stream. Eight credits are reserved for the ordered foreground file.
-For linear targets, reads stay within the next 512 MiB from the writer's consumed frontier;
-this is an upper bound, not a guarantee that the window fills. Each tiny file still occupies a
-1 MiB backing, and the 256 full file lifetimes also include pending completion and result delivery.
-Hash queues and each random-target queue hold four chunk references; file write queues hold
-references sized to the file prefix, at most 512. References share the global backing budget.
+Content backing is allocated lazily and holds at most 512 MiB (512 buffers of 1 MiB; not a total
+RSS limit). It returns to a shared reusable pool once the run's consumers and completion workers
+have exited. For linear targets, reads stay within the next 512 MiB from the writer's consumed
+frontier; this is an upper bound, not a guarantee that the window fills. Each file occupies at
+least one 1 MiB buffer while it is in flight.
 
-Configured source threads bound actual Read calls; configured target threads bound concurrent
-file data writers. Linear devices force their corresponding thread count to one. Preparation
-uses `min(max(source threads, 8), 256)` workers. Ordered reads reserve an opportunity for the
-earliest unfinished source; that reservation advances at source EOF independently of Write and
-Close, including with one source thread. Workers release Read permits before waiting on queues.
-Random-target files reserve their writer permit in dispatch order before reading, so future files
-cannot consume all backing while the active writers need it. File-lifetime admission is reserved before
-job dequeue, so later preparation cannot take the required head's slot. Open descriptors scale
-with admitted files and their target counts, rather than with Read permits alone.
-`WithReadBuffer` continues to count input items, independently of these content limits.
+Configured source threads bound concurrent Read calls; configured target threads bound concurrent
+file data writers. Linear devices force their corresponding thread count to one. At most 256
+files are in flight at once, from source opening until their completion and result delivery
+finish. Admission follows request order, so later files cannot take the slot of the earliest
+unfinished one, and ordered reads always let that file proceed, including with one source thread.
+Open descriptors scale with the files in flight and their target counts. `WithReadBuffer`
+continues to count input items, independently of these content limits.
 
 ### Target completion
 
@@ -155,10 +149,7 @@ if err != nil {
 if err := stream.Submit(&acp.SimpleJob{Path: "/data/a.bin", Dsts: []string{"/tape/a.bin"}}); err != nil {
 	// the run accepts no more work
 }
-if err := stream.Close(); err != nil {
-	// the final flush failed
-}
-return stream.Wait() // the run's terminal error
+return stream.Close() // drains the run and returns its terminal error; Wait returns the same
 ```
 
 An item is pure data. It has no callback, so the caller finds its own state by asserting
@@ -202,11 +193,10 @@ type Result struct {
 }
 
 type TargetResult struct {
-	Path       string
-	Size       int64
-	StoredSize int64 // bytes written to a written native target; zero for a failed or content target
-	WriteTime  time.Time
-	Err        error // nil when this target was written
+	Path         string
+	StoredSize   int64  // bytes written to a written native target; zero for a failed or content target
+	StoredSHA256 []byte // hash of the stored bytes of a written native target; nil when unknown (no hash, content or failed target)
+	Err          error // nil when this target was written
 }
 ```
 
@@ -226,8 +216,8 @@ var ErrMemberSettled error // wrapped by an endpoint failure that ends only its 
 ### Encoded native content
 
 An item can store a caller-owned encoding, such as a compression format, in its native targets, and
-read one back from its native source. ACP has no codec of its own; hashing, `Result.Size`,
-`TargetResult.Size` and progress always describe the plaintext:
+read one back from its native source. ACP has no codec of its own; hashing, `Result.Size`
+and progress always describe the plaintext:
 
 ```go
 // Optional: encode every native target of this item; a nil encode writes plaintext.
@@ -252,11 +242,14 @@ tail into `dst` and returns only after every write into `dst` has finished. It b
 output's data writing, so a linear writer starts the next file only after it returns. Content
 targets are not encoded.
 
-`TargetResult.StoredSize` counts the bytes written into `dst`. An encoded output keeps ordinary
+`TargetResult.StoredSize` counts the bytes written into `dst`, and `TargetResult.StoredSHA256` is
+the SHA-256 of the stored bytes of a written native target whenever the transfer hashes its
+content; for a plaintext target it equals `Result.SHA256`. It is nil only when unknown: the hash
+policy produced no hash, or the target is a content target or failed. An encoded output keeps ordinary
 [target completion](#target-completion): its exclusive temporary file, the overwrite rules and the
 rename after completion, with the item's mode, times and ordinary xattrs restored onto the stored
 file. It is never preallocated, because its size is unknown. Linear capacity admission still debits
-the plaintext size. It always receives a managed signature entry that marks it as encoded; see the
+the plaintext size. It receives a managed signature entry that marks it as encoded; see the
 [content signature cache](#content-signature-cache).
 
 An encoder error, a nil writer, a `Close` error, a failure to write the managed entry, or a panic
@@ -293,7 +286,8 @@ plaintext target written from it receives an entry as usual; see the
 
 ### Content endpoints
 
-An `Item` can optionally implement `ContentItem` to copy a member of an ordered stream:
+An `Item` can optionally implement `ContentSourceItem` and `ContentTargetItem` to copy a member
+of an ordered stream:
 
 ```go
 type ContentMetadata struct {
@@ -307,7 +301,6 @@ type ContentSource interface {
 type XattrReader interface {
 	Xattrs() (map[string][]byte, error)
 }
-func SourceFromFS(fsys fs.FS, name string) ContentSource
 
 type ContentTarget interface {
 	Open(context.Context, ContentMetadata) (ContentWriter, error)
@@ -316,9 +309,10 @@ type ContentWriter interface {
 	io.Writer
 	Finish(cause error) error
 }
-type ContentItem interface {
-	Item
+type ContentSourceItem interface {
 	ContentSource() ContentSource
+}
+type ContentTargetItem interface {
 	ContentTargets() []ContentTarget
 }
 ```
@@ -363,20 +357,10 @@ draining remaining payload. Context-aware endpoint implementations receive the r
 make their blocking Open, Read and Write operations respond to cancellation. ACP also checks
 cancellation during source observation and closes any acquired file before reporting the outcome.
 
-SourceFromFS binds an existing fs.FS and an fs.ValidPath name without opening it. It opens only in
-that same ordered lane and returns the filesystem's actual fs.File, retaining optional XattrReader.
-It never calls fs.Stat separately. Invalid names and a nil filesystem fail before target creation.
-The name is relative, UTF-8 and slash-delimited; Item.Source remains the caller's display identifier:
-
-```go
-source := acp.SourceFromFS(fsys, "docs/readme.txt")
-// Return source from the existing caller-owned Item's ContentSource method.
-```
-
-The adapter checks context before and after Open, retaining any acquired file and joining an Open
-error with cancellation for ACP's common cleanup. Standard filesystem methods that ignore context
-are not made interruptible. An injected os.DirFS stays an opaque filesystem: ACP does not infer a
-native root, mmap, ownership or cache access. The caller keeps its storage disjoint from native
+An opened source file may be a plain `fs.File`; ACP never calls `fs.Stat` separately from its
+single observation and returns it for `Close` through the common cleanup, retaining the optional
+`XattrReader`. A source backed by an `fs.FS` stays an opaque filesystem: ACP does not infer a native
+root, mmap, ownership or cache access, and the caller keeps its storage disjoint from native
 outputs under the stable-input operating model. Native-path entrypoints retain their native name,
 symlink, alias, mapped-read and rewrite behavior.
 
@@ -407,14 +391,14 @@ retain ACP's existing best-effort destination xattr error policy, and regenerate
 entries through the selected hash policy. Both managed keys (`acp.signature` and
 `user.acp.signature`) are excluded from endpoint snapshots. Empty and binary attribute values
 are preserved. Attribute names and values remain opaque to generic snapshots; each codec owns
-its representation checks, including PAX key grammar. ACP applies these exported envelope limits:
+its representation checks, including PAX key grammar. ACP applies these envelope limits:
 
 | Limit | Value |
 | --- | --- |
-| `ContentMaxXattrCount` | 256 ordinary attributes |
-| `ContentMaxXattrNameBytes` | 1 KiB per name |
-| `ContentMaxXattrValueBytes` | 1 MiB per value |
-| `ContentMaxMetadataBytes` | 4 MiB aggregate xattr names/values, including 64 bytes framing allowance per attribute |
+| Ordinary attributes | 256 |
+| Name | 1 KiB |
+| Value | 1 MiB |
+| Aggregate names and values | 4 MiB, including a 64-byte framing allowance per attribute |
 
 Native endpoint capture validates the name-list and each name/value/count/aggregate limit before
 the corresponding buffer allocation or snapshot growth. Managed keys are excluded before ordinary
@@ -443,10 +427,10 @@ and the report row.
 
 ### Delivery and lifecycle
 
-Use one submitter, then call `Close` and `Wait`. `Submit` blocks when the read buffer is full
-and rejects nil items. `Close` ends the feed and drains accepted work; it returns wrap-up or
-flush errors. `NewStream` returns creation and option-validation errors; `Wait` returns the
-terminal run error.
+Use one submitter, then call `Close` or `Wait`. `Submit` blocks when the read buffer is full
+and rejects nil items. `Close` ends the feed, drains accepted work and returns the run's terminal
+error; `Wait` is the same call, so they always return the same error. `NewStream` returns
+creation and option-validation errors.
 
 `Result.Err` describes an item ACP could not process, including a source description/open failure,
 a failed targetless read or an item abandoned by a graceful stop. `TargetResult.Err` describes
@@ -469,11 +453,21 @@ run without a per-item completion guarantee.
 `HardStopped` closes when that fatal boundary is crossed, so a caller waiting for per-item source
 completion can escape without first closing the feed. It stays open for normal completion and
 graceful stops. The signal does not prove that sources or device commands have settled; `Close`
-and `Wait` still settle resources, and `Wait` supplies the authoritative terminal error.
+and `Wait` still settle resources, and both return the run's terminal error.
 
 Caller methods, the results callback and event handlers run under panic protection. A panic
 in an item method fails that item; a callback or event-handler panic becomes a run error. A
 panic escaping pipeline code is a fatal run error, preserving the panic value.
+
+The public package `github.com/samuelncui/acp/signature` owns the managed signature entry: its
+Protobuf and legacy codec, the platform attribute access and the functions that read and write an
+entry. A caller that only reads entries imports it without the copy engine. It exports `Entry`,
+`Decoded`, `Status` (`Missing`, `Stale`, `Fresh`), `Read`, `ReadCached`, `ReadFile`, `WriteFile`,
+`WritePath`, `Entry.Equal`, `Ignorable`, `IsAttribute` and `MaxEncoding`. `ReadCached` returns the
+entry and whether it is a fresh plain hash: the entry's size and mtime match the file and `SHA256` holds the
+hash of the bytes on disk. An empty `Entry.SHA256` means unknown. `WriteFile` and `WritePath` refuse an
+entry that `Read` would reject: a negative size, a hash that is neither empty nor 32 bytes, or a
+decoded description without an encoding name or with one longer than `MaxEncoding`.
 
 ## Options
 
@@ -540,18 +534,22 @@ facts; a transfer reads its source to write it somewhere:
 | `HashCachedOnly` | stored hash reused; a miss leaves the item without one | rejected: a copy always reads its source |
 | `HashCachedOrRead` | stored hash reused; a miss reads and hashes | rejected: a copy always reads its source |
 | `HashCachedOrReadRefresh` | stored hash reused; a miss reads, hashes and refreshes | always reads, hashes and refreshes |
-| `HashRead` | always reads and hashes; no cache use | always reads and hashes; no cache use |
+| `HashRead` | always reads and hashes; no cache use | always reads and hashes; refreshes no cache entry |
 | `HashReadRefresh` | always reads and hashes, and refreshes the cache | always reads, hashes and refreshes the cache |
 
 Transfers read source content and compute a hash only when the policy enables hashing. The two
 reuse-only policies fail the item with `Result.Err` when it requests targets; they do not fail
-stream creation. `HashCachedOrReadRefresh` transfers as `HashReadRefresh`.
+stream creation. `HashCachedOrReadRefresh` transfers as `HashReadRefresh`. The marker of an encoded
+target is not a cache refresh: it is written under every policy and holds both hashes whenever the
+transfer computes hashes, `HashRead` included, and none under `HashOff`.
 
 ## Content signature cache
 
 The managed xattr (`user.acp.signature` on Linux, `acp.signature` on Darwin and FreeBSD) holds a
-Protobuf `SignatureEntry` of at most 512 bytes (`internal/signaturepb/signature.proto`, generated
-by `go generate ./internal/signaturepb`). `size` and `mtime_ns` describe the file on disk and decide
+Protobuf `SignatureEntry` of at most 512 bytes (`signature/internal/signaturepb/signature.proto`,
+generated by `go generate ./signature/internal/signaturepb`). The public `signature` package owns
+this entry: its codec, the platform attribute access and the read and write functions the copy
+engine and library callers use. `size` and `mtime_ns` describe the file on disk and decide
 freshness against the stored file's own size and mtime, never a decoded size; `sha256` is the hash of
 the bytes on disk. An encoded file also carries `decoded`: the item's `encoding`, the decoded `size`
 and the decoded content's `sha256`. Every hash is empty when unknown; an entry with a bad hash
@@ -569,15 +567,19 @@ keeps the other half of a fresh entry unchanged, writes only what it computed ov
 missing entry, and skips an unchanged write. A fresh staged plaintext target receives a new entry
 directly only when refresh is enabled, without reading or invalidating an old one.
 `RefreshSignatureCache(false)` on the source or target device keeps a refreshing policy from
-writing that side's entries; hashing, reuse and the other side are unchanged. A rewrite's
+writing that side's entries; hashing, reuse, the other side and the marker of an encoded target are
+unchanged. A rewrite's
 replacement file is a written target.
 
-An encoded target always receives an entry, whatever the hash policy: `size` is the stored size
+An encoded target receives an entry under every hash policy: `size` is the stored size
 (`TargetResult.StoredSize`), `mtime_ns` the source mtime the metadata restore applies, and
-`decoded` the encoding, plaintext size and, when the policy refreshes, the target side has not
-opted out and a hash was computed, plaintext hash. This entry is the durable marker that the file
-is encoded, so a failure to write it, including a file system without the attribute, fails that
-target and discards its temporary output, unlike the warning-only plaintext writes.
+`decoded` the encoding and plaintext size. When the transfer computes hashes (`HashRead` and the
+refreshing policies, whatever `RefreshSignatureCache` says), the entry also holds both hashes:
+`sha256` of the stored bytes (`TargetResult.StoredSHA256`) and `decoded.sha256` of the plaintext.
+Under `HashOff` it holds neither. This entry is the durable
+marker that the file is encoded, so a failure to write it, including a file system without the
+attribute, fails that target and discards its temporary output, unlike the warning-only plaintext
+writes.
 For a written target, only an encoding write produces the marker. A plain copy of an encoded
 file, including an `acp-rewrite` replacement, does not carry `decoded`: the managed key is never
 copied as an ordinary attribute, and the copy writes at most a plaintext entry for the stored bytes.
@@ -636,10 +638,7 @@ c.Wait()
   `WithResultFlushInterval`, `WithHashPolicy`, `WithLogger`, `WithEventHandler`,
   `WithProgressBar`, `WithHash(bool)`, `Event*`, `EventHandler`, `Error`, `Job`, `Report`,
   `ReportGetter`, `NewReportGetter`, `NewProgressBar`, `Cache[K,V]`, `DeviceOption`,
-  `WildcardJobOption`, `Option`, `ReadCachedSignature`, `CachedSignature`,
-  `DecodeCachedSignature`, `SignatureEntry`, `DecodedSignature`, `SignatureStatus`
-  (`SignatureMissing`, `SignatureStale`, `SignatureFresh`), `ReadSignatureEntry`,
-  `DecodeSignatureEntry`, `ErrTargetNoSpace`, `ErrTargetDropToReadonly`, `ErrTargetIO`,
+  `WildcardJobOption`, `Option`, `ErrTargetNoSpace`, `ErrTargetDropToReadonly`, `ErrTargetIO`,
   `CopyAttrs`, `UnexpectFileMode`.
 - `WithHash(true)` maps to `HashReadRefresh`; `WithHash(false)` maps to `HashOff`.
 - Pipeline errors are returned by `WaitErr` and cause the command to fail. The shell produces

@@ -13,7 +13,7 @@ func (t *transfer) readContent() {
 	// Every exit closes both data channels, releases the source turn and starts one source Close.
 	defer func() {
 		if value := recover(); value != nil {
-			t.readErr = t.panicFailure("source reader", value)
+			t.readErr = t.copyer.fatalPanic("source reader", value)
 		}
 		// An Open error or panic still releases writers waiting for observed metadata.
 		if t.sourceReady != nil {
@@ -30,11 +30,11 @@ func (t *transfer) readContent() {
 		}
 		t.ahead.finishRead(t.job.order)
 		close(t.readDone)
-		go t.copyer.wrap(context.Background(), func() {
+		go t.copyer.wrap(func() {
 			defer close(t.sourceDone)
 			defer func() {
 				if value := recover(); value != nil {
-					t.sourceErr = t.panicFailure("source close", value)
+					t.sourceErr = t.copyer.fatalPanic("source close", value)
 				}
 			}()
 			t.sourceErr = t.sourceFailure(t.job.finishSource())
@@ -51,7 +51,7 @@ func (t *transfer) readContent() {
 	if t.job.contentSource != nil {
 		var file fs.File
 		var err error
-		panicErr := protectCall("ContentSource.Open", func() {
+		panicErr := t.copyer.protectCall("ContentSource.Open", func() {
 			file, err = t.job.contentSource.Open(t.copyer.ctx)
 		})
 		t.job.reader = file
@@ -62,7 +62,7 @@ func (t *transfer) readContent() {
 		}
 		if err == nil {
 			var metadata ContentMetadata
-			panicErr = protectCall("content source metadata", func() {
+			panicErr = t.copyer.protectCall("content source metadata", func() {
 				metadata.Info, err = file.Stat()
 				err = errors.Join(t.sourceFailure(err), t.copyer.ctx.Err())
 				if err != nil {
@@ -186,7 +186,7 @@ func (t *transfer) readChunk(want int) (int, bool, error) {
 func (t *transfer) decodeSource() error {
 	source := &decodedSource{native: t.job.reader}
 	var err error
-	panicErr := protectCall("item source decoder", func() { source.decoded, err = t.job.decode(nativeSource{source}) })
+	panicErr := t.copyer.protectCall("item source decoder", func() { source.decoded, err = t.job.decode(nativeSource{source}) })
 	switch {
 	case panicErr != nil:
 		return panicErr

@@ -5,12 +5,12 @@ package acp
 
 import (
 	"context"
-	"crypto/sha256"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 
+	"github.com/samuelncui/acp/signature"
 	"golang.org/x/sys/unix"
 )
 
@@ -38,14 +38,8 @@ func TestManagedSignatureIsNotOrdinaryCopiedXattr(t *testing.T) {
 	target := filepath.Join(root, "target.txt")
 
 	// A value no run would publish for this file: any managed entry on the target is a copy.
-	decoy := CachedSignature{Size: 1, MtimeNS: 2, SHA256: sha256.Sum256([]byte("decoy"))}
-	file, err := os.Open(source)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = writeSignatureXattr(file, encodeCachedSignature(decoy))
-	_ = file.Close()
-	if err != nil {
+	decoy := signature.Entry{Size: 1, MtimeNS: 2, SHA256: sha("decoy")}
+	if err := signature.WritePath(source, decoy); err != nil {
 		t.Skipf("temporary filesystem does not support signature xattrs: %v", err)
 	}
 	if err := unix.Setxattr(source, controlXattrName, []byte("carried"), 0); err != nil {
@@ -81,31 +75,12 @@ func TestManagedSignatureIsNotOrdinaryCopiedXattr(t *testing.T) {
 	}
 
 	// The managed key did not travel: the target has no managed attribute at all.
-	targetFile, err := os.Open(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	encoded, readErr := readSignatureXattr(targetFile)
-	_ = targetFile.Close()
-	if readErr == nil {
-		t.Fatalf("the target carries a managed signature attribute: %x", encoded)
-	}
-	if !signatureXattrIgnorable(readErr) {
-		t.Fatalf("read the target's managed attribute: %v", readErr)
+	if entry, status, err := signature.Read(target); err != nil || status != signature.Missing {
+		t.Fatalf("the target carries a managed signature attribute: %#v %v / %v", entry, status, err)
 	}
 
 	// The source keeps its own entry: the transfer neither moved nor removed it.
-	sourceFile, err := os.Open(source)
-	if err != nil {
-		t.Fatal(err)
-	}
-	kept, readErr := readSignatureXattr(sourceFile)
-	_ = sourceFile.Close()
-	if readErr != nil {
-		t.Fatalf("read the source's managed attribute: %v", readErr)
-	}
-	stored, err := DecodeCachedSignature(kept)
-	if err != nil || stored != decoy {
+	if stored, _, err := signature.Read(source); err != nil || !stored.Equal(decoy) {
 		t.Fatalf("source managed attribute = %#v / %v, want the seeded decoy %#v", stored, err, decoy)
 	}
 }

@@ -30,13 +30,13 @@ func TestContentMetadataLimitsAndManagedCacheFiltering(t *testing.T) {
 	}
 
 	// Refuse each size boundary without truncating metadata.
-	for _, name := range []string{strings.Repeat("n", ContentMaxXattrNameBytes+1)} {
+	for _, name := range []string{strings.Repeat("n", contentMaxXattrNameBytes+1)} {
 		if _, err := checkContentXattr(name, 0, 1, 0); err == nil {
 			t.Errorf("accepted name %q", name)
 		}
 	}
 	for _, tc := range []struct{ size, count, total int }{
-		{ContentMaxXattrValueBytes + 1, 1, 0}, {0, ContentMaxXattrCount + 1, 0}, {0, 1, ContentMaxMetadataBytes},
+		{contentMaxXattrValueBytes + 1, 1, 0}, {0, contentMaxXattrCount + 1, 0}, {0, 1, contentMaxMetadataBytes},
 	} {
 		if _, err := checkContentXattr("user.attr", tc.size, tc.count, tc.total); err == nil {
 			t.Errorf("accepted limits=%v", tc)
@@ -46,15 +46,15 @@ func TestContentMetadataLimitsAndManagedCacheFiltering(t *testing.T) {
 
 func TestContentMetadataExcludesManagedValuesBeforeLimits(t *testing.T) {
 	// An untrusted cache value is neither copied nor counted as ordinary metadata.
-	oversized := make([]byte, ContentMaxXattrValueBytes+1)
+	oversized := make([]byte, contentMaxXattrValueBytes+1)
 	metadata := ContentMetadata{Info: contentInfo{name: "a", mode: 0600}, Xattrs: map[string][]byte{
 		"acp.signature": oversized, "user.acp.signature": oversized,
 	}}
-	for i := range ContentMaxXattrCount {
+	for i := range contentMaxXattrCount {
 		metadata.Xattrs[strings.Repeat("a", i+1)] = []byte{}
 	}
 	got, err := snapshotContentMetadata(metadata)
-	if err != nil || len(got.Xattrs) != ContentMaxXattrCount {
+	if err != nil || len(got.Xattrs) != contentMaxXattrCount {
 		t.Fatalf("snapshot count=%d, err=%v", len(got.Xattrs), err)
 	}
 	for _, name := range []string{"acp.signature", "user.acp.signature"} {

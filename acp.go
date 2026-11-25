@@ -53,7 +53,7 @@ type StreamCopyer struct {
 	targetDirs        map[string]string         // Indexed parent paths; Submit is their sole owner.
 	linearSpace       map[string]*spaceEstimate // Owned by the single linear writer until shutdown.
 	linearTargetEnded uint32
-	signatures        *signatureCache
+	cacheStats        *cacheStats
 	filesystem        transferFilesystem
 
 	// order numbers submitted items; a single submitter keeps it race-free.
@@ -74,7 +74,6 @@ type StreamCopyer struct {
 	hardStopOnce sync.Once
 
 	closeOnce sync.Once
-	closeErr  error
 
 	eventCh chan Event
 }
@@ -136,20 +135,23 @@ func newStream(ctx context.Context, onResults func([]Result) error, opt *option)
 		resultCh:       make(chan Result, opt.resultBuffer),
 		resultsDone:    make(chan struct{}),
 		onResults:      onResults,
-		eventCh:        make(chan Event, 128),
+		eventCh:        make(chan Event, 256),
 		hardStop:       make(chan struct{}),
 		getDevice:      getDevice,
 		availableSpace: availableSpace,
 	}
-	if opt.hashPolicy.usesCache() {
-		c.signatures = newSignatureCache()
+	if opt.hashPolicy.producesHash() {
+		c.cacheStats = &cacheStats{}
+	}
+	if opt.wrapFilesystem != nil {
+		c.filesystem = opt.wrapFilesystem(c.fs())
 	}
 
 	// Account for the pipeline, event dispatch and result delivery before any of them starts.
 	c.running.Add(3)
-	go c.wrap(ctx, func() { defer c.running.Done(); c.eventLoop() })
-	go c.wrap(ctx, func() { defer c.running.Done(); c.run(ctx) })
-	go c.wrap(ctx, func() { defer c.running.Done(); defer close(c.resultsDone); c.deliver() })
+	go c.wrap(func() { defer c.running.Done(); c.eventLoop() })
+	go c.wrap(func() { defer c.running.Done(); c.run(ctx) })
+	go c.wrap(func() { defer c.running.Done(); defer close(c.resultsDone); c.deliver() })
 
 	return c, nil
 }
@@ -207,7 +209,9 @@ func (c *StreamCopyer) HardStopped() <-chan struct{} { return c.hardStop }
 
 // Close ends the feed and drains the run: every item already submitted finishes
 // and all dependent cache and Close work settle, the remaining results are flushed, and the run's
-// cache summary is reported. It returns the flush error, and it is safe to call more than once.
+// cache summary is reported. It returns the run's terminal error, the same one Wait returns: a
+// pipeline failure, a submission error, an error the results callback returned, or a flush
+// failure. It is safe to call more than once.
 func (c *StreamCopyer) Close() error {
 	c.closeOnce.Do(func() {
 		c.feedLock.Lock()
@@ -220,18 +224,15 @@ func (c *StreamCopyer) Close() error {
 		c.running.Wait()
 	})
 
-	return c.closeErr
-}
-
-// Wait drains the run and returns its terminal error: a pipeline failure, a submission error, an
-// error the results callback returned, or a flush failure. It is the authoritative outlet for
-// run-time errors, and a caller that stopped the run gracefully reads the stopping error here.
-func (c *StreamCopyer) Wait() error {
-	_ = c.Close()
-
 	c.errLock.Lock()
 	defer c.errLock.Unlock()
 	return c.err
+}
+
+// Wait is Close: it drains the run and returns its terminal error. A caller that stopped the run
+// gracefully reads the stopping error here.
+func (c *StreamCopyer) Wait() error {
+	return c.Close()
 }
 
 // push hands one job to the read buffer. It holds the feed lock, so Close cannot close the
@@ -355,19 +356,6 @@ func (c *StreamCopyer) publishResult(result Result) {
 	}
 }
 
-// recordClose keeps the first flush error of the run, so Close can report it and Wait returns it.
-func (c *StreamCopyer) recordClose(err error) {
-	if err == nil {
-		return
-	}
-
-	c.errLock.Lock()
-	defer c.errLock.Unlock()
-	if c.closeErr == nil {
-		c.closeErr = err
-	}
-}
-
 func (c *StreamCopyer) setError(err error) {
 	if err == nil {
 		return
@@ -396,9 +384,9 @@ func (c *StreamCopyer) linearTargetStopped() bool {
 // the caller has seen every result by the time EventFinished is delivered. The intermediate
 // finished flags describe their own counter, not the results, so they may arrive before the
 // final flush.
-func (c *StreamCopyer) run(ctx context.Context) error {
+func (c *StreamCopyer) run(ctx context.Context) {
 	defer close(c.eventCh)
-	defer c.finishSignatureCache()
+	defer c.reportCacheStats()
 	defer func() {
 		close(c.resultCh)
 		<-c.resultsDone
@@ -420,46 +408,19 @@ func (c *StreamCopyer) run(ctx context.Context) error {
 
 	// The feed ended when the read buffer closed, so the indexed totals are final.
 	c.submit(&EventUpdateCount{Bytes: c.countBytes.Load(), Files: c.countFiles.Load(), Finished: true})
-
-	return nil
 }
 
+// eventLoop is the only goroutine that calls the event handler, so the handler never runs
+// concurrently. It drains the events even without a handler and ends with EventFinished.
 func (c *StreamCopyer) eventLoop() {
-	chans := make([]chan Event, len(c.eventHandlers))
-	for idx := range chans {
-		chans[idx] = make(chan Event, 128)
-	}
-
-	var handlers sync.WaitGroup
-	for idx, ch := range chans {
-		handler := c.eventHandlers[idx]
-		events := ch
-
-		handlers.Add(1)
-		go c.wrap(c.ctx, func() {
-			defer handlers.Done()
-
-			for {
-				e, ok := <-events
-				if !ok {
-					c.deliverEvent(handler, &EventFinished{})
-					return
-				}
-				c.deliverEvent(handler, e)
-			}
-		})
-	}
-
-	defer func() {
-		for _, ch := range chans {
-			close(ch)
-		}
-		handlers.Wait()
-	}()
+	handler := c.eventHandler
 	for e := range c.eventCh {
-		for _, ch := range chans {
-			ch <- e
+		if handler != nil {
+			c.deliverEvent(handler, e)
 		}
+	}
+	if handler != nil {
+		c.deliverEvent(handler, &EventFinished{})
 	}
 }
 
@@ -486,7 +447,7 @@ func (c *StreamCopyer) reportError(src, dst string, err error) {
 // deliverEvent hands one event to a caller-owned handler. A panic in the handler becomes a
 // pipeline error instead of unwinding the dispatch goroutine, which owns channel closing.
 func (c *StreamCopyer) deliverEvent(handler EventHandler, e Event) {
-	if err := protectCall("EventHandler", func() { handler(e) }); err != nil {
+	if err := c.protectCall("EventHandler", func() { handler(e) }); err != nil {
 		c.setError(fmt.Errorf("event handler failed, %w", err))
 	}
 }
